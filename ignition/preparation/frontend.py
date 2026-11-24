@@ -18,6 +18,16 @@ class PromptEncoder(IntEnum):
     TML_V0 = 3
 
 
+class QwenPositionScheme(IntEnum):
+    CORNER_MAX = 0
+    CENTERED_STEP = 1
+
+
+class QwenResizeKernel(IntEnum):
+    TORCHVISION_BICUBIC = 0
+    PILLOW_BICUBIC = 1
+
+
 TOKEN_FIELDS = ("bos_token", "eos_token", "unk_token", "sep_token", "pad_token", "cls_token", "mask_token")
 
 
@@ -89,11 +99,40 @@ def _expected(config, values, label):
             raise ValueError(f"unsupported {label} {key}")
 
 
-def image_settings(config, model, profile, qwen_model_type="qwen4_exp"):
+def _validated_resize_and_normalization(config):
+    result = dict(min_pixels=config.get("min_pixels"), max_pixels=config.get("max_pixels"),
+                  image_mean=config.get("image_mean"), image_std=config.get("image_std"))
+    if (any(type(result[key]) is not int for key in ("min_pixels", "max_pixels"))
+            or not 0 < result["min_pixels"] <= result["max_pixels"]):
+        raise ValueError("unsupported image processor resize area")
+    for key in ("image_mean", "image_std"):
+        values = result[key]
+        if (not isinstance(values, list) or len(values) != 3
+                or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)
+                or key == "image_std" and any(v <= 0 for v in values)):
+            raise ValueError(f"unsupported image processor {key}")
+        result[key] = [float(v) for v in values]
+    return result
+
+
+def image_settings(
+    config,
+    model,
+    profile,
+    qwen_model_type="qwen4_exp",
+    *,
+    qwen_processor_class="Qwen3VLProcessor",
+    qwen_image_processor_type="Qwen2VLImageProcessorFast",
+    qwen_channel_normalization=False,
+    qwen_position_scheme=QwenPositionScheme.CORNER_MAX,
+    qwen_resize_kernel=QwenResizeKernel.TORCHVISION_BICUBIC,
+    qwen_tokens=None,
+):
     """Resolve the image settings the native frontend consumes for ``profile``.
 
-    The Qwen profile serves two checkpoint families with one processor; ``qwen_model_type``
-    is the ``model_type`` the preparing recipe requires of its checkpoint.
+    For the ``qwen`` profile, recipes declare the checkpoint's expected ``model_type``,
+    processor classes, normalization mode, 3D position scheme, resize kernel, and any
+    required image/video placeholder strings explicitly.
     """
     if profile == "padded_grid":
         # Inkling 2 ships the processor in processor_config.json; `size` is the token cell, not a resize target.
@@ -165,10 +204,39 @@ def image_settings(config, model, profile, qwen_model_type="qwen4_exp"):
         raise ValueError("unsupported image preprocessing profile")
     qwen = profile == "qwen"
     if qwen:
-        _expected(config, {"image_mean": [0.5] * 3, "image_std": [0.5] * 3}, "image processor")
-    _expected(config, {"processor_class": "Qwen3VLProcessor" if qwen else "Qwen2_5_VLProcessor",
-        "image_processor_type": "Qwen2VLImageProcessorFast" if qwen else "Qwen2VLImageProcessor",
-        "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2}, "image processor")
+        if not isinstance(qwen_position_scheme, QwenPositionScheme):
+            raise ValueError("qwen_position_scheme must be a QwenPositionScheme")
+        if not isinstance(qwen_resize_kernel, QwenResizeKernel):
+            raise ValueError("qwen_resize_kernel must be a QwenResizeKernel")
+        if type(qwen_channel_normalization) is not bool:
+            raise ValueError("qwen_channel_normalization must be a boolean")
+        expected_processor = {
+            "processor_class": qwen_processor_class,
+            "image_processor_type": qwen_image_processor_type,
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+        }
+        if not qwen_channel_normalization:
+            expected_processor["image_mean"] = [0.5] * 3
+            expected_processor["image_std"] = [0.5] * 3
+        if qwen_tokens is not None:
+            if (
+                not isinstance(qwen_tokens, dict)
+                or not set(qwen_tokens).issubset({"image_token", "video_token"})
+                or any(type(v) is not str or not v for v in qwen_tokens.values())
+            ):
+                raise ValueError(
+                    "qwen_tokens may only specify non-empty image_token and video_token strings"
+                )
+            expected_processor.update(qwen_tokens)
+        _expected(config, expected_processor, "image processor")
+    else:
+        _expected(config, {"processor_class": "Qwen2_5_VLProcessor",
+            "image_processor_type": "Qwen2VLImageProcessor",
+            "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2}, "image processor")
+    # Processor subclasses whose class defaults omit these keys from preprocessor_config.json
+    # are pinned by `image_processor_type`; any explicit override that conflicts is rejected.
     optional = {"resample": 3, "rescale_factor": 1 / 255,
         "do_resize": True, "do_rescale": True, "do_normalize": True, "do_convert_rgb": True}
     _expected(config, {key: value for key, value in optional.items() if key in config}, "image processor")
@@ -177,8 +245,16 @@ def image_settings(config, model, profile, qwen_model_type="qwen4_exp"):
     _expected(vision, {"patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2}, "vision configuration")
     if qwen:
         _expected(vision, {"in_channels": 3, "num_position_embeddings": 2304}, "vision configuration")
-        _expected(config["size"], {"shortest_edge": 65536, "longest_edge": 16777216}, "resize area")
-        result = dict(min_pixels=65536, max_pixels=16777216, position_side=48)
+        if qwen_channel_normalization:
+            result = _validated_resize_and_normalization(config)
+            result["position_side"] = 48
+        else:
+            _expected(config["size"], {"shortest_edge": 65536, "longest_edge": 16777216}, "resize area")
+            result = dict(min_pixels=65536, max_pixels=16777216, position_side=48)
+        if qwen_position_scheme != QwenPositionScheme.CORNER_MAX:
+            result["position_scheme"] = int(qwen_position_scheme)
+        if qwen_resize_kernel != QwenResizeKernel.TORCHVISION_BICUBIC:
+            result["resize_kernel"] = int(qwen_resize_kernel)
         for name in ("image_token_id", "video_token_id"):
             value = model[name]
             if type(value) is not int or not 0 <= value < 2**32:
@@ -188,18 +264,7 @@ def image_settings(config, model, profile, qwen_model_type="qwen4_exp"):
         # MiMo checkpoints publish their own resize area and normalization; the native frontend
         # consumes the packaged values, so preparation validates their form rather than fixing them.
         _expected(model, {"image_token_id": 151655}, "model configuration")
-        result = dict(min_pixels=config.get("min_pixels"), max_pixels=config.get("max_pixels"),
-                      image_mean=config.get("image_mean"), image_std=config.get("image_std"))
-        if (any(type(result[key]) is not int for key in ("min_pixels", "max_pixels"))
-                or not 0 < result["min_pixels"] <= result["max_pixels"]):
-            raise ValueError("unsupported image processor resize area")
-        for key in ("image_mean", "image_std"):
-            values = result[key]
-            if (not isinstance(values, list) or len(values) != 3
-                    or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)
-                    or key == "image_std" and any(v <= 0 for v in values)):
-                raise ValueError(f"unsupported image processor {key}")
-            result[key] = [float(v) for v in values]
+        result = _validated_resize_and_normalization(config)
     return {profile: result}
 
 
@@ -220,8 +285,21 @@ def _native_image_placeholder(snapshot, model, encoder):
     return token_id
 
 
-def prepare_frontend(snapshot, *, eos_token_ids, image_profile=None, preprocessor=None,
-                     prompt_encoder=PromptEncoder.PROMPT_JINJA, qwen_model_type="qwen4_exp"):
+def prepare_frontend(
+    snapshot,
+    *,
+    eos_token_ids,
+    image_profile=None,
+    preprocessor=None,
+    prompt_encoder=PromptEncoder.PROMPT_JINJA,
+    qwen_model_type="qwen4_exp",
+    qwen_processor_class="Qwen3VLProcessor",
+    qwen_image_processor_type="Qwen2VLImageProcessorFast",
+    qwen_channel_normalization=False,
+    qwen_position_scheme=QwenPositionScheme.CORNER_MAX,
+    qwen_resize_kernel=QwenResizeKernel.TORCHVISION_BICUBIC,
+    qwen_tokens=None,
+):
     """Resolve checkpoint structure during preparation; sampling is recipe-owned."""
     if not isinstance(prompt_encoder, PromptEncoder):
         raise ValueError("prompt_encoder must be a PromptEncoder")
@@ -245,7 +323,16 @@ def prepare_frontend(snapshot, *, eos_token_ids, image_profile=None, preprocesso
             result["image_placeholder_token_id"] = _native_image_placeholder(
                 snapshot, json.loads((snapshot / "config.json").read_text()), prompt_encoder)
         path = snapshot / "preprocessor_config.json" if preprocessor is None else Path(preprocessor)
-        result["image"] = image_settings({} if image_profile == "deepseek_row_major" else json.loads(path.read_text()),
-            json.loads((snapshot / "config.json").read_text()), image_profile,
-            qwen_model_type=qwen_model_type)
+        result["image"] = image_settings(
+            {} if image_profile == "deepseek_row_major" else json.loads(path.read_text()),
+            json.loads((snapshot / "config.json").read_text()),
+            image_profile,
+            qwen_model_type=qwen_model_type,
+            qwen_processor_class=qwen_processor_class,
+            qwen_image_processor_type=qwen_image_processor_type,
+            qwen_channel_normalization=qwen_channel_normalization,
+            qwen_position_scheme=qwen_position_scheme,
+            qwen_resize_kernel=qwen_resize_kernel,
+            qwen_tokens=qwen_tokens,
+        )
     return result

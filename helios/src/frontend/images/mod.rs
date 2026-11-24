@@ -294,6 +294,36 @@ pub struct DeepseekRowMajorImageSettings {
     pub max_width_height_ratio: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QwenPositionScheme {
+    /// Spatial height/width coordinates start at the text cursor (0..height, 0..width) and
+    /// advance the cursor by max(height, width).
+    #[default]
+    CornerMax,
+    /// Spatial height/width coordinates center around the text cursor by floor((dim - 1) / 2)
+    /// and advance the cursor by 1.
+    CenteredStep,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QwenResizeKernel {
+    /// Torchvision uint8 antialiased bicubic resizing with adaptive fixed-point precision.
+    #[default]
+    TorchvisionBicubic,
+    /// Pillow uint8 antialiased bicubic resizing with 22-bit fixed-point precision.
+    PillowBicubic,
+}
+
+fn is_default_position_scheme(value: &QwenPositionScheme) -> bool {
+    *value == QwenPositionScheme::CornerMax
+}
+
+fn is_default_resize_kernel(value: &QwenResizeKernel) -> bool {
+    *value == QwenResizeKernel::TorchvisionBicubic
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QwenImageSettings {
@@ -302,6 +332,14 @@ pub struct QwenImageSettings {
     pub position_side: usize,
     pub image_token_id: u32,
     pub video_token_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_mean: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_std: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "is_default_position_scheme")]
+    pub position_scheme: QwenPositionScheme,
+    #[serde(default, skip_serializing_if = "is_default_resize_kernel")]
+    pub resize_kernel: QwenResizeKernel,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -943,6 +981,10 @@ mod tests {
                 position_side: 48,
                 image_token_id: 248056,
                 video_token_id: 248057,
+                image_mean: None,
+                image_std: None,
+                position_scheme: QwenPositionScheme::CornerMax,
+                resize_kernel: QwenResizeKernel::TorchvisionBicubic,
             }),
             limits,
         )
@@ -1017,7 +1059,9 @@ mod tests {
     fn image_profiles_accept_five_images_within_the_total_patch_budget() {
         let settings = [
             ImageSettings::Qwen(QwenImageSettings { min_pixels: 65536, max_pixels: 16777216,
-                position_side: 48, image_token_id: 248056, video_token_id: 248057 }),
+                position_side: 48, image_token_id: 248056, video_token_id: 248057,
+                image_mean: None, image_std: None, position_scheme: QwenPositionScheme::CornerMax,
+                resize_kernel: QwenResizeKernel::TorchvisionBicubic }),
             ImageSettings::Mimo(MimoImageSettings { min_pixels: 65536, max_pixels: 16777216,
                 image_mean: [0.5; 3], image_std: [0.5; 3] }),
             ImageSettings::Deepseek4 {},
@@ -1105,5 +1149,116 @@ mod tests {
             &[5, 6, 7, 8, 9, 10]
         );
         assert!(processor.decode_png(&bytes[..bytes.len() - 12]).is_err());
+    }
+
+    #[test]
+    fn qwen_channel_normalization_position_scheme_and_resize_kernel_validate_and_apply() {
+        let base = QwenImageSettings {
+            min_pixels: 4096,
+            max_pixels: 65_536,
+            position_side: 48,
+            image_token_id: 157157,
+            video_token_id: 156909,
+            image_mean: Some([0.48145466, 0.4578275, 0.40821073]),
+            image_std: Some([0.26862954, 0.26130258, 0.27577711]),
+            position_scheme: QwenPositionScheme::CenteredStep,
+            resize_kernel: QwenResizeKernel::PillowBicubic,
+        };
+        let processor = ImageProcessor::load(ImageSettings::Qwen(base.clone()), ImageLimits::default()).unwrap();
+        let solid = RgbImage::new(128, 128, vec![255; 128 * 128 * 3]).unwrap();
+        let processed = processor.process(&[solid]).unwrap();
+        assert_eq!(processed.geometry[0].grid_thw, [1, 8, 8]);
+        assert_eq!(processed.geometry[0].tokens, 16);
+        let expected_r = (1.0f32 - 0.48145466) / 0.26862954;
+        assert!((processed.pixel_values[0] - expected_r).abs() < 1e-5);
+
+        let mut missing_std = base.clone();
+        missing_std.image_std = None;
+        assert!(ImageProcessor::load(ImageSettings::Qwen(missing_std), ImageLimits::default()).is_err());
+
+        let mut bad_std = base;
+        bad_std.image_std = Some([0.25, 0.0, 0.25]);
+        assert!(ImageProcessor::load(ImageSettings::Qwen(bad_std), ImageLimits::default()).is_err());
+    }
+
+    #[test]
+    fn default_qwen_settings_preserve_legacy_identity_domain_and_differ_when_extended() {
+        use sha2::{Digest, Sha256};
+
+        let legacy = ImageSettings::Qwen(QwenImageSettings {
+            min_pixels: 65_536,
+            max_pixels: 16_777_216,
+            position_side: 48,
+            image_token_id: 248056,
+            video_token_id: 248057,
+            image_mean: None,
+            image_std: None,
+            position_scheme: QwenPositionScheme::CornerMax,
+            resize_kernel: QwenResizeKernel::TorchvisionBicubic,
+        });
+        let expected_json = r#"{"qwen":{"min_pixels":65536,"max_pixels":16777216,"position_side":48,"image_token_id":248056,"video_token_id":248057}}"#;
+        let serialized = serde_json::to_string(&legacy).unwrap();
+        assert_eq!(serialized, expected_json);
+        let expected_domain: [u8; 32] = Sha256::digest(expected_json.as_bytes()).into();
+        let default_proc = ImageProcessor::load(legacy, ImageLimits::default()).unwrap();
+        assert_eq!(default_proc.identity_domain, expected_domain);
+
+        let sample = RgbImage::new(64, 64, vec![120; 64 * 64 * 3]).unwrap();
+        let base_id = default_proc.semantic_identity(&sample);
+
+        let with_norm = ImageProcessor::load(
+            ImageSettings::Qwen(QwenImageSettings {
+                min_pixels: 65_536,
+                max_pixels: 16_777_216,
+                position_side: 48,
+                image_token_id: 248056,
+                video_token_id: 248057,
+                image_mean: Some([0.48145466, 0.4578275, 0.40821073]),
+                image_std: Some([0.26862954, 0.26130258, 0.27577711]),
+                position_scheme: QwenPositionScheme::CornerMax,
+                resize_kernel: QwenResizeKernel::TorchvisionBicubic,
+            }),
+            ImageLimits::default(),
+        )
+        .unwrap();
+        assert_ne!(base_id, with_norm.semantic_identity(&sample));
+
+        let with_scheme = ImageProcessor::load(
+            ImageSettings::Qwen(QwenImageSettings {
+                min_pixels: 65_536,
+                max_pixels: 16_777_216,
+                position_side: 48,
+                image_token_id: 248056,
+                video_token_id: 248057,
+                image_mean: None,
+                image_std: None,
+                position_scheme: QwenPositionScheme::CenteredStep,
+                resize_kernel: QwenResizeKernel::TorchvisionBicubic,
+            }),
+            ImageLimits::default(),
+        )
+        .unwrap();
+        assert_ne!(base_id, with_scheme.semantic_identity(&sample));
+
+        let with_pillow = ImageProcessor::load(
+            ImageSettings::Qwen(QwenImageSettings {
+                min_pixels: 65_536,
+                max_pixels: 16_777_216,
+                position_side: 48,
+                image_token_id: 248056,
+                video_token_id: 248057,
+                image_mean: None,
+                image_std: None,
+                position_scheme: QwenPositionScheme::CornerMax,
+                resize_kernel: QwenResizeKernel::PillowBicubic,
+            }),
+            ImageLimits::default(),
+        )
+        .unwrap();
+        assert_ne!(base_id, with_pillow.semantic_identity(&sample));
+        assert_ne!(
+            with_scheme.semantic_identity(&sample),
+            with_pillow.semantic_identity(&sample)
+        );
     }
 }

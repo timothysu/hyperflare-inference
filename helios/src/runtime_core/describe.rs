@@ -428,8 +428,33 @@ pub(super) fn vision_json(
     let profile = settings.image.as_ref().and_then(|image| image.profile.as_ref()).map(|profile| {
         use wire::image_settings::Profile;
         match profile {
-            Profile::Qwen(c) => json!({"profile": "qwen", "min_pixels": c.min_pixels, "max_pixels": c.max_pixels,
-                "position_side": c.position_side, "image_token_id": c.image_token_id, "video_token_id": c.video_token_id}),
+            Profile::Qwen(c) => {
+                let mut qwen = serde_json::Map::from_iter([
+                    ("profile".into(), json!("qwen")),
+                    ("min_pixels".into(), json!(c.min_pixels)),
+                    ("max_pixels".into(), json!(c.max_pixels)),
+                    ("position_side".into(), json!(c.position_side)),
+                    ("image_token_id".into(), json!(c.image_token_id)),
+                    ("video_token_id".into(), json!(c.video_token_id)),
+                    (
+                        "position_scheme".into(),
+                        json!(wire::QwenPositionScheme::try_from(c.position_scheme)
+                            .map_or("UNKNOWN", |e| e.as_str_name())),
+                    ),
+                    (
+                        "resize_kernel".into(),
+                        json!(wire::QwenResizeKernel::try_from(c.resize_kernel)
+                            .map_or("UNKNOWN", |e| e.as_str_name())),
+                    ),
+                ]);
+                if !c.image_mean.is_empty() {
+                    qwen.insert("image_mean".into(), json!(c.image_mean));
+                }
+                if !c.image_std.is_empty() {
+                    qwen.insert("image_std".into(), json!(c.image_std));
+                }
+                Value::Object(qwen)
+            }
             Profile::Mimo(c) => json!({"profile": "mimo", "min_pixels": c.min_pixels, "max_pixels": c.max_pixels}),
             Profile::DeepseekRowMajor(c) => json!({"profile": "deepseek_row_major", "min_pixels": c.min_pixels,
                 "max_tokens": c.max_tokens, "max_width_height_ratio": c.max_width_height_ratio}),
@@ -1136,7 +1161,7 @@ mod tests {
         let index = wire::ModelIndex {
             contract: Some(wire::ServingContract {
                 model_contract: Some(wire::ModelContract {
-                    vision: Some(enabled),
+                    vision: Some(enabled.clone()),
                     ..Default::default()
                 }),
                 max_sequence_tokens: 131072,
@@ -1162,5 +1187,37 @@ mod tests {
         assert_eq!(frontend["prompt_encoder"], "DEEPSEEK_V41");
         assert_eq!(frontend["image_placeholder_token_id"], 7);
         assert!(frontend["tools"].is_null());
+
+        let qwen_settings = wire::FrontendSettings {
+            tokenizer: None,
+            image: Some(wire::ImageSettings {
+                profile: Some(wire::image_settings::Profile::Qwen(wire::QwenImageSettings {
+                    min_pixels: 4096,
+                    max_pixels: 4_194_304,
+                    position_side: 48,
+                    image_token_id: 157157,
+                    video_token_id: 156909,
+                    image_mean: vec![0.48145466, 0.4578275, 0.40821073],
+                    image_std: vec![0.26862954, 0.26130258, 0.27577711],
+                    position_scheme: wire::QwenPositionScheme::CenteredStep as i32,
+                    resize_kernel: wire::QwenResizeKernel::PillowBicubic as i32,
+                })),
+            }),
+            eos_token_ids: vec![1],
+            template_encoding: 0,
+            prompt_encoder: 0,
+            image_placeholder_token_id: None,
+        };
+        let qwen_vision = vision_json(Some(&enabled), &qwen_settings, Some(131072));
+        assert_eq!(
+            qwen_vision["image"]["position_scheme"],
+            "QWEN_POSITION_SCHEME_CENTERED_STEP"
+        );
+        assert_eq!(
+            qwen_vision["image"]["resize_kernel"],
+            "QWEN_RESIZE_KERNEL_PILLOW_BICUBIC"
+        );
+        assert_eq!(qwen_vision["image"]["image_mean"].as_array().unwrap().len(), 3);
+        assert_eq!(qwen_vision["image"]["image_std"].as_array().unwrap().len(), 3);
     }
 }

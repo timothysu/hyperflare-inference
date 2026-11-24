@@ -150,11 +150,40 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
         .map(|image| -> Result<serde_json::Value> {
             use wire::image_settings::Profile;
             Ok(match required(image.profile, "image profile")? {
-                Profile::Qwen(config) => serde_json::json!({"qwen": {
-                    "min_pixels": config.min_pixels, "max_pixels": config.max_pixels,
-                    "position_side": config.position_side, "image_token_id": config.image_token_id,
-                    "video_token_id": config.video_token_id,
-                }}),
+                Profile::Qwen(config) => {
+                    let mut qwen = serde_json::Map::from_iter([
+                        ("min_pixels".into(), config.min_pixels.into()),
+                        ("max_pixels".into(), config.max_pixels.into()),
+                        ("position_side".into(), config.position_side.into()),
+                        ("image_token_id".into(), config.image_token_id.into()),
+                        ("video_token_id".into(), config.video_token_id.into()),
+                    ]);
+                    if !config.image_mean.is_empty() || !config.image_std.is_empty() {
+                        qwen.insert(
+                            "image_mean".into(),
+                            serde_json::json!(array::<f32, 3>(config.image_mean, "image_mean")?),
+                        );
+                        qwen.insert(
+                            "image_std".into(),
+                            serde_json::json!(array::<f32, 3>(config.image_std, "image_std")?),
+                        );
+                    }
+                    match wire::QwenPositionScheme::try_from(config.position_scheme) {
+                        Ok(wire::QwenPositionScheme::CornerMax) => {}
+                        Ok(wire::QwenPositionScheme::CenteredStep) => {
+                            qwen.insert("position_scheme".into(), "centered_step".into());
+                        }
+                        Err(_) => return Err(invalid("unknown Qwen image position scheme")),
+                    }
+                    match wire::QwenResizeKernel::try_from(config.resize_kernel) {
+                        Ok(wire::QwenResizeKernel::TorchvisionBicubic) => {}
+                        Ok(wire::QwenResizeKernel::PillowBicubic) => {
+                            qwen.insert("resize_kernel".into(), "pillow_bicubic".into());
+                        }
+                        Err(_) => return Err(invalid("unknown Qwen image resize kernel")),
+                    }
+                    serde_json::json!({"qwen": qwen})
+                }
                 Profile::Mimo(config) => serde_json::json!({"mimo": {
                     "min_pixels": config.min_pixels, "max_pixels": config.max_pixels,
                     "image_mean": config.image_mean, "image_std": config.image_std,
@@ -815,6 +844,139 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn qwen_image_settings_round_trip_and_legacy_wire_bytes_preserve_identity() {
+        let base = wire::FrontendSettings {
+            tokenizer: Some(wire::TokenizerSettings::default()),
+            eos_token_ids: vec![1],
+            image: Some(wire::ImageSettings {
+                profile: Some(wire::image_settings::Profile::Qwen(wire::QwenImageSettings {
+                    min_pixels: 4096,
+                    max_pixels: 4_194_304,
+                    position_side: 48,
+                    image_token_id: 157157,
+                    video_token_id: 156909,
+                    image_mean: vec![0.48145466, 0.4578275, 0.40821073],
+                    image_std: vec![0.26862954, 0.26130258, 0.27577711],
+                    position_scheme: wire::QwenPositionScheme::CenteredStep as i32,
+                    resize_kernel: wire::QwenResizeKernel::PillowBicubic as i32,
+                })),
+            }),
+            ..Default::default()
+        };
+        let decoded = wire::FrontendSettings::decode(base.encode_to_vec().as_slice()).unwrap();
+        let json = frontend_settings(decoded).unwrap();
+        assert_eq!(json["image"]["qwen"]["position_scheme"], "centered_step");
+        assert_eq!(json["image"]["qwen"]["resize_kernel"], "pillow_bicubic");
+        assert_eq!(json["image"]["qwen"]["image_mean"].as_array().unwrap().len(), 3);
+        #[cfg(feature = "server")]
+        {
+            let frontend: crate::frontend::FrontendSettings = serde_json::from_value(json).unwrap();
+            let _ = crate::frontend::images::ImageProcessor::load(
+                frontend.image.unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        }
+        // Pre-extension Qwen wire bytes containing only fields 1..5:
+        // min_pixels=65536, max_pixels=16777216, position_side=48,
+        // image_token_id=248056, video_token_id=248057.
+        let legacy_bytes: &[u8] = &[
+            0x0a, 0x00, // tokenizer = {}
+            0x12, 0x15, // image (21 bytes)
+            0x0a, 0x13, // qwen (19 bytes)
+            0x08, 0x80, 0x80, 0x04, // min_pixels = 65536
+            0x10, 0x80, 0x80, 0x80, 0x08, // max_pixels = 16777216
+            0x18, 0x30, // position_side = 48
+            0x20, 0xf8, 0x91, 0x0f, // image_token_id = 248056
+            0x28, 0xf9, 0x91, 0x0f, // video_token_id = 248057
+            0x1a, 0x01, 0x01, // eos_token_ids = [1]
+        ];
+        let legacy_decoded = wire::FrontendSettings::decode(legacy_bytes).unwrap();
+        let legacy_json = frontend_settings(legacy_decoded).unwrap();
+        assert!(legacy_json["image"]["qwen"].get("image_mean").is_none());
+        assert!(legacy_json["image"]["qwen"].get("position_scheme").is_none());
+        assert!(legacy_json["image"]["qwen"].get("resize_kernel").is_none());
+        #[cfg(feature = "server")]
+        {
+            let frontend: crate::frontend::FrontendSettings =
+                serde_json::from_value(legacy_json).unwrap();
+            let settings = frontend.image.unwrap();
+            let serialized = serde_json::to_string(&settings).unwrap();
+            assert_eq!(
+                serialized,
+                r#"{"qwen":{"min_pixels":65536,"max_pixels":16777216,"position_side":48,"image_token_id":248056,"video_token_id":248057}}"#
+            );
+            let proc = crate::frontend::images::ImageProcessor::load(
+                settings,
+                Default::default(),
+            )
+            .unwrap();
+            let sample =
+                crate::frontend::images::RgbImage::new(64, 64, vec![64; 64 * 64 * 3]).unwrap();
+            let legacy_id = proc.semantic_identity(&sample);
+            let mut changed = base.clone();
+            if let Some(wire::image_settings::Profile::Qwen(q)) =
+                changed.image.as_mut().and_then(|i| i.profile.as_mut())
+            {
+                q.min_pixels = 65536;
+                q.max_pixels = 16_777_216;
+                q.image_token_id = 248056;
+                q.video_token_id = 248057;
+            }
+            let changed_fe: crate::frontend::FrontendSettings =
+                serde_json::from_value(frontend_settings(changed).unwrap()).unwrap();
+            let changed_proc = crate::frontend::images::ImageProcessor::load(
+                changed_fe.image.unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+            assert_ne!(legacy_id, changed_proc.semantic_identity(&sample));
+        }
+
+        let bad_scheme = wire::FrontendSettings {
+            tokenizer: Some(wire::TokenizerSettings::default()),
+            eos_token_ids: vec![1],
+            image: Some(wire::ImageSettings {
+                profile: Some(wire::image_settings::Profile::Qwen(wire::QwenImageSettings {
+                    min_pixels: 4096,
+                    max_pixels: 65536,
+                    position_side: 48,
+                    image_token_id: 1,
+                    video_token_id: 2,
+                    position_scheme: 99,
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        };
+        assert!(frontend_settings(bad_scheme)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown Qwen image position scheme"));
+
+        let bad_kernel = wire::FrontendSettings {
+            tokenizer: Some(wire::TokenizerSettings::default()),
+            eos_token_ids: vec![1],
+            image: Some(wire::ImageSettings {
+                profile: Some(wire::image_settings::Profile::Qwen(wire::QwenImageSettings {
+                    min_pixels: 4096,
+                    max_pixels: 65536,
+                    position_side: 48,
+                    image_token_id: 1,
+                    video_token_id: 2,
+                    resize_kernel: 99,
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        };
+        assert!(frontend_settings(bad_kernel)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown Qwen image resize kernel"));
     }
     #[test]
     fn serialized_scored_prefill_preserves_operation_and_prompt_target_values() {

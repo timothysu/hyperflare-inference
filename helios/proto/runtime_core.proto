@@ -535,12 +535,24 @@ message DeepseekRowMajorImageSettings {
   uint64 max_tokens = 2;
   optional uint64 max_width_height_ratio = 3;
 }
+enum QwenPositionScheme {
+  QWEN_POSITION_SCHEME_CORNER_MAX = 0;
+  QWEN_POSITION_SCHEME_CENTERED_STEP = 1;
+}
+enum QwenResizeKernel {
+  QWEN_RESIZE_KERNEL_TORCHVISION_BICUBIC = 0;
+  QWEN_RESIZE_KERNEL_PILLOW_BICUBIC = 1;
+}
 message QwenImageSettings {
   uint64 min_pixels = 1;
   uint64 max_pixels = 2;
   uint32 position_side = 3;
   uint32 image_token_id = 4;
   uint32 video_token_id = 5;
+  repeated float image_mean = 6;
+  repeated float image_std = 7;
+  QwenPositionScheme position_scheme = 8;
+  QwenResizeKernel resize_kernel = 9;
 }
 message MimoImageSettings {
   uint64 min_pixels = 1;

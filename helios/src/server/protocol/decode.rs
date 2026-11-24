@@ -1123,7 +1123,8 @@ mod native_prompt_tests {
     #[test]
     fn messages_image_hints_end_after_expansion_for_text_and_segmented_templates() {
         use crate::frontend::images::{
-            ImageLimits, ImageProcessor, ImageSettings, QwenImageSettings,
+            ImageLimits, ImageProcessor, ImageSettings, QwenImageSettings, QwenPositionScheme,
+            QwenResizeKernel,
         };
         use crate::model::contract::{ImageLayoutKind, ImageTokenLayout};
         use base64::Engine;
@@ -1164,6 +1165,10 @@ mod native_prompt_tests {
                     position_side: 48,
                     image_token_id: token(placeholder),
                     video_token_id: token("<|video_pad|>"),
+                    image_mean: None,
+                    image_std: None,
+                    position_scheme: QwenPositionScheme::CornerMax,
+                    resize_kernel: QwenResizeKernel::TorchvisionBicubic,
                 })
             } else {
                 ImageSettings::Moonvit {}

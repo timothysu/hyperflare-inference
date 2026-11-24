@@ -702,9 +702,16 @@ static WebP, and non-animated GIF decoding; it also enables `frontend`. Typed co
 selects the preparation profile and token layout independently. Profiles cover
 Qwen, MiMo, patch-merge, DeepSeek, DeepSeek row-major, Moonvit, Step, RADIO,
 and GLM inputs.
-The Qwen processor uses an RGB8, bicubic-antialias profile with
-16×16 patches, temporal duplication by two, spatial merge by two, a 48×48
-learned position table, and fused normalization `(pixel - 127.5) / 127.5`.
+The Qwen processor uses an RGB8 bicubic-antialias profile (Torchvision adaptive
+precision by default, or Pillow 22-bit precision when declared by
+`QwenResizeKernel::PillowBicubic`) with 16×16 patches, temporal duplication by
+two, spatial merge by two, a 48×48 learned position table, and either fused
+symmetric normalization `(pixel - 127.5) / 127.5` or declared per-channel
+`image_mean`/`image_std` normalization. Prompt position assignment follows the
+declared `QwenPositionScheme`: `CornerMax` (default) places spatial coordinates
+at `0..height` / `0..width` and advances the cursor by `max(height, width)`,
+while `CenteredStep` centers coordinates by `floor((dim - 1) / 2)` and advances
+the cursor by `1`.
 
 `process` produces packed `pixel_values[N,1536]` float32, image grids `[1,H,W]`,
 vision positions `[N,2]` int64, interpolation indices `[N,4]` int64 and weights

@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn every_image_layout_describes_history_larger_than_the_feature_window() {
         use crate::frontend::images::{DeepseekRowMajorImageSettings, ImageSettings,
-            MimoImageSettings, QwenImageSettings};
+            MimoImageSettings, QwenImageSettings, QwenPositionScheme, QwenResizeKernel};
         use crate::model::contract::{ImageSpan, ImageTokenLayout};
         let frontend = image_frontend();
         let token = |text: &str| frontend.encode(text, false).unwrap()[0];
@@ -431,6 +431,9 @@ mod tests {
             (ImageLayoutKind::Qwen, ImageSettings::Qwen(QwenImageSettings {
                 min_pixels: 4096, max_pixels: 65536, position_side: 48,
                 image_token_id: token("<|image_pad|>"), video_token_id: token("<|video_pad|>"),
+                image_mean: None, image_std: None,
+                position_scheme: QwenPositionScheme::CornerMax,
+                resize_kernel: QwenResizeKernel::TorchvisionBicubic,
             }), "<|image_pad|>", 4),
             (ImageLayoutKind::Mimo, ImageSettings::Mimo(MimoImageSettings {
                 min_pixels: 4096, max_pixels: 65536, image_mean: [0.5; 3], image_std: [0.5; 3],

@@ -323,3 +323,9 @@
     dense Qwen3.8, and read each one's pre-tokenizer for Metaspace (see the test
     header). Close when each passes and none uses Metaspace, or loading rejects
     one that does.
+
+[ ] Load and serve a previously exported multimodal Qwen core (exported before
+    the optional channel normalization, QwenPositionScheme, and QwenResizeKernel
+    fields were added to QwenImageSettings) under flare run to complete
+    runtime-core backward-compatibility qualification beyond protobuf wire-byte
+    and identity-domain unit tests.

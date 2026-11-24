@@ -5643,7 +5643,7 @@ fn worker_restores_conditioned_windows_with_fresh_generation_and_unchanged_sampl
     use crate::execution::{BufferDescriptor, Dtype, GraphDescriptor, InputBinding, SamplingMode};
     use crate::frontend::images::{
         ImageInput, ImageLimits, ImageProcessor, ImageSettings, ImageSource, PreparedImageInput,
-        QwenImageSettings, RgbImage,
+        QwenImageSettings, QwenPositionScheme, QwenResizeKernel, RgbImage,
     };
     use crate::model::contract::{GraphContract, GraphOperation, InputIndexing, ValueSource};
     let mut fixture = Fixture::new();
@@ -5738,6 +5738,10 @@ fn worker_restores_conditioned_windows_with_fresh_generation_and_unchanged_sampl
                 position_side: 48,
                 image_token_id: 248056,
                 video_token_id: 248057,
+                image_mean: None,
+                image_std: None,
+                position_scheme: QwenPositionScheme::CornerMax,
+                resize_kernel: QwenResizeKernel::TorchvisionBicubic,
             }),
             ImageLimits {
                 patches_per_feature: 4,

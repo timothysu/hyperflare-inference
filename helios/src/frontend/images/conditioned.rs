@@ -329,7 +329,7 @@ mod tests {
     use super::*;
     use crate::frontend::images::{
         DeepseekRowMajorImageSettings, ImageLimits, ImageSettings, MimoImageSettings,
-        QwenImageSettings,
+        QwenImageSettings, QwenPositionScheme, QwenResizeKernel,
     };
 
     fn settings() -> Vec<ImageSettings> {
@@ -340,6 +340,10 @@ mod tests {
                 position_side: 48,
                 image_token_id: 248056,
                 video_token_id: 248057,
+                image_mean: None,
+                image_std: None,
+                position_scheme: QwenPositionScheme::CornerMax,
+                resize_kernel: QwenResizeKernel::TorchvisionBicubic,
             }),
             ImageSettings::Mimo(MimoImageSettings {
                 min_pixels: 65536,
