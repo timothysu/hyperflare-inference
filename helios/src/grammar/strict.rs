@@ -2228,8 +2228,8 @@ impl GrammarCompiler {
                     wire_hints(presentation.as_deref_mut(), &tool.name, !props.is_empty())?;
                 let mut param_seq = Vec::with_capacity(props.len());
                 for (p_idx, (prop_name, prop_schema)) in props.iter().enumerate() {
-                    let open_lit = serde_json::to_string(&format!(
-                        "<arg_key>{prop_name}</arg_key><arg_value>"
+                    let key_lit = serde_json::to_string(&format!(
+                        "<arg_key>{prop_name}</arg_key>"
                     ))
                     .unwrap();
                     let pname = format!("glm_param_{t_idx}_{p_idx}");
@@ -2248,7 +2248,9 @@ impl GrammarCompiler {
                                 &["</arg_value>", "</tool_call>"],
                             )?;
                             subgrammars.push(g);
-                            rules.push_str(&format!("{pname}: {open_lit} @{s_sub}\n"));
+                            rules.push_str(&format!(
+                                "{pname}: {key_lit} ws \"<arg_value>\" @{s_sub}\n"
+                            ));
                         }
                         SplitBranches::Pure {
                             string_branch: None,
@@ -2262,7 +2264,7 @@ impl GrammarCompiler {
                                 &nb,
                             );
                             rules.push_str(&format!(
-                                "{pname}: {open_lit} {j_ref} \"</arg_value>\"\n"
+                                "{pname}: {key_lit} ws \"<arg_value>\" {j_ref} \"</arg_value>\"\n"
                             ));
                         }
                         _ => {
@@ -2754,6 +2756,113 @@ mod tests {
         assert_eq!(
             decoded_args(glm_cfg, &nested)["filter"]["hourly"],
             "literal </arg_value></tool_call>"
+        );
+
+        // Ling-3.2-Air envelope: <think>/</think> reasoning delimiters + GlmArgumentTags.
+        // Verify both chunked streaming of newline-formatted generated tool calls and
+        // required strict-tool enforcement over the same reasoning + tool envelope.
+        let mut ling_syntax = crate::model::testing::metadata().frontend;
+        ling_syntax.tools = Some(ToolParser {
+            kind: ToolParserKind::GlmArgumentTags,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        let ling_schema = json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["query", "limit"],
+            "additionalProperties": false,
+        });
+        let mut ling_cfg = OutputConfig {
+            syntax: ling_syntax,
+            control_tokens: vec![],
+            content: TaggedConfig {
+                structured: false,
+                start: OutputStart::Reasoning,
+                tools: vec![
+                    json!({"type":"function","function":{"name":"lookup","strict":true,"parameters":ling_schema}}),
+                ],
+            },
+        };
+        let ling_env = OutputPipeline::grammar_envelope(&ling_cfg).unwrap();
+        let ling_plan = ToolGrammarPlan {
+            tools: vec![StrictToolSpec {
+                name: "lookup".into(),
+                strict_schema: Some(&ling_schema),
+            }],
+            syntax: Some((ToolParserKind::GlmArgumentTags, 0, String::new())),
+            dsml_token: None,
+            allow_undeclared: false,
+            require_call: true,
+            single_call: true,
+        };
+        compiler
+            .compile_presented_strict_tools(
+                None,
+                Some(&ling_env),
+                &ling_plan,
+                Some(&mut ling_cfg.content),
+            )
+            .unwrap();
+        assert!(!accepts_bytes(
+            &compiler,
+            &ling_env,
+            &ling_plan,
+            "plan</think>plain text without a tool call",
+            256
+        ));
+        // Use the exact same newline-delimited Ling tool call for BOTH strict grammar
+        // acceptance and chunked streaming parsing.
+        let streamed_chunks = [
+            "check ",
+            "records</thi",
+            "nk><tool_",
+            "call>lookup\n<arg_",
+            "key>query</arg_key>\n<arg_val",
+            "ue>café</arg_value>\n<arg_key>lim",
+            "it</arg_key>\n<arg_value>3</arg_",
+            "value>\n</tool_call>",
+        ];
+        let ling_newline_call: String = streamed_chunks.concat();
+        assert!(accepts_bytes(
+            &compiler,
+            &ling_env,
+            &ling_plan,
+            &ling_newline_call,
+            256
+        ));
+        let mut pipe = OutputPipeline::new(ling_cfg);
+        let mut events = Vec::new();
+        for chunk in streamed_chunks {
+            events.extend(pipe.push(Input::Text(chunk)).unwrap());
+        }
+        events.extend(pipe.finish(Termination::Eos).unwrap());
+        let reasoning: String = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Reasoning(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        let tool_name = events.iter().find_map(|e| match e {
+            Event::ToolBegin { name, .. } => Some(name.as_str()),
+            _ => None,
+        });
+        let tool_args: String = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolArguments { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, "check records");
+        assert_eq!(tool_name, Some("lookup"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&tool_args).unwrap(),
+            json!({"query": "café", "limit": 3})
         );
     }
 

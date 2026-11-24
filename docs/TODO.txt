@@ -329,3 +329,7 @@
     fields were added to QwenImageSettings) under flare run to complete
     runtime-core backward-compatibility qualification beyond protobuf wire-byte
     and identity-domain unit tests.
+
+[ ] Run a strict required-tool check on a served GLM-5.3 core under flare run
+    after allowing whitespace between `</arg_key>` and `<arg_value>` in
+    compile_strict_glm (helios/src/grammar/strict.rs); only unit tests have run.
