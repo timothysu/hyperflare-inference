@@ -385,6 +385,7 @@ enum ImagePreparationKind {
   GLM_IMAGE_PREPARATION = 8;
   PATCH_MERGE_IMAGE_PREPARATION = 9;
   PADDED_GRID_IMAGE_PREPARATION = 10;
+  ROW_NEWLINE_IMAGE_PREPARATION = 11;
 }
 enum ImageLayoutKind {
   IMAGE_LAYOUT_UNSPECIFIED = 0;
@@ -398,6 +399,7 @@ enum ImageLayoutKind {
   GLM_IMAGE_LAYOUT = 8;
   BRACKETED_IMAGE_LAYOUT = 9;
   CLASS_TOKEN_IMAGE_LAYOUT = 10;
+  ROW_NEWLINE_IMAGE_LAYOUT = 11;
 }
 message ToolParser {
   ToolParserKind kind = 1;
@@ -520,7 +522,18 @@ message ImageSettings {
     Empty glm = 8;
     PatchMergeImageSettings patch_merge = 9;
     Empty padded_grid = 10;
+    RowNewlineImageSettings row_newline = 11;
   }
+}
+message RowNewlineImageSettings {
+  uint64 min_pixels = 1;
+  uint64 max_pixels = 2;
+  uint32 patch_size = 3;
+  uint32 merge_size = 4;
+  uint32 position_side = 5;
+  uint32 image_token_id = 6;
+  uint32 newline_token_id = 7;
+  uint32 video_token_id = 8;
 }
 message PatchMergeImageSettings {
   uint32 patch_size = 1;

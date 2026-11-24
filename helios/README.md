@@ -585,7 +585,12 @@ prepared contract names as a marker, or the placeholder text that an image
 layout lets request text spell. The server adds the contract's markers when it
 loads the core: its reasoning delimiters and terminal markers, the markers of
 the tool-call parser kind it selects (its delimiters and, for GLM and Hy, their
-argument tags), and its image feature and span tokens. The RADIO layout (the C-RADIO
+argument tags), and its image feature and span tokens. The `RowNewline` image
+profile and layout expand each image placeholder into merged spatial rows
+terminated by a configured newline token with 3D M-RoPE positions advancing by
+`max(H, W + 1)` and bilinearly interpolated learned position coordinates;
+`RowNewlineImageSettings.image_token_id` must match the contract's
+`image_tokens.feature_token`. The RADIO layout (the C-RADIO
 image encoder) is the one that lets request text spell a placeholder: its
 template lets message text place `<image>` placeholders, and cores prepared for
 it declare no placeholder token ID, so the layout supplies the text. Spelled
@@ -706,7 +711,7 @@ The `images` feature adds `frontend::images::ImageProcessor` and PNG, JPEG,
 static WebP, and non-animated GIF decoding; it also enables `frontend`. Typed core metadata
 selects the preparation profile and token layout independently. Profiles cover
 Qwen, MiMo, patch-merge, DeepSeek, DeepSeek row-major, Moonvit, Step, RADIO,
-and GLM inputs.
+GLM, and RowNewline inputs.
 The Qwen processor uses an RGB8, bicubic-antialias profile with
 16×16 patches, temporal duplication by two, spatial merge by two, a 48×48
 learned position table, and fused normalization `(pixel - 127.5) / 127.5`.

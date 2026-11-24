@@ -61,6 +61,10 @@ pub fn prepare_image_inputs(
                 .ok_or("class-token image layout requires a prepared feature token")?.feature_token,
             processor, rendered, &images,
         )?,
+        Some(ImageLayoutKind::RowNewline) => crate::frontend::images::layouts::row_newline::prepare_input(
+            config.contract.frontend.image_tokens.as_ref(),
+            processor, rendered, &images,
+        )?,
         Some(ImageLayoutKind::Qwen) => crate::frontend::images::layouts::qwen::prepare_input(
             frontend, processor, rendered, &images,
         )?,
@@ -407,6 +411,7 @@ mod tests {
             "<|media_end|>", "<im_patch>", "<patch_start>", "<patch_end>", "<patch_newline>",
             "<im_start>", "<im_end>", "<image>", "<img>", "</img>",
             "<|start|>", "<|message|>", "<|eom|>", "<|eot|>",
+            "<｜hy_image▁pad:opensource｜>", "<｜hy_image▁newline:opensource｜>", "<｜hy_video▁pad:opensource｜>",
         ].map(|text| tokenizers::AddedToken::from(text, true))).unwrap();
         let asset = |name: &str, bytes: &[u8]| {
             let path = root.join(name); std::fs::write(&path, bytes).unwrap();
@@ -423,7 +428,7 @@ mod tests {
     #[test]
     fn every_image_layout_describes_history_larger_than_the_feature_window() {
         use crate::frontend::images::{DeepseekRowMajorImageSettings, ImageSettings,
-            MimoImageSettings, QwenImageSettings};
+            MimoImageSettings, QwenImageSettings, RowNewlineImageSettings};
         use crate::model::contract::{ImageSpan, ImageTokenLayout};
         let frontend = image_frontend();
         let token = |text: &str| frontend.encode(text, false).unwrap()[0];
@@ -443,6 +448,13 @@ mod tests {
             (ImageLayoutKind::Step, ImageSettings::Step {}, "<im_patch>", 16),
             (ImageLayoutKind::Radio, ImageSettings::Radio {}, "<image>", 4),
             (ImageLayoutKind::ClassToken, ImageSettings::PaddedGrid {}, "<image>", 4),
+            (ImageLayoutKind::RowNewline, ImageSettings::RowNewline(RowNewlineImageSettings {
+                min_pixels: 4096, max_pixels: 65536, patch_size: 16, merge_size: 2,
+                position_side: 128,
+                image_token_id: token("<｜hy_image▁pad:opensource｜>"),
+                newline_token_id: token("<｜hy_image▁newline:opensource｜>"),
+                video_token_id: token("<｜hy_video▁pad:opensource｜>"),
+            }), "<｜hy_image▁pad:opensource｜>", 4),
         ];
         for (layout, settings, placeholder, merge) in profiles {
             let initial = ImageProcessor::load(settings.clone(), Default::default()).unwrap();
@@ -458,7 +470,7 @@ mod tests {
             };
             let syntax = &mut config.contract.frontend;
             syntax.image_layout = Some(layout);
-            syntax.position_dimensions = if layout == ImageLayoutKind::Qwen { 3 } else { 0 };
+            syntax.position_dimensions = if matches!(layout, ImageLayoutKind::Qwen | ImageLayoutKind::RowNewline) { 3 } else { 0 };
             syntax.rejected_tokens.clear();
             syntax.image_tokens = Some(ImageTokenLayout {
                 feature_token: match layout { ImageLayoutKind::Deepseek => 1002,

@@ -110,6 +110,41 @@ def image_settings(config, model, profile, qwen_model_type="qwen4_exp"):
         _expected(model["vision_config"], {"native_patch_size": 20, "adapter_merge_size": 2,
             "posemb_grid_size": 32, "temporal_patch_size": 2}, "padded-grid vision configuration")
         return {"padded_grid": {}}
+    if profile == "row_newline":
+        _expected(config, {"processor_class": "HYV4FlashProcessor"}, "row-newline processor")
+        image = config.get("image_processor")
+        if not isinstance(image, dict):
+            raise ValueError("unsupported row-newline image processor")
+        _expected(image, {"image_processor_type": "HYV4VLImageProcessor", "patch_size": 16,
+            "temporal_patch_size": 1, "merge_size": 2,
+            "image_mean": [0.5] * 3, "image_std": [0.5] * 3,
+            "rescale_factor": 1 / 255, "do_resize": True, "do_rescale": True,
+            "do_normalize": True, "do_convert_rgb": True}, "row-newline image processor")
+        # Upstream tencent/Hy4-flash@eccd3123eec73f2040f4c9ed0de1883593470510
+        # processor_config.json sets resample=1 (LANCZOS), which Transformers
+        # transformers/models/hunyuan_vl/image_processing_hunyuan_vl.py
+        # (HunYuanVLImageProcessor.resize) documents as unused by the reference
+        # bicubic resize; accept 1 or 3 (PIL BICUBIC) and reject conflicting kernels.
+        if "resample" in image and (type(image["resample"]) is not int or image["resample"] not in (1, 3)):
+            raise ValueError("unsupported row-newline resample kernel")
+        _expected(model, {"model_type": "hy_v4_flash"}, "row-newline model configuration")
+        vision = model["vision_config"]
+        _expected(vision, {"patch_size": 16, "spatial_merge_size": 2, "num_channels": 3,
+            "max_image_size": 2048}, "row-newline vision configuration")
+        min_pixels = image.get("min_pixels")
+        max_pixels = image.get("max_pixels")
+        if any(type(v) is not int for v in (min_pixels, max_pixels)) or not 0 < min_pixels <= max_pixels:
+            raise ValueError("unsupported row-newline resize area")
+        result = dict(min_pixels=min_pixels, max_pixels=max_pixels, patch_size=16, merge_size=2,
+                      position_side=vision["max_image_size"] // 16)
+        for field, key in (("image_token_id", "image_token_id"),
+                           ("newline_token_id", "image_newline_token_id"),
+                           ("video_token_id", "video_token_id")):
+            value = model.get(key)
+            if type(value) is not int or not 0 <= value < 2**32:
+                raise ValueError(f"invalid model {key}")
+            result[field] = value
+        return {"row_newline": result}
     if profile == "glm":
         _expected(config, {"processor_class": "Glm5NextProcessor"}, "GLM processor")
         image = config["image_processor"]

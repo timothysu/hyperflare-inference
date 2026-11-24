@@ -288,6 +288,13 @@ impl Bootstrap {
             return Err("image preparation identifier differs from its settings".into());
         }
         let images = if model.contract.vision.enabled() {
+            if let Some(crate::frontend::images::ImageSettings::RowNewline(settings)) =
+                &frontend_settings.image
+                && let Some(tokens) = &model.contract.frontend.image_tokens
+                && settings.image_token_id != tokens.feature_token
+            {
+                return Err("row-newline image_token_id differs from contract feature_token".into());
+            }
             Some(ImageProcessor::load(
                 frontend_settings
                     .image

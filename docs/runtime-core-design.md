@@ -226,7 +226,10 @@ remains request-controlled.
 `FrontendSettings` contains EOS token IDs, the special-token strings used by the
 chat template, and optional image settings. Qwen image settings contain resize
 area limits, learned-position geometry, and image/video token IDs. MiMo image
-settings contain resize limits and channel normalization. DeepSeek's image profile
+settings contain resize limits and channel normalization. RowNewline image
+settings contain resize area limits, patch and spatial-merge sizes, learned
+position grid side, and distinct image/newline/video token IDs (`image_token_id`
+must match the contract's `image_tokens.feature_token`). DeepSeek's image profile
 has fixed geometry validated by Ignition. Preparation reads and validates structural
 checkpoint config files, then exports only these consumed fields. The only frontend
 payload assets are `tokenizer.json` and the Jinja chat template; raw generation,

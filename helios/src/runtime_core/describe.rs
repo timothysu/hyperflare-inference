@@ -441,6 +441,10 @@ pub(super) fn vision_json(
                 "min_pixels": c.min_pixels, "max_pixels": c.max_pixels}),
             Profile::Glm(_) => json!({"profile": "glm"}),
             Profile::PaddedGrid(_) => json!({"profile": "padded_grid"}),
+            Profile::RowNewline(c) => json!({"profile": "row_newline", "min_pixels": c.min_pixels,
+                "max_pixels": c.max_pixels, "patch_size": c.patch_size, "merge_size": c.merge_size,
+                "position_side": c.position_side, "image_token_id": c.image_token_id,
+                "newline_token_id": c.newline_token_id, "video_token_id": c.video_token_id}),
         }
     });
     json!({
@@ -1129,6 +1133,29 @@ mod tests {
         assert_eq!(value["max_image_tokens_per_prompt"], 131072);
         assert_eq!(value["max_images"], 131072);
         assert_eq!(value["image_feature_window_tokens"], 4096);
+        let rn_settings = wire::FrontendSettings {
+            image: Some(wire::ImageSettings {
+                profile: Some(wire::image_settings::Profile::RowNewline(
+                    wire::RowNewlineImageSettings {
+                        min_pixels: 4096,
+                        max_pixels: 4_194_304,
+                        patch_size: 16,
+                        merge_size: 2,
+                        position_side: 128,
+                        image_token_id: 120120,
+                        newline_token_id: 120121,
+                        video_token_id: 120124,
+                    },
+                )),
+            }),
+            ..settings.clone()
+        };
+        let rn_value = vision_json(Some(&enabled), &rn_settings, Some(131072));
+        assert_eq!(rn_value["image"]["profile"], "row_newline");
+        assert_eq!(rn_value["image"]["position_side"], 128);
+        assert_eq!(rn_value["image"]["image_token_id"], 120120);
+        assert_eq!(rn_value["image"]["newline_token_id"], 120121);
+        assert_eq!(rn_value["image"]["video_token_id"], 120124);
         let absent_context = vision_json(Some(&enabled), &settings, None);
         assert!(absent_context["max_image_tokens_per_prompt"].is_null());
         assert!(absent_context["max_images"].is_null());

@@ -174,6 +174,12 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
                 Profile::Radio(_) => serde_json::json!({"radio": {}}),
                 Profile::Glm(_) => serde_json::json!({"glm": {}}),
                 Profile::PaddedGrid(_) => serde_json::json!({"padded_grid": {}}),
+                Profile::RowNewline(config) => serde_json::json!({"row_newline": {
+                    "min_pixels": config.min_pixels, "max_pixels": config.max_pixels,
+                    "patch_size": config.patch_size, "merge_size": config.merge_size,
+                    "position_side": config.position_side, "image_token_id": config.image_token_id,
+                    "newline_token_id": config.newline_token_id, "video_token_id": config.video_token_id,
+                }}),
             })
         })
         .transpose()?;
@@ -1034,6 +1040,43 @@ mod tests {
             )
             .unwrap(),
             ReasoningParserKind::HyThink
+        );
+        assert_eq!(
+            crate::model::contract::ImagePreparationKind::try_from(11).unwrap(),
+            crate::model::contract::ImagePreparationKind::RowNewline
+        );
+        assert_eq!(
+            crate::model::contract::ImageLayoutKind::try_from(11).unwrap(),
+            crate::model::contract::ImageLayoutKind::RowNewline
+        );
+        let settings = wire::ImageSettings {
+            profile: Some(wire::image_settings::Profile::RowNewline(
+                wire::RowNewlineImageSettings {
+                    min_pixels: 4096,
+                    max_pixels: 4_194_304,
+                    patch_size: 16,
+                    merge_size: 2,
+                    position_side: 128,
+                    image_token_id: 120120,
+                    newline_token_id: 120121,
+                    video_token_id: 120124,
+                },
+            )),
+        };
+        let encoded = settings.encode_to_vec();
+        let decoded = wire::ImageSettings::decode(encoded.as_slice()).unwrap();
+        let frontend_json = frontend_settings(wire::FrontendSettings {
+            tokenizer: Some(wire::TokenizerSettings::default()),
+            eos_token_ids: vec![1],
+            image: Some(decoded),
+            ..Default::default()
+        })
+        .unwrap();
+        let parsed: crate::frontend::images::ImageSettings =
+            serde_json::from_value(frontend_json["image"].clone()).unwrap();
+        assert_eq!(
+            parsed.preparation_kind(),
+            crate::model::contract::ImagePreparationKind::RowNewline
         );
         assert!(ToolParserKind::try_from(wire::ToolParser::decode(&[][..]).unwrap().kind).is_err());
         let syntax: FrontendContract = serde_json::from_value(

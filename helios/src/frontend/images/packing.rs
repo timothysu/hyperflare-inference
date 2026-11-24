@@ -28,7 +28,9 @@ pub(crate) fn tensor_layout(
             "vision_pixel_values",
         ) => (Float32, patches * 588),
         (ImageLayoutKind::Bracketed, "vision_pixel_values") => (Float32, patches * 1176),
-        (ImageLayoutKind::Radio, "vision_pixel_values") => (Float32, patches * 768),
+        (ImageLayoutKind::Radio | ImageLayoutKind::RowNewline, "vision_pixel_values") => {
+            (Float32, patches * 768)
+        }
         (ImageLayoutKind::Glm, "vision_pixel_values") => (Float32, patches * 1176),
         (ImageLayoutKind::ClassToken, "vision_pixel_values") => (Float32, patches * 1200),
         // One class-token row precedes each image's patch positions.
@@ -43,7 +45,8 @@ pub(crate) fn tensor_layout(
             | ImageLayoutKind::Moonvit
             | ImageLayoutKind::Step
             | ImageLayoutKind::Radio
-            | ImageLayoutKind::ClassToken,
+            | ImageLayoutKind::ClassToken
+            | ImageLayoutKind::RowNewline,
             "vision_num_features",
         ) => (Int32, 1),
         (
@@ -51,7 +54,8 @@ pub(crate) fn tensor_layout(
             | ImageLayoutKind::Moonvit
             | ImageLayoutKind::Step
             | ImageLayoutKind::Radio
-            | ImageLayoutKind::ClassToken,
+            | ImageLayoutKind::ClassToken
+            | ImageLayoutKind::RowNewline,
             "vision_interpolation_indices",
         ) => (Int64, patches * 4),
         (
@@ -59,14 +63,16 @@ pub(crate) fn tensor_layout(
             | ImageLayoutKind::Moonvit
             | ImageLayoutKind::Step
             | ImageLayoutKind::Radio
-            | ImageLayoutKind::ClassToken,
+            | ImageLayoutKind::ClassToken
+            | ImageLayoutKind::RowNewline,
             "vision_interpolation_weights",
         ) => (Float32, patches * 4),
         (ImageLayoutKind::Mimo, "vision_column_indices" | "vision_row_indices") => {
             (Int32, patches / 4)
         }
         (
-            ImageLayoutKind::Deepseek | ImageLayoutKind::DeepseekRowMajor | ImageLayoutKind::Moonvit | ImageLayoutKind::Radio,
+            ImageLayoutKind::Deepseek | ImageLayoutKind::DeepseekRowMajor | ImageLayoutKind::Moonvit
+            | ImageLayoutKind::Radio | ImageLayoutKind::RowNewline,
             "vision_merge_indices",
         ) => (Int32, patches),
         (ImageLayoutKind::Step, "vision_downsample1_indices") => (Int32, patches / 4 * 9),
@@ -95,7 +101,9 @@ pub(crate) fn prepare(
         ImageLayoutKind::Qwen | ImageLayoutKind::Glm => qwen(config, handle, images, image, destination_feature_offset),
         ImageLayoutKind::Mimo => mimo(config, handle, images, image, destination_feature_offset),
         ImageLayoutKind::Deepseek | ImageLayoutKind::DeepseekRowMajor => deepseek(config, handle, images, image, destination_feature_offset),
-        ImageLayoutKind::Moonvit | ImageLayoutKind::Radio => spatial_merge(config, handle, images, image, destination_feature_offset),
+        ImageLayoutKind::Moonvit | ImageLayoutKind::Radio | ImageLayoutKind::RowNewline => {
+            spatial_merge(config, handle, images, image, destination_feature_offset)
+        }
         ImageLayoutKind::Step => step(config, handle, images, image, destination_feature_offset),
         ImageLayoutKind::ClassToken => class_token(config, handle, images, image, destination_feature_offset),
     }
@@ -113,7 +121,10 @@ fn qwen(
         Some(ImageLayoutKind::Moonvit | ImageLayoutKind::Step)
     ) {
         588
-    } else if config.contract.frontend.image_layout == Some(ImageLayoutKind::Radio) {
+    } else if matches!(
+        config.contract.frontend.image_layout,
+        Some(ImageLayoutKind::Radio | ImageLayoutKind::RowNewline)
+    ) {
         768
     } else if config.contract.frontend.image_layout == Some(ImageLayoutKind::Glm) {
         1176
@@ -367,10 +378,17 @@ fn spatial_merge(
         .ok_or("missing scheduled image")?;
     let h = usize::try_from(geometry.grid_thw[1]).map_err(|_| "invalid vision height")?;
     let w = usize::try_from(geometry.grid_thw[2]).map_err(|_| "invalid vision width")?;
-    let max_side = if config.contract.frontend.image_layout == Some(ImageLayoutKind::Radio) {
-        13312
-    } else {
-        512
+    let max_side = match config.contract.frontend.image_layout {
+        Some(ImageLayoutKind::Radio) => 13312,
+        // Extreme 200:1 aspect-ratio images can exceed 512 patches on one side while still
+        // fitting the prepared vision graph's total patch capacity (`h * w <= max_patches`).
+        Some(ImageLayoutKind::RowNewline) => *config
+            .contract
+            .vision
+            .patch_capacities
+            .last()
+            .ok_or("missing vision patch capacities")?,
+        _ => 512,
     };
     if h == 0
         || w == 0

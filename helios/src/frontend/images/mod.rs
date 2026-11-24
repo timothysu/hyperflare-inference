@@ -26,6 +26,7 @@ mod patch_merge;
 mod qwen;
 mod radio;
 mod resize;
+mod row_newline;
 mod step;
 
 use std::fmt::Write as _;
@@ -256,6 +257,7 @@ pub enum ImageSettings {
     Radio {},
     Glm {},
     PaddedGrid {},
+    RowNewline(RowNewlineImageSettings),
 }
 
 /// The text that stands for an image in a RADIO prompt.
@@ -282,8 +284,22 @@ impl ImageSettings {
             Self::Radio {} => ImagePreparationKind::Radio,
             Self::Glm {} => ImagePreparationKind::Glm,
             Self::PaddedGrid {} => ImagePreparationKind::PaddedGrid,
+            Self::RowNewline(_) => ImagePreparationKind::RowNewline,
         }
     }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowNewlineImageSettings {
+    pub min_pixels: usize,
+    pub max_pixels: usize,
+    pub patch_size: usize,
+    pub merge_size: usize,
+    pub position_side: usize,
+    pub image_token_id: u32,
+    pub newline_token_id: u32,
+    pub video_token_id: u32,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -338,6 +354,7 @@ enum Profile {
     Radio,
     Glm,
     PaddedGrid,
+    RowNewline(row_newline::RowNewlineProcessor),
 }
 
 impl ImageProcessor {
@@ -375,6 +392,9 @@ impl ImageProcessor {
             ImageSettings::PatchMerge(settings) => Profile::PatchMerge(patch_merge::Processor::load(settings, limits)?),
             ImageSettings::Qwen(settings) => {
                 Profile::Qwen(qwen::QwenProcessor::load(&settings, limits)?)
+            }
+            ImageSettings::RowNewline(settings) => {
+                Profile::RowNewline(row_newline::RowNewlineProcessor::load(&settings, limits)?)
             }
         };
         Ok(Self { limits, profile, identity_domain, counts: Default::default(), decoded_budget })
@@ -831,6 +851,13 @@ impl ImageProcessor {
         Ok(image)
     }
 
+    pub(crate) fn row_newline_tokens(&self) -> Option<(u32, u32, u32)> {
+        match &self.profile {
+            Profile::RowNewline(profile) => Some(profile.tokens()),
+            _ => None,
+        }
+    }
+
     pub fn geometry(&self, width: usize, height: usize) -> Result<ImageGeometry> {
         match &self.profile {
             Profile::Qwen(profile) => profile.patches.geometry(width, height),
@@ -843,6 +870,7 @@ impl ImageProcessor {
             Profile::Radio => radio::geometry(self.limits, width, height),
             Profile::Glm => glm::geometry(self.limits, width, height),
             Profile::PaddedGrid => padded_grid::geometry(self.limits, width, height),
+            Profile::RowNewline(profile) => profile.geometry(width, height),
         }
     }
     pub fn resized_rgb(&self, image: &RgbImage) -> Result<(ImageGeometry, Vec<u8>)> {
@@ -857,6 +885,7 @@ impl ImageProcessor {
             Profile::Radio => Err("RADIO resizing produces float32 pixels; use process".into()),
             Profile::Glm => glm::resized_rgb(self.limits, image),
             Profile::PaddedGrid => Err("padded-grid preparation pads with values outside RGB8; use process".into()),
+            Profile::RowNewline(profile) => profile.resized_rgb(image),
         }
     }
     pub fn process(&self, images: &[RgbImage]) -> Result<ProcessedImages> {
@@ -876,6 +905,7 @@ impl ImageProcessor {
             Profile::Radio => radio::process(self.limits, images),
             Profile::Glm => glm::process(self.limits, images),
             Profile::PaddedGrid => padded_grid::process(self.limits, images),
+            Profile::RowNewline(profile) => profile.process(images),
         }
     }
     pub fn expand_prompt(
@@ -896,6 +926,7 @@ impl ImageProcessor {
             Profile::Radio => Err("RADIO image expansion requires its model contract".into()),
             Profile::Glm => Err("GLM image expansion requires its prepared layout".into()),
             Profile::PaddedGrid => Err("padded-grid image expansion requires its prepared layout".into()),
+            Profile::RowNewline(_) => Err("row-newline image expansion requires its prepared layout".into()),
         }
     }
 }
@@ -1024,6 +1055,11 @@ mod tests {
             ImageSettings::DeepseekRowMajor(DeepseekRowMajorImageSettings { min_pixels: 46656,
                 max_tokens: 1024, max_width_height_ratio: None }),
             ImageSettings::Moonvit {}, ImageSettings::Step {}, ImageSettings::Radio {},
+            ImageSettings::RowNewline(RowNewlineImageSettings {
+                min_pixels: 4096, max_pixels: 4_194_304, patch_size: 16, merge_size: 2,
+                position_side: 128, image_token_id: 120120, newline_token_id: 120121,
+                video_token_id: 120124,
+            }),
         ];
         for settings in settings {
             let limits = ImageLimits { max_patches_per_image: 65536, max_total_patches: 65536,

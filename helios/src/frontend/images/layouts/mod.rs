@@ -13,3 +13,4 @@ pub(crate) mod radio;
 pub(crate) mod step;
 pub(crate) mod bracketed;
 pub(crate) mod class_token;
+pub(crate) mod row_newline;

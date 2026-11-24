@@ -186,7 +186,7 @@ impl PreparedImageInput {
         use super::Profile;
         let pixel_width = match self.processor.profile {
             Profile::Qwen(_) | Profile::MiMo(_) => 1536,
-            Profile::Radio => 768,
+            Profile::Radio | Profile::RowNewline(_) => 768,
             Profile::Glm => 1176,
             Profile::PaddedGrid => super::padded_grid::FEATURES,
             _ => 588,
@@ -194,7 +194,12 @@ impl PreparedImageInput {
         let patches = self.geometry.patches;
         let interpolation = matches!(
             self.processor.profile,
-            Profile::Qwen(_) | Profile::Moonvit | Profile::Step | Profile::Radio | Profile::PaddedGrid
+            Profile::Qwen(_)
+                | Profile::Moonvit
+                | Profile::Step
+                | Profile::Radio
+                | Profile::PaddedGrid
+                | Profile::RowNewline(_)
         );
         let sequences = if matches!(self.processor.profile, Profile::Step) {
             let local = self.geometry.grid_thw[1] * self.geometry.grid_thw[2];
@@ -329,7 +334,7 @@ mod tests {
     use super::*;
     use crate::frontend::images::{
         DeepseekRowMajorImageSettings, ImageLimits, ImageSettings, MimoImageSettings,
-        QwenImageSettings,
+        QwenImageSettings, RowNewlineImageSettings,
     };
 
     fn settings() -> Vec<ImageSettings> {
@@ -357,6 +362,16 @@ mod tests {
             ImageSettings::Step {},
             ImageSettings::Radio {},
             ImageSettings::PaddedGrid {},
+            ImageSettings::RowNewline(RowNewlineImageSettings {
+                min_pixels: 4096,
+                max_pixels: 4_194_304,
+                patch_size: 16,
+                merge_size: 2,
+                position_side: 128,
+                image_token_id: 120120,
+                newline_token_id: 120121,
+                video_token_id: 120124,
+            }),
         ]
     }
 
