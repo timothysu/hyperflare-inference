@@ -43,12 +43,12 @@ class EngramInputs:
     interval: int
 
     @classmethod
-    def allocate(cls, tokens, device, *, timings, interval=0):
+    def allocate(cls, tokens, device, *, timings, interval=0, heads=24, row_bytes=256, scale_bytes=8):
         ready = torch.cuda.Event(external=True)
         ready.record(torch.cuda.current_stream(device))
-        return cls(torch.zeros((tokens * 24, 256), dtype=torch.uint8, device=device),
-                   torch.zeros((tokens * 24, 8), dtype=torch.uint8, device=device),
-                   torch.full((tokens, 24), -1, dtype=torch.int64, device=device), ready, timings, interval)
+        return cls(torch.zeros((tokens * heads, row_bytes), dtype=torch.uint8, device=device),
+                   torch.zeros((tokens * heads, scale_bytes), dtype=torch.uint8, device=device),
+                   torch.full((tokens, heads), -1, dtype=torch.int64, device=device), ready, timings, interval)
 
     def buffers(self, layer):
         return {f"engram_{layer}_{name}": getattr(self, name) for name in ("weights", "scales", "hashes")}

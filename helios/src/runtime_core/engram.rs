@@ -115,28 +115,44 @@ pub(super) fn decode<F: super::payload::Files>(
         let gpu = !table.request_buffer.is_empty();
         let encoding = wire::engram_table::Encoding::try_from(table.encoding)
             .map_err(|_| invalid("unknown n-gram encoding"))?;
-        let (width, block, row_bytes, scale_bytes) = match encoding {
-            wire::engram_table::Encoding::Fp8E4m3E8m0 => (256, 32, 256, 8),
-            wire::engram_table::Encoding::Nvfp4E4m3Global
-                if table.global_scale.is_finite() && table.global_scale > 0.0 =>
+        let (block, row_bytes, scale_bytes) = match encoding {
+            wire::engram_table::Encoding::Fp8E4m3E8m0
+                if table.scale_block == 32
+                    && table.embedding_width > 0
+                    && table.embedding_width.is_multiple_of(32) =>
             {
-                (160, 16, 80, 10)
+                let width = table.embedding_width as usize;
+                (32u32, width, width / 32)
             }
-            _ => return Err(invalid("invalid n-gram encoding or global scale")),
+            wire::engram_table::Encoding::Nvfp4E4m3Global
+                if table.global_scale.is_finite()
+                    && table.global_scale > 0.0
+                    && table.scale_block == 16
+                    && table.embedding_width > 0
+                    && table.embedding_width.is_multiple_of(16) =>
+            {
+                let width = table.embedding_width as usize;
+                (16u32, width / 2, width / 16)
+            }
+            _ => return Err(invalid("invalid n-gram encoding, width, scale block, or global scale")),
         };
         let geometry = table
             .hash
             .as_ref()
             .ok_or_else(|| invalid("n-gram table lacks hash geometry"))?;
         let order = match wire::engram_hash::Method::try_from(geometry.method) {
-            Ok(wire::engram_hash::Method::XorModulo) if !value.token_map.is_empty() => 4,
+            Ok(wire::engram_hash::Method::XorModulo)
+                if !value.token_map.is_empty()
+                    && matches!(geometry.multipliers.len(), 3 | 4) =>
+            {
+                geometry.multipliers.len()
+            }
             Ok(wire::engram_hash::Method::EosXorModulo) if gpu && value.token_map.is_empty() => 3,
             _ => return Err(invalid("unsupported n-gram hash method or request source")),
         };
         let heads = (order - 1) * 8;
         if !layers.insert(table.layer)
             || table.rows == 0
-            || table.embedding_width != width
             || table.scale_block != block
             || !events.insert(table.ready_event.clone())
             || table.ready_event.is_empty()
@@ -204,15 +220,14 @@ pub(super) fn decode<F: super::payload::Files>(
                 .execution
                 .as_ref()
                 .ok_or_else(|| invalid("Engram rank lacks execution bindings"))?;
+            let is_consumer = |kind: &str| {
+                crate::execution::GraphKind::try_from(kind)
+                    .is_ok_and(crate::engram::consumes)
+            };
             let tokens = execution
                 .graphs
                 .iter()
-                .filter(|g| {
-                    matches!(
-                        g.kind.as_str(),
-                        "prefill" | "terminal_prefill" | "decode" | "speculative" | "mixed"
-                    )
-                })
+                .filter(|g| is_consumer(g.kind.as_str()))
                 .map(|g| g.packed_tokens())
                 .max()
                 .ok_or_else(|| invalid("Engram catalog lacks consumers"))?;
@@ -267,12 +282,11 @@ pub(super) fn decode<F: super::payload::Files>(
                     return Err(invalid("invalid mapped n-gram mailbox"));
                 }
             }
-            for graph in execution.graphs.iter().filter(|g| {
-                matches!(
-                    g.kind.as_str(),
-                    "prefill" | "terminal_prefill" | "decode" | "speculative" | "mixed"
-                )
-            }) {
+            for graph in execution
+                .graphs
+                .iter()
+                .filter(|g| is_consumer(g.kind.as_str()))
+            {
                 if !gpu
                     && !graph.input_bindings.iter().any(|b| {
                         b.buffer_name == table.hash_buffer
@@ -384,5 +398,359 @@ mod tests {
             assert_eq!((planes[0].1.offset, planes[0].1.nbytes), (0, 32));
             assert_eq!((planes[1].1.offset, planes[1].1.nbytes), (32, 8));
         }
+    }
+
+    #[test]
+    fn engram_accepts_generalized_widths_and_order3_or_order4_hashing() {
+        use super::super::{
+            archive::PayloadFile,
+            format::{Allocation, Context},
+            payload::{Files, RecordReader},
+        };
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        struct StubFiles {
+            file: PayloadFile,
+            path: std::path::PathBuf,
+        }
+        impl Files for StubFiles {
+            fn span<'a>(&self, _: &'a Core, _: &str) -> Result<&'a wire::Span> {
+                unreachable!()
+            }
+            fn source(&self, span: &wire::Span) -> Result<(&PayloadFile, u64)> {
+                Ok((&self.file, span.offset))
+            }
+            fn read(&self, _: &Core, _: &str) -> Result<Vec<u8>> {
+                unreachable!()
+            }
+            fn records<'a>(&'a self, _: &Core, _: &str) -> Result<RecordReader<'a>> {
+                unreachable!()
+            }
+            fn path(&self) -> &std::path::Path {
+                &self.path
+            }
+            fn source_index(&self, _: &wire::Span) -> Result<usize> {
+                Ok(0)
+            }
+            fn asset_path(&self, _: &wire::Span) -> Result<std::path::PathBuf> {
+                unreachable!()
+            }
+            fn release_page_cache(&self) {}
+            fn retained_files(&self) -> Result<Vec<Arc<std::fs::File>>> {
+                Ok(vec![])
+            }
+            fn direct_files(
+                &self,
+            ) -> Box<dyn Iterator<Item = Result<Arc<std::fs::File>>> + '_> {
+                Box::new(std::iter::empty())
+            }
+            fn validate(&self, _: &Core) -> Result<()> {
+                Ok(())
+            }
+            fn resource_reader<'a>(
+                &'a self,
+                _: &Core,
+                _: &str,
+            ) -> Result<Box<dyn std::io::Read + 'a>> {
+                unreachable!()
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!("flare-engram-stub-{}", std::process::id()));
+        std::fs::write(&path, [0u8; 16]).unwrap();
+        let files = StubFiles {
+            file: PayloadFile::new(Arc::new(std::fs::File::open(&path).unwrap()), 0, 16),
+            path: path.clone(),
+        };
+
+        let make_core = |heads: u64, row_bytes: u64, scale_bytes: u64, with_mailbox: bool| {
+            let mut buffers = vec![
+                wire::Buffer {
+                    name: "weights".into(),
+                    dtype: "uint8".into(),
+                    shape: vec![heads, row_bytes],
+                    strides: vec![row_bytes, 1],
+                    nbytes: heads * row_bytes,
+                    reference: None,
+                },
+                wire::Buffer {
+                    name: "scales".into(),
+                    dtype: "uint8".into(),
+                    shape: vec![heads, scale_bytes],
+                    strides: vec![scale_bytes, 1],
+                    nbytes: heads * scale_bytes,
+                    reference: None,
+                },
+                wire::Buffer {
+                    name: "hashes".into(),
+                    dtype: "int64".into(),
+                    shape: vec![1, heads],
+                    strides: vec![heads, 1],
+                    nbytes: heads * 8,
+                    reference: None,
+                },
+            ];
+            let mut allocations = vec![];
+            let mut input_bindings = vec![];
+            if with_mailbox {
+                allocations.push(Allocation {
+                    name: "mailbox_alloc".into(),
+                    sizing: None,
+                    nbytes: (heads as usize + 1) * 8,
+                    alignment: 64,
+                    file: None,
+                    data_spans: vec![],
+                    sources: vec![],
+                    relocations: vec![],
+                    address: None,
+                    memory: Memory::MappedHost,
+                });
+                buffers.push(wire::Buffer {
+                    name: "requests".into(),
+                    dtype: "int64".into(),
+                    shape: vec![heads + 1],
+                    strides: vec![1],
+                    nbytes: (heads + 1) * 8,
+                    reference: Some(wire::Reference {
+                        allocation: "mailbox_alloc".into(),
+                        offset: 0,
+                    }),
+                });
+            } else {
+                input_bindings.push(wire::InputBinding {
+                    buffer_name: "hashes".into(),
+                    host_offset: 0,
+                    nbytes: heads * 8,
+                });
+            }
+            Core {
+                resources: HashMap::new(),
+                architecture: [12, 0],
+                allocations,
+                modules: vec![],
+                functions: vec![],
+                graphs: vec![],
+                reservations: vec![],
+                context: Context::default(),
+                events: vec!["engram_ready".into()],
+                execution: Some(wire::Execution {
+                    graphs: vec![wire::ExecutionGraph {
+                        name: "decode1".into(),
+                        kind: "decode".into(),
+                        batch_capacity: 1,
+                        token_capacity: 1,
+                        input_bindings,
+                        ..Default::default()
+                    }],
+                    buffers,
+                    ..Default::default()
+                }),
+            }
+        };
+
+        let make_engram = |encoding: wire::engram_table::Encoding,
+                           width: u32,
+                           scale_block: u32,
+                           global_scale: f32,
+                           order: usize,
+                           with_mailbox: bool| {
+            let heads = (order - 1) * 8;
+            let (row_bytes, scale_bytes) = match encoding {
+                wire::engram_table::Encoding::Fp8E4m3E8m0 => (width as u64, (width / scale_block) as u64),
+                _ => ((width / 2) as u64, (width / scale_block) as u64),
+            };
+            wire::Engram {
+                token_map: vec![0, 1, 2],
+                pad_token_id: 2,
+                compressed_vocabulary: 3,
+                tables: vec![wire::EngramTable {
+                    layer: 1,
+                    rows: 500,
+                    embedding_width: width,
+                    scale_block,
+                    encoding: encoding as i32,
+                    global_scale,
+                    hash: Some(wire::EngramHash {
+                        method: wire::engram_hash::Method::XorModulo as i32,
+                        orders: (2..=order as u32).flat_map(|n| [n; 8]).collect(),
+                        multipliers: vec![3; order],
+                        primes: vec![17; heads],
+                        offsets: (0..heads as u64).map(|i| i * 17).collect(),
+                    }),
+                    weights: Some(wire::Span {
+                        filename: "w.bin".into(),
+                        offset: 0,
+                        nbytes: 500 * row_bytes,
+                    }),
+                    scales: Some(wire::Span {
+                        filename: "s.bin".into(),
+                        offset: 0,
+                        nbytes: 500 * scale_bytes,
+                    }),
+                    weight_buffer: "weights".into(),
+                    scale_buffer: "scales".into(),
+                    hash_buffer: "hashes".into(),
+                    ready_event: "engram_ready".into(),
+                    request_buffer: if with_mailbox { "requests".into() } else { String::new() },
+                    ..Default::default()
+                }],
+            }
+        };
+
+        // Generalized host-hash geometry: FP8_E4M3_E8M0 width 96, block 32 (96B + 3B), order-3 (16 heads).
+        let idx = decode(
+            make_engram(wire::engram_table::Encoding::Fp8E4m3E8m0, 96, 32, 0.0, 3, false),
+            &files,
+            &[make_core(16, 96, 3, false)],
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(idx.tables.len(), 1);
+        assert_eq!(idx.tables[0].heads, 16);
+        assert_eq!(idx.tables[0].planes[0].row_bytes, 96);
+        assert_eq!(idx.tables[0].planes[1].row_bytes, 3);
+        assert!(idx.tables[0].request.is_none());
+
+        // DeepSeek host-hash geometry: FP8_E4M3_E8M0 width 256, block 32 (256B + 8B), order-4 (24 heads).
+        let ds_idx = decode(
+            make_engram(wire::engram_table::Encoding::Fp8E4m3E8m0, 256, 32, 0.0, 4, false),
+            &files,
+            &[make_core(24, 256, 8, false)],
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(ds_idx.tables[0].heads, 24);
+        assert_eq!(ds_idx.tables[0].planes[0].row_bytes, 256);
+        assert_eq!(ds_idx.tables[0].planes[1].row_bytes, 8);
+
+        // Order-3 (16 heads) width-96 GPU-mailbox geometry for both FP8_E4M3_E8M0 and NVFP4_E4M3_GLOBAL.
+        let fp8_mb = decode(
+            make_engram(wire::engram_table::Encoding::Fp8E4m3E8m0, 96, 32, 0.0, 3, true),
+            &files,
+            &[make_core(16, 96, 3, true)],
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(fp8_mb.tables[0].heads, 16);
+        assert_eq!(fp8_mb.tables[0].planes[0].row_bytes, 96);
+        assert_eq!(fp8_mb.tables[0].planes[1].row_bytes, 3);
+        assert_eq!(fp8_mb.tables[0].request.as_deref(), Some("requests"));
+
+        let fp4_mb = decode(
+            make_engram(wire::engram_table::Encoding::Nvfp4E4m3Global, 96, 16, 1.5, 3, true),
+            &files,
+            &[make_core(16, 48, 6, true)],
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(fp4_mb.tables[0].heads, 16);
+        assert_eq!(fp4_mb.tables[0].planes[0].row_bytes, 48);
+        assert_eq!(fp4_mb.tables[0].planes[1].row_bytes, 6);
+        assert_eq!(fp4_mb.tables[0].request.as_deref(), Some("requests"));
+
+        // Width not divisible by scale_block 32 is rejected with updated diagnostic text.
+        let bad_width = decode(
+            make_engram(wire::engram_table::Encoding::Fp8E4m3E8m0, 80, 32, 0.0, 3, false),
+            &files,
+            &[make_core(16, 80, 2, false)],
+            0,
+            1,
+        )
+        .unwrap_err();
+        assert!(bad_width.to_string().contains("width"));
+
+        // Unsupported order 2 is rejected.
+        assert!(decode(
+            make_engram(wire::engram_table::Encoding::Fp8E4m3E8m0, 96, 32, 0.0, 2, false),
+            &files,
+            &[make_core(8, 96, 3, false)],
+            0,
+            1,
+        )
+        .is_err());
+
+        // ScoredPrefill is counted as an Engram consumer for both compact buffer sizing
+        // and per-graph host-hash binding validation (matching crate::engram::consumes).
+        let mut core_under = make_core(16, 96, 3, false);
+        core_under.execution.as_mut().unwrap().graphs.push(wire::ExecutionGraph {
+            name: "scored4".into(),
+            kind: "scored_prefill".into(),
+            batch_capacity: 1,
+            token_capacity: 4,
+            input_bindings: vec![wire::InputBinding {
+                buffer_name: "hashes".into(),
+                host_offset: 0,
+                nbytes: 4 * 16 * 8,
+            }],
+            ..Default::default()
+        });
+        assert!(decode(
+            make_engram(wire::engram_table::Encoding::Fp8E4m3E8m0, 96, 32, 0.0, 3, false),
+            &files,
+            &[core_under],
+            0,
+            1,
+        )
+        .is_err());
+
+        // Sizing compact buffers to match scored_prefill succeeds, while omitting
+        // scored_prefill's host hash binding is rejected.
+        let make_scored_core = |with_binding: bool| {
+            let mut core = make_core(16, 96, 3, false);
+            for buf in &mut core.execution.as_mut().unwrap().buffers {
+                if buf.name == "weights" {
+                    buf.shape = vec![4 * 16, 96];
+                    buf.nbytes = 4 * 16 * 96;
+                } else if buf.name == "scales" {
+                    buf.shape = vec![4 * 16, 3];
+                    buf.nbytes = 4 * 16 * 3;
+                } else if buf.name == "hashes" {
+                    buf.shape = vec![4, 16];
+                    buf.nbytes = 4 * 16 * 8;
+                }
+            }
+            core.execution.as_mut().unwrap().graphs.push(wire::ExecutionGraph {
+                name: "scored4".into(),
+                kind: "scored_prefill".into(),
+                batch_capacity: 1,
+                token_capacity: 4,
+                input_bindings: if with_binding {
+                    vec![wire::InputBinding {
+                        buffer_name: "hashes".into(),
+                        host_offset: 0,
+                        nbytes: 4 * 16 * 8,
+                    }]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            });
+            core
+        };
+        assert!(decode(
+            make_engram(wire::engram_table::Encoding::Fp8E4m3E8m0, 96, 32, 0.0, 3, false),
+            &files,
+            &[make_scored_core(true)],
+            0,
+            1,
+        )
+        .is_ok());
+
+        let missing_err = decode(
+            make_engram(wire::engram_table::Encoding::Fp8E4m3E8m0, 96, 32, 0.0, 3, false),
+            &files,
+            &[make_scored_core(false)],
+            0,
+            1,
+        )
+        .unwrap_err();
+        assert!(missing_err.to_string().contains("hash input binding"));
+
+        std::fs::remove_file(&path).unwrap();
     }
 }

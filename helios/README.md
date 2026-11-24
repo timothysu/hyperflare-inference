@@ -652,6 +652,10 @@ requested rows; recency breaks ties, and periodic count decay adapts to workload
 changes. Each server start creates an empty row cache; request gathers populate
 it without persistent cache files. `/metrics` exposes `flare_engram_` gather
 time, disk traffic, cache hits, misses, evictions, occupancy, capacity and bytes.
+Engram tables support `FP8_E4M3_E8M0` (any positive width divisible by 32) and
+`NVFP4_E4M3_GLOBAL` (any positive width divisible by 16 with a positive finite
+global scale), with order-3 (16-head) or order-4 (24-head) `XOR_MODULO` hashing
+or order-3 `EOS_XOR_MODULO` GPU-mailbox hashing.
 
 ## Prefix checkpoint policy
 

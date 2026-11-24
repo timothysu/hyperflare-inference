@@ -323,3 +323,8 @@
     dense Qwen3.8, and read each one's pre-tokenizer for Metaspace (see the test
     header). Close when each passes and none uses Metaspace, or loading rejects
     one that does.
+
+[ ] Load and serve a previously exported DeepSeek Engram core under flare run
+    after the generalized Engram table width and 3-gram/4-gram hash validation
+    changes in helios/src/runtime_core/engram.rs to complete runtime-core
+    backward-compatibility qualification beyond unit tests.
