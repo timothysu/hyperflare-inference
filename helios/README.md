@@ -584,8 +584,8 @@ special, or that the chat template or one of its defaults names, or that the
 prepared contract names as a marker, or the placeholder text that an image
 layout lets request text spell. The server adds the contract's markers when it
 loads the core: its reasoning delimiters and terminal markers, the markers of
-the tool-call parser kind it selects (its delimiters and, for GLM, its argument
-tags), and its image feature and span tokens. The RADIO layout (the C-RADIO
+the tool-call parser kind it selects (its delimiters and, for GLM and Hy, their
+argument tags), and its image feature and span tokens. The RADIO layout (the C-RADIO
 image encoder) is the one that lets request text spell a placeholder: its
 template lets message text place `<image>` placeholders, and cores prepared for
 it declare no placeholder token ID, so the layout supplies the text. Spelled

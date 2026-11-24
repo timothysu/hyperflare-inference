@@ -811,7 +811,7 @@ fn prepared_templates_keep_their_own_controls_for_ordinary_requests() {
 /// Prepared templates, with the control spellings each one writes for the roles, reasoning and
 /// tool calls of `prepared_context` (the markers of the recipe contracts, and the other added
 /// tokens the template emits).
-const PREPARED_TEMPLATES: [(&str, &str, &[&str]); 9] = [
+const PREPARED_TEMPLATES: [(&str, &str, &[&str]); 10] = [
     ("glm53", "chat_template", &["<|system|>", "<|user|>", "<|assistant|>", "<|observation|>", "<think>", "</think>", "<tool_call>", "</tool_call>"]),
     ("qwen38", "chat_template", &["<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>", "</tool_call>"]),
     ("step5", "chat_template", &["<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>", "</tool_call>"]),
@@ -821,6 +821,7 @@ const PREPARED_TEMPLATES: [(&str, &str, &[&str]); 9] = [
     ("nemotron_h", "chat_template", &["<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>", "</tool_call>"]),
     ("gemma4", "chat_template.google", &["<|turn>", "<turn|>", "<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>", "<|tool_response>", "<tool_response|>"]),
     ("gemma4", "chat_template.google-e2b-e4b", &["<|turn>", "<turn|>", "<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>", "<|tool_response>", "<tool_response|>"]),
+    ("hy4_flash", "chat_template", &["<｜hy_start:opensource｜>", "<｜hy_middle:opensource｜>", "<｜hy_end:opensource｜>", "<think:opensource>", "</think:opensource>", "<tool_calls:opensource>", "</tool_calls:opensource>", "<tool_call:opensource>", "</tool_call:opensource>", "<arg_key:opensource>", "</arg_key:opensource>", "<arg_value:opensource>", "</arg_value:opensource>"]),
 ];
 
 /// A conversation, tools and documents in which every request string is `marker`.

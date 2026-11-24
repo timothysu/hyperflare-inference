@@ -328,3 +328,8 @@
     after the generalized Engram table width and 3-gram/4-gram hash validation
     changes in helios/src/runtime_core/engram.rs to complete runtime-core
     backward-compatibility qualification beyond unit tests.
+
+[ ] Load and serve a previously exported GLM or Qwen core under flare run after
+    the argument-tag parser and strict-tool grammar refactoring for
+    HyThink/HyArgumentTags to complete end-to-end parser compatibility
+    qualification beyond unit tests.

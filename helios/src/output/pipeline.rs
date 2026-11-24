@@ -27,6 +27,7 @@ pub enum OutputPipeline {
     FunctionTags(TaggedOutput<super::chatml::FunctionTags<true>>),
     CompactFunctionTags(TaggedOutput<super::chatml::FunctionTags<false>>),
     ArgumentTags(TaggedOutput<super::argument_tags::ArgumentTags>),
+    HyArgumentTags(TaggedOutput<super::argument_tags::HyArgumentTags>),
     Dsml(super::dsml::DsmlOutput<false>),
     SpacedDsml(super::dsml::DsmlOutput<true>),
     Xtml(super::xtml::XtmlOutput),
@@ -54,6 +55,7 @@ macro_rules! dispatch {
             OutputPipeline::FunctionTags($parser) => $body,
             OutputPipeline::CompactFunctionTags($parser) => $body,
             OutputPipeline::ArgumentTags($parser) => $body,
+            OutputPipeline::HyArgumentTags($parser) => $body,
             OutputPipeline::Dsml($parser) => $body,
             OutputPipeline::SpacedDsml($parser) => $body,
             OutputPipeline::Xtml($parser) => $body,
@@ -84,6 +86,9 @@ impl OutputPipeline {
                 TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
             ),
             Some((ToolParserKind::GlmArgumentTags, _, _)) => Self::ArgumentTags(
+                TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
+            ),
+            Some((ToolParserKind::HyArgumentTags, _, _)) => Self::HyArgumentTags(
                 TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
             ),
             Some((ToolParserKind::Dsml, _, " ")) => {
@@ -117,6 +122,7 @@ impl OutputPipeline {
                 ToolParserKind::Dsml
                 | ToolParserKind::QwenCoder
                 | ToolParserKind::GlmArgumentTags
+                | ToolParserKind::HyArgumentTags
                 | ToolParserKind::MiniMaxXml
                 | ToolParserKind::GemmaCall,
             )
@@ -132,6 +138,7 @@ impl OutputPipeline {
             ToolParserKind::TmlJson => &super::tml::CONTROL_MARKERS,
             ToolParserKind::QwenCoder
             | ToolParserKind::GlmArgumentTags
+            | ToolParserKind::HyArgumentTags
             | ToolParserKind::Dsml
             | ToolParserKind::MiniMaxXml
             | ToolParserKind::GemmaCall => &[],
@@ -160,6 +167,11 @@ impl OutputPipeline {
                 ToolParserKind::GlmArgumentTags => [
                     dialect::<super::argument_tags::ArgumentTags>(),
                     super::argument_tags::ARGUMENT_MARKERS.to_vec(),
+                ]
+                .concat(),
+                ToolParserKind::HyArgumentTags => [
+                    dialect::<super::argument_tags::HyArgumentTags>(),
+                    super::argument_tags::HY_ARGUMENT_MARKERS.to_vec(),
                 ]
                 .concat(),
                 ToolParserKind::MiniMaxXml => dialect::<super::minimax_xml::MiniMaxXml>(),
@@ -198,6 +210,11 @@ impl OutputPipeline {
             }
             Some((ToolParserKind::GlmArgumentTags, _, _)) => {
                 TaggedOutput::<super::argument_tags::ArgumentTags>::grammar_envelope(
+                    &config.content,
+                )
+            }
+            Some((ToolParserKind::HyArgumentTags, _, _)) => {
+                TaggedOutput::<super::argument_tags::HyArgumentTags>::grammar_envelope(
                     &config.content,
                 )
             }
@@ -245,6 +262,9 @@ impl OutputPipeline {
                 Some(ReasoningParserKind::MmThink) => envelope.reasoning_end = Some("</mm:think>"),
                 Some(ReasoningParserKind::ChannelThought) => {
                     envelope.reasoning_end = Some("<channel|>")
+                }
+                Some(ReasoningParserKind::HyThink) => {
+                    envelope.reasoning_end = Some("</think:opensource>")
                 }
                 _ => {}
             }
@@ -1362,6 +1382,92 @@ mod tests {
                     "{pieces:?} feed {feed}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn hy_think_and_hy_argument_tags_stream_with_token_gated_delimiters() {
+        use crate::output::tagged::OutputStart;
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.tools = Some(ToolParser {
+            kind: ToolParserKind::HyArgumentTags,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        syntax.reasoning = Some(ReasoningParser {
+            kind: ReasoningParserKind::HyThink,
+            open: "<think:opensource>".into(),
+            close: "</think:opensource>".into(),
+            wrapping_newlines: 0,
+            terminal_markers: vec![],
+        });
+        let tools = vec![json!({
+            "function": {
+                "name": "lookup",
+                "parameters": {"properties": {"n": {"type": "integer"}}}
+            }
+        })];
+        let control = [
+            (10, "<think:opensource>".to_owned()),
+            (11, "</think:opensource>".to_owned()),
+        ];
+        let pieces = [
+            (false, "Quote </think:opensource> in thought."),
+            (true, "</think:opensource>"),
+            (false, "Calling. "),
+            (
+                false,
+                "<tool_calls:opensource><tool_call:opensource>lookup<arg_key:opensource>n</arg_key:opensource><arg_value:opensource>3</arg_value:opensource></tool_call:opensource></tool_calls:opensource>",
+            ),
+        ];
+        for feed in 0..3 {
+            let message =
+                delimited_by(&syntax, &control, OutputStart::Reasoning, &tools, &pieces, feed);
+            assert_eq!(
+                message["reasoning_content"],
+                "Quote </think:opensource> in thought.",
+                "feed {feed}"
+            );
+            assert_eq!(message["content"], "Calling. ", "feed {feed}");
+            assert_eq!(message["tool_calls"][0]["function"]["name"], "lookup");
+            assert_eq!(
+                message["tool_calls"][0]["function"]["arguments"],
+                "{\"n\":3}"
+            );
+        }
+        let envelope = OutputPipeline::grammar_envelope(&OutputConfig {
+            syntax: syntax.clone(),
+            control_tokens: control.to_vec(),
+            content: TaggedConfig {
+                start: OutputStart::Reasoning,
+                structured: false,
+                tools,
+            },
+        })
+        .unwrap();
+        assert_eq!(envelope.reasoning_end, Some("</think:opensource>"));
+        assert_eq!(
+            envelope.tool,
+            Some(("<tool_calls:opensource>", "</tool_calls:opensource>"))
+        );
+        assert_eq!(
+            envelope.function,
+            Some(("<tool_call:opensource>", "</tool_call:opensource>"))
+        );
+        let declared = OutputPipeline::declared_markers(&syntax);
+        for marker in [
+            "<think:opensource>",
+            "</think:opensource>",
+            "<tool_calls:opensource>",
+            "</tool_calls:opensource>",
+            "<tool_call:opensource>",
+            "</tool_call:opensource>",
+            "<arg_key:opensource>",
+            "</arg_key:opensource>",
+            "<arg_value:opensource>",
+            "</arg_value:opensource>",
+        ] {
+            assert!(declared.contains(&marker), "missing {marker} in {declared:?}");
         }
     }
 }

@@ -40,6 +40,46 @@ fn grammar_err(message: impl Into<String>) -> Error {
     Error::admission(AdmissionError::Grammar, message.into())
 }
 
+struct ArgumentTagDialect<'a> {
+    prefix: &'a str,
+    upper: &'a str,
+    label: &'a str,
+    key_open: &'a str,
+    key_close: &'a str,
+    val_open: &'a str,
+    val_close: &'a str,
+    call_close: &'a str,
+    forbidden_closes: &'a [&'a str],
+}
+
+const GLM_ARGUMENT_TAG_DIALECT: ArgumentTagDialect<'static> = ArgumentTagDialect {
+    prefix: "glm",
+    upper: "GLM",
+    label: "GLM",
+    key_open: "<arg_key>",
+    key_close: "</arg_key>",
+    val_open: "<arg_value>",
+    val_close: "</arg_value>",
+    call_close: "</tool_call>",
+    forbidden_closes: &["</arg_value>", "</tool_call>"],
+};
+
+const HY_ARGUMENT_TAG_DIALECT: ArgumentTagDialect<'static> = ArgumentTagDialect {
+    prefix: "hy",
+    upper: "HY",
+    label: "Hy",
+    key_open: "<arg_key:opensource>",
+    key_close: "</arg_key:opensource>",
+    val_open: "<arg_value:opensource>",
+    val_close: "</arg_value:opensource>",
+    call_close: "</tool_call:opensource>",
+    forbidden_closes: &[
+        "</arg_value:opensource>",
+        "</tool_call:opensource>",
+        "</tool_calls:opensource>",
+    ],
+};
+
 fn valid_wire_ident(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 256
@@ -1479,6 +1519,9 @@ impl GrammarCompiler {
             ToolParserKind::GlmArgumentTags => {
                 self.compile_strict_glm(answer_constraint, envelope, plan, presentation)
             }
+            ToolParserKind::HyArgumentTags => {
+                self.compile_strict_hy_argument_tags(answer_constraint, envelope, plan, presentation)
+            }
             other => Err(grammar_err(format!(
                 "strict function tool schemas are not supported for {other:?} tool syntax"
             ))),
@@ -2198,27 +2241,25 @@ impl GrammarCompiler {
         self.finish_composed(rules, subgrammars)
     }
 
-    fn compile_strict_glm(
-        &self,
-        answer_constraint: Option<AnswerConstraint<'_>>,
-        envelope: &OutputEnvelope,
+    fn compile_argument_tag_calls(
+        dialect: &ArgumentTagDialect<'_>,
         plan: &ToolGrammarPlan,
         mut presentation: Option<&mut crate::output::tagged::OutputConfig>,
-    ) -> Result<RequestGrammar> {
-        let mut rules = String::from("GLM_WS1: /\\s+/\nws: GLM_WS1?\n");
-        let mut subgrammars = Vec::new();
-        let has_structured_answer =
-            self.prepare_answer_subgrammar(answer_constraint, true, &mut subgrammars)?;
-        if !has_structured_answer {
-            push_tagged_answer(&mut subgrammars, r"<tool_call>");
-        }
-
+        rules: &mut String,
+        subgrammars: &mut Vec<GrammarWithLexer>,
+        always_emit_undeclared: bool,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let prefix = dialect.prefix;
+        let upper = dialect.upper;
+        let key_open_lit = serde_json::to_string(dialect.key_open).unwrap();
+        let key_close_lit = serde_json::to_string(dialect.key_close).unwrap();
+        let val_open_lit = serde_json::to_string(dialect.val_open).unwrap();
+        let val_close_lit = serde_json::to_string(dialect.val_close).unwrap();
+        let call_close_lit = serde_json::to_string(dialect.call_close).unwrap();
         let mut call_alts = Vec::new();
-        let mut strict_names = Vec::new();
 
         for (t_idx, tool) in plan.tools.iter().enumerate() {
             if let Some(schema) = &tool.strict_schema {
-                strict_names.push(tool.name.clone());
                 let empty = Map::new();
                 let props = schema
                     .get("properties")
@@ -2229,23 +2270,24 @@ impl GrammarCompiler {
                 let mut param_seq = Vec::with_capacity(props.len());
                 for (p_idx, (prop_name, prop_schema)) in props.iter().enumerate() {
                     let open_lit = serde_json::to_string(&format!(
-                        "<arg_key>{prop_name}</arg_key><arg_value>"
+                        "{}{prop_name}{}{}",
+                        dialect.key_open, dialect.key_close, dialect.val_open
                     ))
                     .unwrap();
-                    let pname = format!("glm_param_{t_idx}_{p_idx}");
+                    let pname = format!("{prefix}_param_{t_idx}_{p_idx}");
                     match split_top_property(schema, prop_schema) {
                         SplitBranches::Pure {
                             string_branch: Some(sb),
                             nonstring_branch: None,
                         } => {
                             set_wire_hint(&mut hints, prop_name, prop_schema, true);
-                            let s_sub = format!("glm_s_{t_idx}_{p_idx}");
+                            let s_sub = format!("{prefix}_s_{t_idx}_{p_idx}");
                             let g = build_raw_string_with_close_subgrammar(
                                 &tool.name,
                                 s_sub.clone(),
                                 &sb,
-                                ParameterClose::Text("</arg_value>"),
-                                &["</arg_value>", "</tool_call>"],
+                                ParameterClose::Text(dialect.val_close),
+                                dialect.forbidden_closes,
                             )?;
                             subgrammars.push(g);
                             rules.push_str(&format!("{pname}: {open_lit} @{s_sub}\n"));
@@ -2256,54 +2298,61 @@ impl GrammarCompiler {
                         } => {
                             set_wire_hint(&mut hints, prop_name, prop_schema, false);
                             let j_ref = push_json_param_subgrammar(
-                                &mut subgrammars,
-                                format!("glm_j_{t_idx}_{p_idx}"),
+                                subgrammars,
+                                format!("{prefix}_j_{t_idx}_{p_idx}"),
                                 schema,
                                 &nb,
                             );
                             rules.push_str(&format!(
-                                "{pname}: {open_lit} {j_ref} \"</arg_value>\"\n"
+                                "{pname}: {open_lit} {j_ref} {val_close_lit}\n"
                             ));
                         }
                         _ => {
                             return Err(grammar_err(format!(
-                                "strict tool {:?} property {prop_name:?} mixes string and non-string types, which is ambiguous in GLM argument-tag syntax",
-                                tool.name
+                                "strict tool {:?} property {prop_name:?} mixes string and non-string types, which is ambiguous in {} argument-tag syntax",
+                                tool.name, dialect.label
                             )));
                         }
                     }
                     param_seq.push(pname);
                 }
-                let cname = format!("glm_call_{t_idx}");
+                let cname = format!("{prefix}_call_{t_idx}");
                 let nlit = serde_json::to_string(&tool.name).unwrap();
                 if param_seq.is_empty() {
-                    rules.push_str(&format!("{cname}: ws {nlit} ws \"</tool_call>\"\n"));
+                    rules.push_str(&format!("{cname}: ws {nlit} ws {call_close_lit}\n"));
                 } else {
                     rules.push_str(&format!(
-                        "{cname}: ws {nlit} ws {} ws \"</tool_call>\"\n",
+                        "{cname}: ws {nlit} ws {} ws {call_close_lit}\n",
                         param_seq.join(" ws ")
                     ));
                 }
                 call_alts.push(cname);
             } else {
                 let nlit = serde_json::to_string(&tool.name).unwrap();
-                call_alts.push(format!("(ws {nlit} @glm_free_tail)"));
+                call_alts.push(format!("(ws {nlit} @{prefix}_free_tail)"));
             }
         }
 
         if plan.tools.iter().any(|t| t.strict_schema.is_none()) || plan.allow_undeclared {
-            let mut fg = GrammarWithLexer::from_lark(
+            let key_close_rx = dialect.key_close.replace('/', r"\/");
+            let forbidden_union = dialect
+                .forbidden_closes
+                .iter()
+                .map(|s| serde_json::to_string(s).unwrap())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let mut fg = GrammarWithLexer::from_lark(format!(
                 "ws: /[ \\t\\r\\n]*/\n\
-                 GLM_FREE_KEY: (/[^<]+/ & ~(/.*<\\/arg_key>.*/))\n\
-                 GLM_FREE_BODY: (/(?s:.*)/ & ~(/(?s:.*)/ (\"</arg_value>\" | \"</tool_call>\") /(?s:.*)/))\n\
-                 glm_free_val[suffix=\"</arg_value>\"]: GLM_FREE_BODY\n\
-                 glm_free_arg: \"<arg_key>\" GLM_FREE_KEY \"</arg_key>\" ws \"<arg_value>\" glm_free_val\n\
-                 start: (ws glm_free_arg)* ws \"</tool_call>\"\n"
-                    .to_owned(),
-            );
-            fg.name = Some("glm_free_tail".into());
+                 {upper}_FREE_KEY: (/[^<]+/ & ~(/.*{key_close_rx}.*/))\n\
+                 {upper}_FREE_BODY: (/(?s:.*)/ & ~(/(?s:.*)/ ({forbidden_union}) /(?s:.*)/))\n\
+                 {prefix}_free_val[suffix={val_close_lit}]: {upper}_FREE_BODY\n\
+                 {prefix}_free_arg: {key_open_lit} {upper}_FREE_KEY {key_close_lit} ws {val_open_lit} {prefix}_free_val\n\
+                 start: (ws {prefix}_free_arg)* ws {call_close_lit}\n"
+            ));
+            fg.name = Some(format!("{prefix}_free_tail"));
             subgrammars.push(fg);
         }
+
         let mut all_declared = Vec::new();
         for tool in &plan.tools {
             let lit = serde_json::to_string(&tool.name).unwrap();
@@ -2311,17 +2360,45 @@ impl GrammarCompiler {
                 all_declared.push(lit);
             }
         }
-        if all_declared.is_empty() {
-            rules.push_str("GLM_UNDECLARED_NAME: /[^<>\\s]+/\n");
-        } else {
-            rules.push_str(&format!(
-                "GLM_UNDECLARED_NAME: (/[^<>\\s]+/ & ~({}))\n",
-                all_declared.join(" | ")
-            ));
+        if always_emit_undeclared || plan.allow_undeclared {
+            if all_declared.is_empty() {
+                rules.push_str(&format!("{upper}_UNDECLARED_NAME: /[^<>\\s]+/\n"));
+            } else {
+                rules.push_str(&format!(
+                    "{upper}_UNDECLARED_NAME: (/[^<>\\s]+/ & ~({}))\n",
+                    all_declared.join(" | ")
+                ));
+            }
         }
         if plan.allow_undeclared {
-            call_alts.push("(ws GLM_UNDECLARED_NAME @glm_free_tail)".into());
+            call_alts.push(format!("(ws {upper}_UNDECLARED_NAME @{prefix}_free_tail)"));
         }
+        Ok((call_alts, all_declared))
+    }
+
+    fn compile_strict_glm(
+        &self,
+        answer_constraint: Option<AnswerConstraint<'_>>,
+        envelope: &OutputEnvelope,
+        plan: &ToolGrammarPlan,
+        presentation: Option<&mut crate::output::tagged::OutputConfig>,
+    ) -> Result<RequestGrammar> {
+        let mut rules = String::from("GLM_WS1: /\\s+/\nws: GLM_WS1?\n");
+        let mut subgrammars = Vec::new();
+        let has_structured_answer =
+            self.prepare_answer_subgrammar(answer_constraint, true, &mut subgrammars)?;
+        if !has_structured_answer {
+            push_tagged_answer(&mut subgrammars, r"<tool_call>");
+        }
+
+        let (call_alts, all_declared) = Self::compile_argument_tag_calls(
+            &GLM_ARGUMENT_TAG_DIALECT,
+            plan,
+            presentation,
+            &mut rules,
+            &mut subgrammars,
+            true,
+        )?;
 
         rules.push_str(&format!(
             "tool_after_open: {}\n\
@@ -2419,6 +2496,104 @@ impl GrammarCompiler {
             rg.name = Some("glm_reasoning".into());
             subgrammars.push(rg);
             rules.push_str(&format!("start: @glm_reasoning ws {body_branches} ws\n"));
+        } else {
+            rules.push_str(&format!("start: ws {body_branches} ws\n"));
+        }
+        self.finish_composed(rules, subgrammars)
+    }
+
+    fn compile_strict_hy_argument_tags(
+        &self,
+        answer_constraint: Option<AnswerConstraint<'_>>,
+        envelope: &OutputEnvelope,
+        plan: &ToolGrammarPlan,
+        presentation: Option<&mut crate::output::tagged::OutputConfig>,
+    ) -> Result<RequestGrammar> {
+        let mut rules = String::from("HY_WS1: /\\s+/\nws: HY_WS1?\n");
+        let mut subgrammars = Vec::new();
+        let has_structured_answer =
+            self.prepare_answer_subgrammar(answer_constraint, true, &mut subgrammars)?;
+        if !has_structured_answer {
+            let mut ag = GrammarWithLexer::from_lark(
+                "ANSWER: (/(?s:.*)/ & ~(/(?s:.*)/ (\"<tool_calls:opensource>\" | \"<tool_call:opensource>\") /(?s:.*)/))\n\
+                 start: ANSWER\n"
+                    .to_owned(),
+            );
+            ag.name = Some("plain_answer".into());
+            subgrammars.push(ag);
+        }
+
+        let (call_alts, _) = Self::compile_argument_tag_calls(
+            &HY_ARGUMENT_TAG_DIALECT,
+            plan,
+            presentation,
+            &mut rules,
+            &mut subgrammars,
+            false,
+        )?;
+
+        rules.push_str(&format!(
+            "hy_call_after_open: {}\n\
+             hy_single_call: \"<tool_call:opensource>\" hy_call_after_open\n",
+            call_alts.join(" | ")
+        ));
+        let tail_blocks = if plan.single_call {
+            rules.push_str(
+                "hy_calls_after_open: ws hy_single_call ws \"</tool_calls:opensource>\"\n\
+                 tool_block: \"<tool_calls:opensource>\" hy_calls_after_open | hy_single_call\n\
+                 tools: tool_block\n",
+            );
+            ""
+        } else {
+            rules.push_str(
+                "hy_calls_after_open: ws hy_single_call (ws hy_single_call)* ws \"</tool_calls:opensource>\"\n\
+                 tool_block: \"<tool_calls:opensource>\" hy_calls_after_open | hy_single_call\n\
+                 tools: tool_block (ws tool_block)*\n",
+            );
+            " (ws tool_block)*"
+        };
+
+        let body_branches = if has_structured_answer {
+            if plan.require_call {
+                "tools".to_owned()
+            } else {
+                "(@answer | tools)".to_owned()
+            }
+        } else {
+            let mut pre_outer = GrammarWithLexer::from_lark(
+                "PRE: (/(?s:.*)/ & ~(/(?s:.*)/ (\"<tool_calls:opensource>\" | \"<tool_call:opensource>\") /(?s:.*)/))\n\
+                 start[suffix=\"<tool_calls:opensource>\"]: PRE\n"
+                    .to_owned(),
+            );
+            pre_outer.name = Some("hy_pre_outer".into());
+            subgrammars.push(pre_outer);
+            let mut pre_inner = GrammarWithLexer::from_lark(
+                "PRE: (/(?s:.*)/ & ~(/(?s:.*)/ (\"<tool_calls:opensource>\" | \"<tool_call:opensource>\") /(?s:.*)/))\n\
+                 start[suffix=\"<tool_call:opensource>\"]: PRE\n"
+                    .to_owned(),
+            );
+            pre_inner.name = Some("hy_pre_inner".into());
+            subgrammars.push(pre_inner);
+            rules.push_str(&format!(
+                "hy_call_from_prose: (@hy_pre_outer hy_calls_after_open | @hy_pre_inner hy_call_after_open){tail_blocks} (ws @plain_answer)?\n"
+            ));
+            if plan.require_call {
+                "hy_call_from_prose".to_owned()
+            } else {
+                "(@plain_answer | hy_call_from_prose)".to_owned()
+            }
+        };
+
+        if envelope.tool_body_start {
+            rules.push_str(&format!("start: hy_calls_after_open{tail_blocks} ws\n"));
+        } else if let Some(end) = envelope.reasoning_end {
+            let mut rg = GrammarWithLexer::from_lark(format!(
+                "{}start: reasoning\n",
+                self.region("reasoning", end)
+            ));
+            rg.name = Some("hy_reasoning".into());
+            subgrammars.push(rg);
+            rules.push_str(&format!("start: @hy_reasoning ws {body_branches} ws\n"));
         } else {
             rules.push_str(&format!("start: ws {body_branches} ws\n"));
         }
@@ -4498,6 +4673,252 @@ mod tests {
         replay(
             "local CPU temperature source search",
             &"r".repeat(385),
+            false,
+        );
+    }
+
+    #[test]
+    fn strict_hy_argument_tags_enforces_schema_variants_and_roundtrips_with_parser() {
+        use crate::model::contract::{ReasoningParser, ReasoningParserKind, ToolParser};
+        use crate::output::tagged::{OutputConfig as TaggedConfig, OutputStart};
+        use crate::output::{Event, Input, OutputConfig, OutputPipeline, Termination};
+
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["city", "count"],
+            "properties": {
+                "city": {"type": "string", "minLength": 2},
+                "count": {"type": "integer", "minimum": 1, "maximum": 10}
+            }
+        });
+        let strict_tool = json!({
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "strict": true,
+                "parameters": schema.clone()
+            }
+        });
+        let free_tool = json!({
+            "type": "function",
+            "function": {
+                "name": "notes",
+                "parameters": {"type": "object", "properties": {"body": {"type": "string"}}}
+            }
+        });
+        let make_cfg = |start: OutputStart, structured: bool, tools: Vec<Value>| {
+            let mut syntax = crate::model::testing::metadata().frontend;
+            syntax.tools = Some(ToolParser {
+                kind: ToolParserKind::HyArgumentTags,
+                wrapping_newlines: 0,
+                tag_separator: String::new(),
+            });
+            syntax.reasoning = Some(ReasoningParser {
+                kind: ReasoningParserKind::HyThink,
+                open: "<think:opensource>".into(),
+                close: "</think:opensource>".into(),
+                wrapping_newlines: 0,
+                terminal_markers: vec![],
+            });
+            OutputConfig {
+                syntax,
+                control_tokens: vec![],
+                content: TaggedConfig {
+                    structured,
+                    start,
+                    tools,
+                },
+            }
+        };
+        let check = |cfg: &OutputConfig,
+                     answer: Option<AnswerConstraint<'_>>,
+                     plan: &ToolGrammarPlan,
+                     wire: &str,
+                     accepted: bool| {
+            let env = OutputPipeline::grammar_envelope(cfg).unwrap();
+            let mut presented = cfg.clone();
+            let mut grammar = compiler
+                .compile_presented_strict_tools(answer, Some(&env), plan, Some(&mut presented.content))
+                .unwrap();
+            let mut tokens: Vec<u32> = wire.bytes().map(u32::from).collect();
+            tokens.push(256);
+            let rejection = tokens
+                .into_iter()
+                .enumerate()
+                .find_map(|(at, tok)| grammar.advance(tok).err().map(|e| (at, tok, e)));
+            if accepted {
+                assert!(rejection.is_none(), "rejected valid {wire:?}: {rejection:?}");
+                assert!(grammar.is_stopped());
+            } else {
+                assert!(rejection.is_some(), "accepted invalid {wire:?}");
+            }
+        };
+        let decode_calls = |cfg: OutputConfig, wire: &str| {
+            let mut parser = OutputPipeline::new(cfg);
+            let mut events = parser.push(Input::Text(wire)).unwrap();
+            events.extend(parser.finish(Termination::Eos).unwrap());
+            events
+                .into_iter()
+                .filter_map(|e| match e {
+                    Event::ToolArguments { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let paris = "<tool_call:opensource>weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Paris</arg_value:opensource><arg_key:opensource>count</arg_key:opensource><arg_value:opensource>3</arg_value:opensource></tool_call:opensource>";
+        let tokyo = "<tool_call:opensource>weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Tokyo</arg_value:opensource><arg_key:opensource>count</arg_key:opensource><arg_value:opensource>5</arg_value:opensource></tool_call:opensource>";
+
+        let make_plan = |require_call: bool, single_call: bool| ToolGrammarPlan {
+            tools: vec![StrictToolSpec { name: "weather".into(), strict_schema: Some(&schema) }],
+            syntax: Some((ToolParserKind::HyArgumentTags, 0, String::new())),
+            dsml_token: None,
+            allow_undeclared: false,
+            require_call,
+            single_call,
+        };
+
+        // 1. Multi-call inside wrapper, bare call without wrapper, schema rejections, and parser round-trip.
+        let cfg_reason = make_cfg(OutputStart::Reasoning, false, vec![strict_tool.clone()]);
+        let plan_req = make_plan(true, false);
+        let multi = format!("plan</think:opensource><tool_calls:opensource>{paris}{tokyo}</tool_calls:opensource>");
+        check(&cfg_reason, None, &plan_req, &multi, true);
+        assert_eq!(
+            decode_calls(cfg_reason.clone(), &multi),
+            vec![r#"{"city":"Paris","count":3}"#, r#"{"city":"Tokyo","count":5}"#]
+        );
+        // Bare <tool_call:opensource> via hy_pre_inner + parser round-trip.
+        let bare = format!("plan</think:opensource>Checking weather. {paris}");
+        check(&cfg_reason, None, &plan_req, &bare, true);
+        assert_eq!(
+            decode_calls(cfg_reason.clone(), &bare),
+            vec![r#"{"city":"Paris","count":3}"#]
+        );
+        // Out-of-bounds integer, too-short string, and missing required parameter are rejected.
+        check(
+            &cfg_reason,
+            None,
+            &plan_req,
+            "plan</think:opensource><tool_calls:opensource><tool_call:opensource>weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Paris</arg_value:opensource><arg_key:opensource>count</arg_key:opensource><arg_value:opensource>99</arg_value:opensource></tool_call:opensource></tool_calls:opensource>",
+            false,
+        );
+        check(
+            &cfg_reason,
+            None,
+            &plan_req,
+            "plan</think:opensource><tool_calls:opensource><tool_call:opensource>weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>P</arg_value:opensource><arg_key:opensource>count</arg_key:opensource><arg_value:opensource>3</arg_value:opensource></tool_call:opensource></tool_calls:opensource>",
+            false,
+        );
+        check(
+            &cfg_reason,
+            None,
+            &plan_req,
+            "plan</think:opensource><tool_calls:opensource><tool_call:opensource>weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Paris</arg_value:opensource></tool_call:opensource></tool_calls:opensource>",
+            false,
+        );
+        check(&cfg_reason, None, &plan_req, "plan</think:opensource>plain prose only", false);
+
+        // 2. Optional call with prose (require_call=false) and single_call enforcement.
+        let plan_opt_single = make_plan(false, true);
+        check(&cfg_reason, None, &plan_opt_single, "plan</think:opensource>Plain prose.", true);
+        check(
+            &cfg_reason,
+            None,
+            &plan_opt_single,
+            &format!("plan</think:opensource>Sure. <tool_calls:opensource>{paris}</tool_calls:opensource>"),
+            true,
+        );
+        check(&cfg_reason, None, &plan_opt_single, &multi, false);
+        check(
+            &cfg_reason,
+            None,
+            &plan_opt_single,
+            &format!("plan</think:opensource><tool_calls:opensource>{paris}</tool_calls:opensource><tool_calls:opensource>{tokyo}</tool_calls:opensource>"),
+            false,
+        );
+
+        // 3. Direct content start (no reasoning end) and tool_body_start.
+        let cfg_content = make_cfg(OutputStart::Content, false, vec![strict_tool.clone()]);
+        check(
+            &cfg_content,
+            None,
+            &plan_req,
+            &format!("<tool_calls:opensource>{paris}</tool_calls:opensource>"),
+            true,
+        );
+        let cfg_tool_body = make_cfg(OutputStart::ToolBody, false, vec![strict_tool.clone()]);
+        check(
+            &cfg_tool_body,
+            None,
+            &plan_req,
+            &format!("{paris}</tool_calls:opensource>"),
+            true,
+        );
+        check(
+            &cfg_tool_body,
+            None,
+            &plan_req,
+            &format!("<tool_calls:opensource>{paris}</tool_calls:opensource>"),
+            false,
+        );
+
+        // 4. Non-strict tool and allow_undeclared via hy_free_tail + parser round-trip.
+        let cfg_mixed = make_cfg(OutputStart::Content, false, vec![strict_tool.clone(), free_tool]);
+        let plan_mixed = ToolGrammarPlan {
+            tools: vec![
+                StrictToolSpec { name: "weather".into(), strict_schema: Some(&schema) },
+                StrictToolSpec { name: "notes".into(), strict_schema: None },
+            ],
+            syntax: Some((ToolParserKind::HyArgumentTags, 0, String::new())),
+            dsml_token: None,
+            allow_undeclared: true,
+            require_call: true,
+            single_call: false,
+        };
+        let mixed_wire = "<tool_calls:opensource><tool_call:opensource>notes<arg_key:opensource>body</arg_key:opensource><arg_value:opensource>hello</arg_value:opensource></tool_call:opensource><tool_call:opensource>extra_fn<arg_key:opensource>k</arg_key:opensource><arg_value:opensource>42</arg_value:opensource></tool_call:opensource></tool_calls:opensource>";
+        check(&cfg_mixed, None, &plan_mixed, mixed_wire, true);
+        assert_eq!(
+            decode_calls(cfg_mixed.clone(), mixed_wire),
+            vec![r#"{"body":"hello"}"#, r#"{"k":"42"}"#]
+        );
+        check(
+            &cfg_mixed,
+            None,
+            &plan_mixed,
+            "<tool_calls:opensource><tool_call:opensource>notes<arg_key:opensource>body</arg_key:opensource><arg_value:opensource>unclosed</tool_call:opensource></tool_calls:opensource>",
+            false,
+        );
+
+        // 5. Structured JSON answer alongside optional strict tool calls.
+        let answer_schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["ok"],
+            "properties": {"ok": {"type": "boolean"}}
+        });
+        let cfg_struct = make_cfg(OutputStart::Content, true, vec![strict_tool]);
+        let plan_struct = make_plan(false, false);
+        check(
+            &cfg_struct,
+            Some(AnswerConstraint::Json(&answer_schema)),
+            &plan_struct,
+            r#"{"ok":true}"#,
+            true,
+        );
+        check(
+            &cfg_struct,
+            Some(AnswerConstraint::Json(&answer_schema)),
+            &plan_struct,
+            &format!("<tool_calls:opensource>{paris}</tool_calls:opensource>"),
+            true,
+        );
+        check(
+            &cfg_struct,
+            Some(AnswerConstraint::Json(&answer_schema)),
+            &plan_struct,
+            "not json or tool",
             false,
         );
     }
