@@ -841,3 +841,40 @@ fn prepared_context(marker: &str, serialized: bool) -> Json {
         "tools":tools,"documents":[{"title":marker,"text":marker}],
         "bos_token":"<s>","eos_token":"</s>","add_generation_prompt":true,"preserve_thinking":true})
 }
+
+#[test]
+fn string_format_supports_positional_keyword_escapes_and_provenance() {
+    let context = json!({"tag": ":opensource", "user": "alice", "n": 42});
+    for (source, expected) in [
+        ("{{ '<think{}>'.format(tag) }}", "<think:opensource>"),
+        ("{{ '{1}-{0}'.format('a', 'b') }}", "b-a"),
+        ("{{ '{name}:{count}'.format(name=user, count=n) }}", "alice:42"),
+        ("{{ '{{literal}} {}'.format(tag) }}", "{literal} :opensource"),
+        ("{{ '{} {}'.format('x', 'y') }}", "x y"),
+    ] {
+        let compiled = CompiledTemplate::compile(source).unwrap();
+        let rendered = compiled.render(context.as_object().unwrap(), &[]).unwrap();
+        assert_eq!(rendered.text, expected, "{source}");
+    }
+    for bad in [
+        "{{ '{} {}'.format('only_one') }}",
+        "{{ '{0} {}'.format('a', 'b') }}",
+        "{{ '{missing}'.format(x=1) }}",
+        "{{ '{unclosed'.format(1) }}",
+        "{{ 'stray}'.format() }}",
+        "{{ '{:d}'.format(1) }}",
+        "{{ '{!r}'.format('x') }}",
+    ] {
+        let compiled = CompiledTemplate::compile(bad).unwrap();
+        assert!(compiled.render(context.as_object().unwrap(), &[]).is_err(), "{bad}");
+    }
+    // Template literal parts remain non-ordinary while request-supplied arguments stay ordinary.
+    let compiled = CompiledTemplate::compile("{%- set HYTK = ':opensource' -%}{{ '<think{}>'.format(HYTK) }}{{ '[{}]'.format(user) }}").unwrap();
+    let rendered = compiled.render(context.as_object().unwrap(), &[]).unwrap();
+    assert_eq!(rendered.text, "<think:opensource>[alice]");
+    let think_end = "<think:opensource>".len();
+    assert!(!crate::frontend::overlaps_ordinary(&rendered.ordinary, 0, think_end));
+    let alice_start = rendered.text.find("alice").unwrap();
+    assert!(crate::frontend::within_ordinary(&rendered.ordinary, alice_start, alice_start + 5));
+    assert!(!crate::frontend::overlaps_ordinary(&rendered.ordinary, think_end, think_end + 1));
+}

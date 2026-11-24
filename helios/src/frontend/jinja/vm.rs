@@ -1170,7 +1170,16 @@ fn method<'a>(
 ) -> Result<Value<'a>> {
     let exact = matches!(
         name,
-        "get" | "items" | "keys" | "values" | "strip" | "lstrip" | "rstrip" | "split" | "rsplit"
+        "get"
+            | "items"
+            | "keys"
+            | "values"
+            | "strip"
+            | "lstrip"
+            | "rstrip"
+            | "split"
+            | "rsplit"
+            | "format"
     );
     let operand = v.clone();
     let result = method_value(name, v, args, kw)?;
@@ -1257,6 +1266,93 @@ fn method_value<'a>(
             Ok(Value::list(parts))
         }
         "replace" | "lower" | "upper" | "capitalize" => filter(name, v, args, kw, false),
+        "format" => format_string(&v, text, args, kw),
         _ => Err(Error::new(format!("unknown string method {name}"))),
     }
+}
+
+fn format_string<'a>(
+    template: &Value<'a>,
+    text: &str,
+    args: &[Value<'a>],
+    kw: &[(&str, Value<'a>)],
+) -> Result<Value<'a>> {
+    let mut out = String::with_capacity(text.len());
+    let mut notes = Notes::default();
+    let bytes = text.as_bytes();
+    let mut cursor = 0usize;
+    let mut literal_start = 0usize;
+    let mut next_positional = 0usize;
+    let mut used_auto = false;
+    let mut used_manual = false;
+
+    let flush = |from: usize, to: usize, out: &mut String, notes: &mut Notes| {
+        if from < to {
+            template.piece(&text[from..to], false).append(out, notes);
+        }
+    };
+
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'{' => {
+                if bytes.get(cursor + 1) == Some(&b'{') {
+                    flush(literal_start, cursor + 1, &mut out, &mut notes);
+                    cursor += 2;
+                    literal_start = cursor;
+                    continue;
+                }
+                flush(literal_start, cursor, &mut out, &mut notes);
+                let field_start = cursor + 1;
+                let Some(rel_end) = text[field_start..].find('}') else {
+                    return Err(Error::new("unmatched '{' in format string"));
+                };
+                let field = &text[field_start..field_start + rel_end];
+                if field.contains('{') || field.contains(':') || field.contains('!') {
+                    return Err(Error::new(format!("unsupported format field {{{field}}}")));
+                }
+                let value = if field.is_empty() {
+                    if used_manual {
+                        return Err(Error::new(
+                            "cannot switch from manual field numbering to automatic field numbering",
+                        ));
+                    }
+                    used_auto = true;
+                    let idx = next_positional;
+                    next_positional += 1;
+                    args.get(idx)
+                        .ok_or_else(|| Error::new(format!("format argument {idx} out of range")))?
+                } else if let Ok(idx) = field.parse::<usize>() {
+                    if used_auto {
+                        return Err(Error::new(
+                            "cannot switch from automatic field numbering to manual field numbering",
+                        ));
+                    }
+                    used_manual = true;
+                    args.get(idx)
+                        .ok_or_else(|| Error::new(format!("format argument {idx} out of range")))?
+                } else {
+                    kw.iter()
+                        .rev()
+                        .find(|(k, _)| *k == field)
+                        .map(|(_, val)| val)
+                        .ok_or_else(|| Error::new(format!("missing format key {field}")))?
+                };
+                value.append(&mut out, &mut notes);
+                cursor = field_start + rel_end + 1;
+                literal_start = cursor;
+            }
+            b'}' => {
+                if bytes.get(cursor + 1) == Some(&b'}') {
+                    flush(literal_start, cursor + 1, &mut out, &mut notes);
+                    cursor += 2;
+                    literal_start = cursor;
+                } else {
+                    return Err(Error::new("single '}' encountered in format string"));
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+    flush(literal_start, bytes.len(), &mut out, &mut notes);
+    Ok(Value::annotated(out, notes))
 }

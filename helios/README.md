@@ -572,7 +572,8 @@ prompt bytes, token IDs, image conditioning, or ordinary/special-token selection
 
 The Jinja renderer records which output bytes come from the request. Every
 string and object key supplied by the request is ordinary text, and the record
-follows it through captures, namespace values and exact string operations;
+follows it through captures, namespace values and exact string operations
+(including `str.format` positional, keyword, and escaped-brace formatting);
 other builtins that receive request text mark their whole result ordinary. Text
 written in the template and every string in a template default, including
 strings nested in default arrays or objects, are controls unless the request
