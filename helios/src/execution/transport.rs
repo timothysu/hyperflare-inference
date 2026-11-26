@@ -446,6 +446,7 @@ struct Resources {
     copy: Stream,
     frames: [Frame; 2],
     engram: Option<crate::engram::Transfers>,
+    grammar_exchange: Option<crate::grammar_exchange::Transfers>,
     input_copies: InputCopyBatches,
     wake: Option<CompletionWake>,
 }
@@ -554,6 +555,11 @@ impl GraphExecutor {
             .clone()
             .map(|binding| crate::engram::Transfers::new(binding, &manifest))
             .transpose()?;
+        let grammar_exchange = manifest
+            .grammar_exchange
+            .clone()
+            .map(|binding| crate::grammar_exchange::Transfers::new(binding, &manifest))
+            .transpose()?;
         Ok(Self {
             manifest,
             copy_logprobs: true,
@@ -562,6 +568,7 @@ impl GraphExecutor {
                 copy,
                 frames,
                 engram,
+                grammar_exchange,
                 input_copies: InputCopyBatches::new(upload_capacity.saturating_add(2)),
                 wake,
             }),
@@ -876,6 +883,11 @@ impl GraphExecutor {
                     engram.enqueue(fence.0, graph.packed_tokens(), uploads, &frame.started)?;
                 }
             }
+            if crate::grammar_exchange::consumes(graph.kind, graph.token_capacity) {
+                if let Some(grammar_exchange) = &resources.grammar_exchange {
+                    grammar_exchange.enqueue(fence.0, &frame.started)?;
+                }
+            }
             resources.model.launch(graph.handle)?;
             resources.model.record(&frame.produced)?;
             resources.copy.wait(&frame.produced)?;
@@ -932,7 +944,12 @@ impl GraphExecutor {
             }
             Ok(())
         };
-        if let Err(error) = operation() {
+        let result = operation();
+        drop(operation);
+        if let Err(error) = result {
+            if let Some(grammar_exchange) = &resources.grammar_exchange {
+                grammar_exchange.cancel();
+            }
             self.poison = Some(error.clone());
             return Err(error);
         }
@@ -974,9 +991,18 @@ impl GraphExecutor {
             }
         }
         let pending = frame.pending.take().unwrap();
-        if crate::engram::consumes(self.manifest.graphs[pending.graph_index].kind) {
+        let finished_graph = &self.manifest.graphs[pending.graph_index];
+        if crate::engram::consumes(finished_graph.kind) {
             if let Some(engram) = &resources.engram {
                 if let Err(error) = engram.finish(pending.fence.0) {
+                    self.poison = Some(error.clone());
+                    return Err(error);
+                }
+            }
+        }
+        if crate::grammar_exchange::consumes(finished_graph.kind, finished_graph.token_capacity) {
+            if let Some(grammar_exchange) = &resources.grammar_exchange {
+                if let Err(error) = grammar_exchange.finish(pending.fence.0) {
                     self.poison = Some(error.clone());
                     return Err(error);
                 }
@@ -1135,12 +1161,20 @@ impl GraphExecutor {
         if let Some(engram) = &resources.engram {
             engram.cancel();
         }
+        if let Some(grammar_exchange) = &resources.grammar_exchange {
+            grammar_exchange.cancel();
+        }
         let compute = resources.model.synchronize().map_err(Error::drain);
         let copy = resources.copy.synchronize().map_err(Error::drain);
         let engram = resources
             .engram
             .as_ref()
             .map_or(Ok(()), |e| e.drain())
+            .map_err(Error::drain);
+        let grammar_exchange = resources
+            .grammar_exchange
+            .as_ref()
+            .map_or(Ok(()), |g| g.drain())
             .map_err(Error::drain);
         let worker = self
             .manifest
@@ -1149,11 +1183,16 @@ impl GraphExecutor {
             .and_then(|worker| worker.control.as_ref())
             .map_or(Ok(()), |control| control.stop())
             .map_err(Error::drain);
-        let drained = compute.is_ok() && copy.is_ok() && engram.is_ok() && worker.is_ok();
+        let drained = compute.is_ok()
+            && copy.is_ok()
+            && engram.is_ok()
+            && grammar_exchange.is_ok()
+            && worker.is_ok();
         let error = compute
             .err()
             .or(copy.err())
             .or(engram.err())
+            .or(grammar_exchange.err())
             .or(worker.err())
             .or(self.poison.take());
         if drained {

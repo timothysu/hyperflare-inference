@@ -695,7 +695,13 @@ class ForwardCache:
         options = {name: value for name, value in self.options.items() if name != 'compile_threads'}
         key = hashlib.sha256(pickle.dumps((namespace, options, torch_key(), runtime_patches.identity(),
             properties.name, properties.major, properties.minor, properties.multi_processor_count)))
-        for source in (Path(__file__).resolve().parents[1], Path(flashinfer.__file__).resolve().parent):
+        sources = [Path(__file__).resolve().parents[1], Path(flashinfer.__file__).resolve().parent]
+        try:
+            import hyperflare_recipes
+            sources.append(Path(hyperflare_recipes.__file__).resolve().parent)
+        except ImportError:
+            pass
+        for source in sources:
             for path in sorted(source.rglob('*.py')):
                 if source.name == 'ignition' and (path.name == '__main__.py'
                                                or path.relative_to(source).parts[0] in _COMMAND_SOURCES

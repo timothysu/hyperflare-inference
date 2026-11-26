@@ -251,6 +251,7 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
     Ok(ExecutionManifest {
         collectives: None,
         engram: crate::embedding_tables::binding(value)?,
+        grammar_exchange: None,
         cache: None,
         offload: None,
         abi_version: field!(value, "abi_version", u32),

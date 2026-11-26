@@ -23,6 +23,7 @@ pub struct NativeModel {
     _core_files: Vec<std::sync::Arc<std::fs::File>>,
     pub(super) server_config: serde_json::Value,
     engram: Vec<(std::sync::Arc<crate::engram::Shared>, usize)>,
+    grammar_exchange: Option<std::sync::Arc<crate::grammar_exchange::Shared>>,
     pub(super) offload: flare_selene::offload::Startup,
     cluster: Option<ClusterRank>,
     roce: Vec<Option<RoceSpec>>,
@@ -626,6 +627,7 @@ impl NativeModel {
             ranks: Vec::new(),
             server_config,
             engram: Vec::new(),
+            grammar_exchange: None,
             offload: Default::default(),
             cluster,
             roce,
@@ -859,6 +861,35 @@ impl NativeModel {
                 &initial,
                 embedding_host_bytes,
             )?;
+            if model.cluster.is_none()
+                && model
+                    .ranks
+                    .iter()
+                    .all(|rank| rank.events.contains_key(crate::grammar_exchange::EVENT_NAME))
+            {
+                let rank0_manifest = model.ranks[0].execution_manifest()?;
+                if let Some(geometry) =
+                    crate::grammar_exchange::detect_geometry(&rank0_manifest, prepared.vocabulary)?
+                {
+                    for rank in model.ranks.iter().skip(1) {
+                        let other = crate::grammar_exchange::detect_geometry(
+                            &rank.execution_manifest()?,
+                            prepared.vocabulary,
+                        )?;
+                        if other != Some(geometry) {
+                            return Err(invalid(
+                                "grammar exchange geometry differs across local tensor-parallel ranks",
+                            ));
+                        }
+                    }
+                    model.grammar_exchange = Some(crate::grammar_exchange::Shared::new(
+                        geometry,
+                        model.ranks.len(),
+                        model.ranks[0].context as usize,
+                        devices[0],
+                    )?);
+                }
+            }
             model.prepare_offload(root, options, progress, active)?;
         }
         Ok(model)
@@ -980,6 +1011,18 @@ impl NativeModel {
                         events,
                     });
                 }
+                if let Some(shared) = &self.grammar_exchange {
+                    let event = rank
+                        .events
+                        .get(crate::grammar_exchange::EVENT_NAME)
+                        .map(|event| *event as usize)
+                        .ok_or_else(|| invalid("grammar exchange readiness event missing"))?;
+                    manifest.grammar_exchange = Some(crate::grammar_exchange::Binding {
+                        shared: shared.clone(),
+                        rank: index,
+                        event,
+                    });
+                }
                 Ok(manifest)
             })
             .collect()
@@ -1009,6 +1052,7 @@ impl Drop for NativeModel {
     fn drop(&mut self) {
         self.offload.reset();
         self.engram.clear();
+        self.grammar_exchange = None;
         // Phase 1: destroy graphs, modules, and peer-accessible mappings across every rank
         // before any rank releases shared VA reservations or destroys its CUDA context.
         let mut all_drained = true;
@@ -1226,6 +1270,7 @@ mod tests {
             ranks: Vec::new(),
             server_config: serde_json::Value::Null,
             engram: Vec::new(),
+            grammar_exchange: None,
             offload: Default::default(),
             cluster: None,
             roce: Vec::new(),

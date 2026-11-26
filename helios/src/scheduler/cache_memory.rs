@@ -1355,7 +1355,7 @@ mod tests {
                 draft_pages_per_request: 1,
                 completion_inputs: vec![],
                 speculative_allocations: vec![],
-                state_rows_per_request: None,
+                state_rows_per_request: None, grammar_exchange: false,
             },
         )
         .unwrap();

@@ -192,7 +192,7 @@ pub(super) fn manifest() -> ExecutionManifest {
         ],
     };
     ExecutionManifest { completion_token_capacity: 16, tuning_graphs: vec![], persistent_workers: vec![],
-        engram: None,
+        engram: None, grammar_exchange: None,
         collectives: None,
         cache: None,
         offload: None,

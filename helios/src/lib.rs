@@ -14,6 +14,7 @@ pub mod error;
 pub mod execution;
 #[cfg(feature = "grammar")]
 pub mod grammar;
+pub mod grammar_exchange;
 pub mod model;
 pub mod offload;
 mod os;
