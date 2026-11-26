@@ -656,6 +656,19 @@ impl TextGrammar {
     }
 }
 
+/// Conditional grammar bitmasks and verification bounds for one speculative round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpeculativeMasks {
+    /// Row-major Int32 bitmasks: `mask_count * mask_words` words (`M_0 .. M_{mask_count - 1}`).
+    pub masks: Vec<i32>,
+    /// Number of real target probability rows (`1..=drafts.len() + 1`).
+    pub mask_count: usize,
+    /// Verification extent passed to stochastic verification (`mask_count..=drafts.len() + 1`).
+    pub verify_extent: usize,
+    /// Maximum tokens the round may emit (`1..=drafts.len() + 1`).
+    pub emit_cap: usize,
+}
+
 /// Per-generation parser. Advance once per sampled completion before uploading
 /// the following mask; prompt tokens and consumed pending tokens do not advance it.
 pub struct RequestGrammar {
@@ -717,6 +730,91 @@ impl RequestGrammar {
             count += 1;
         }
         Ok((count, masks))
+    }
+
+    /// Return an independent deep clone of the committed parser for speculative mask evaluation.
+    pub fn clone_for_exchange(&self) -> Self {
+        Self {
+            matcher: self.matcher.deep_clone(),
+            mask: self.mask.clone(),
+            tokenizer_vocab: self.tokenizer_vocab,
+            eos_ids: self.eos_ids.clone(),
+            accepting: self.accepting,
+            stopped: self.stopped,
+            error: self.error.clone(),
+        }
+    }
+
+    pub fn mask_words(&self) -> usize {
+        self.mask.len()
+    }
+
+    /// Evaluate conditional masks and verification bounds for GPU-proposed learned drafts.
+    pub fn speculative_masks(&self, drafts: &[i64]) -> Result<SpeculativeMasks> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        if self.stopped {
+            return Err(Error::admission(
+                AdmissionError::Grammar,
+                "cannot evaluate speculative masks for a stopped grammar",
+            ));
+        }
+        let mut masks = Vec::with_capacity((drafts.len() + 1) * self.mask.len());
+        masks.extend_from_slice(&self.mask);
+        if drafts.is_empty() {
+            return Ok(SpeculativeMasks {
+                masks,
+                mask_count: 1,
+                verify_extent: 1,
+                emit_cap: 1,
+            });
+        }
+        let mut tentative = self.clone_for_exchange();
+        for (j, &raw_token) in drafts.iter().enumerate() {
+            let Ok(token) = u32::try_from(raw_token) else {
+                return Ok(SpeculativeMasks {
+                    masks,
+                    mask_count: j + 1,
+                    verify_extent: j + 2,
+                    emit_cap: j + 1,
+                });
+            };
+            if !tentative.allows(token) || self.eos_ids.contains(&token) {
+                return Ok(SpeculativeMasks {
+                    masks,
+                    mask_count: j + 1,
+                    verify_extent: j + 2,
+                    emit_cap: j + 1,
+                });
+            }
+            if tentative.matcher.consume_token(token).is_err() {
+                return Ok(SpeculativeMasks {
+                    masks,
+                    mask_count: j + 1,
+                    verify_extent: j + 2,
+                    emit_cap: j + 1,
+                });
+            }
+            match tentative.refresh_mask_available() {
+                Ok(true) => masks.extend_from_slice(tentative.mask()),
+                Ok(false) | Err(_) => {
+                    return Ok(SpeculativeMasks {
+                        masks,
+                        mask_count: j + 1,
+                        verify_extent: j + 2,
+                        emit_cap: j + 1,
+                    });
+                }
+            }
+        }
+        let width = drafts.len() + 1;
+        Ok(SpeculativeMasks {
+            masks,
+            mask_count: width,
+            verify_extent: width,
+            emit_cap: width,
+        })
     }
 
     /// Int32 words with token t stored in bit (t % 32) of word (t / 32).
@@ -1962,5 +2060,57 @@ mod recipient_tests {
             let accepted=tokens.into_iter().all(|id|request.advance(id).is_ok()) && request.advance(200008).is_ok();
             assert_eq!(accepted,valid,"{text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod speculative_mask_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn speculative_masks_handles_legal_forbidden_eos_and_empty_drafts() {
+        let tokenizer = super::tests::byte_tokenizer();
+        let compiler = GrammarCompiler::new(&tokenizer, 260, &[256], &[]).unwrap();
+        let grammar = compiler
+            .compile_json_schema(&json!({"type": "object", "properties": {"ok": {"const": true}}, "required": ["ok"], "additionalProperties": false}))
+            .unwrap();
+        let m0 = grammar.mask().to_vec();
+
+        let empty = grammar.speculative_masks(&[]).unwrap();
+        assert_eq!((empty.mask_count, empty.verify_extent, empty.emit_cap), (1, 1, 1));
+        assert_eq!(empty.masks, m0);
+
+        let bad0 = grammar.speculative_masks(&[i64::from(b'['), i64::from(b'{')]).unwrap();
+        assert_eq!((bad0.mask_count, bad0.verify_extent, bad0.emit_cap), (1, 2, 1));
+        assert_eq!(bad0.masks, m0);
+
+        let neg1 = grammar.speculative_masks(&[i64::from(b'{'), -1, i64::from(b'"')]).unwrap();
+        assert_eq!((neg1.mask_count, neg1.verify_extent, neg1.emit_cap), (2, 3, 2));
+
+        let prefix = br#"{"ok":"#;
+        let drafts: Vec<i64> = prefix.iter().map(|&b| i64::from(b)).collect();
+        let all_legal = grammar.speculative_masks(&drafts).unwrap();
+        assert_eq!(
+            (all_legal.mask_count, all_legal.verify_extent, all_legal.emit_cap),
+            (drafts.len() + 1, drafts.len() + 1, drafts.len() + 1)
+        );
+        let mut serial = grammar.clone_for_exchange();
+        let words = grammar.mask_words();
+        for (i, &b) in prefix.iter().enumerate() {
+            assert_eq!(&all_legal.masks[i * words..(i + 1) * words], serial.mask());
+            serial.advance(u32::from(b)).unwrap();
+        }
+        assert_eq!(&all_legal.masks[prefix.len() * words..], serial.mask());
+
+        let mut at_end = grammar.clone_for_exchange();
+        for &b in br#"{"ok":tru"# {
+            at_end.advance(u32::from(b)).unwrap();
+        }
+        let with_eos = at_end
+            .speculative_masks(&[i64::from(b'e'), i64::from(b'}'), 256, i64::from(b' ')])
+            .unwrap();
+        assert_eq!((with_eos.mask_count, with_eos.verify_extent, with_eos.emit_cap), (3, 4, 3));
+        assert_eq!(grammar.mask(), m0.as_slice());
     }
 }

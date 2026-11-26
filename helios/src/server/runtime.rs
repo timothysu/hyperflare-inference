@@ -2305,13 +2305,48 @@ impl<'a> Worker<'a> {
                 });
             }
         }
-        if executor.submit(
-            graph,
-            &uploads,
-            feedback,
-        )? != Some(fence)
-        {
-            return Err("executor refused a reserved scheduler submission".into());
+        let staged_grammar = if crate::grammar_exchange::consumes(step.kind, step.token_capacity) {
+            if let Some(binding) = executor.manifest().grammar_exchange.as_ref() {
+                let mut lanes = Vec::new();
+                for lane in &step.lanes {
+                    let slot = lane.request.slot as usize;
+                    if let Some(grammar) = self.active[slot]
+                        .as_ref()
+                        .and_then(|active| active.incoming.prompt.grammar.as_ref())
+                    {
+                        lanes.push(crate::grammar_exchange::LaneJob {
+                            slot,
+                            draft_count: lane.tokens.saturating_sub(1),
+                            grammar: grammar.clone_for_exchange(),
+                        });
+                    }
+                }
+                if !lanes.is_empty() {
+                    binding.shared.stage_submission(fence.0, lanes)?;
+                    Some(binding.shared.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        match executor.submit(graph, &uploads, feedback) {
+            Ok(Some(submitted)) if submitted == fence => {}
+            Ok(_) => {
+                if let Some(shared) = staged_grammar {
+                    shared.discard_submission(fence.0);
+                }
+                return Err("executor refused a reserved scheduler submission".into());
+            }
+            Err(error) => {
+                if let Some(shared) = staged_grammar {
+                    shared.discard_submission(fence.0);
+                }
+                return Err(error);
+            }
         }
         observe_submission(self.metrics, &self.scheduler, step, executor.outstanding())?;
         self.metrics
@@ -3105,7 +3140,7 @@ mod tests {
                 draft_pages_per_request: 1,
                 completion_inputs: vec![],
 
-                state_rows_per_request: None,
+                state_rows_per_request: None, grammar_exchange: false,
             },
         )
         .unwrap();
@@ -3357,7 +3392,7 @@ mod tests {
                 draft_pages_per_request: 0,
                 completion_inputs: vec![],
 
-                state_rows_per_request: None,
+                state_rows_per_request: None, grammar_exchange: false,
             },
         )
         .unwrap();
@@ -3887,7 +3922,7 @@ mod tests {
                 draft_pages_per_request: 1,
                 completion_inputs: vec![],
 
-                state_rows_per_request: None,
+                state_rows_per_request: None, grammar_exchange: false,
             },
         )
         .unwrap();

@@ -47,7 +47,7 @@ fn ready(geometry: Geometry, prompt: usize, budget: u32) -> (RequestScheduler, V
                 geometry.packed,
                 PrefixAllocation::Gpu,
             )],
-            state_rows_per_request: None,
+            state_rows_per_request: None, grammar_exchange: false,
         },
     )
     .unwrap();

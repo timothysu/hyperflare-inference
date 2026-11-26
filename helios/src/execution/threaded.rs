@@ -587,6 +587,13 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
         (Some(_), None) | (None, Some(_)) => return false,
         _ => {}
     }
+    match (&a.grammar_exchange, &b.grammar_exchange) {
+        (Some(a), Some(b)) if Arc::ptr_eq(&a.shared, &b.shared) && a.rank == b.rank => {
+            return false;
+        }
+        (Some(_), None) | (None, Some(_)) => return false,
+        _ => {}
+    }
     match (&a.offload, &b.offload) {
         (Some(a), Some(b)) if !a.shares(b) || a.rank() == b.rank() => return false,
         (Some(_), None) | (None, Some(_)) => return false,

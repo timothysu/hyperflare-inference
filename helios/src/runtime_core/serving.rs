@@ -142,7 +142,7 @@ impl NativeResources {
             tuning_graphs,
             persistent_workers,
             collectives: None,
-            engram: None,
+            engram: None, grammar_exchange: None,
             cache: self.cache.clone(),
             offload: None,
             abi_version: execution.abi_version,

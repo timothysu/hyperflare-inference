@@ -44,7 +44,7 @@ fn scheduler_with_resources(
             draft_pages_per_request: 1,
             completion_inputs: vec![],
             speculative_allocations: vec![],
-            state_rows_per_request: Some(rows),
+            state_rows_per_request: Some(rows), grammar_exchange: false,
         },
     )
     .unwrap();

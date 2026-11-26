@@ -730,7 +730,7 @@ mod tests {
             dtype: Dtype::Int32, shape: vec![2], strides: vec![4],
         };
         let mut manifest = ExecutionManifest {
-            engram: None, collectives: None, cache: None, offload: None,
+            engram: None, grammar_exchange: None, collectives: None, cache: None, offload: None,
             abi_version: crate::execution::ABI_VERSION, context: 0, device: 0,
             completion_token_capacity: 8,
             max_active: 1, input_frame_bytes: 8,

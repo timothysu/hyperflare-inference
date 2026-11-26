@@ -114,6 +114,7 @@ fn engine_with_geometry(
             completion_inputs: vec![],
             speculative_allocations: vec![],
             state_rows_per_request,
+            grammar_exchange: false,
         },
     )
     .unwrap();
@@ -1163,7 +1164,7 @@ fn interactive_engine(active: usize, speculative: bool) -> RequestScheduler {
             draft_pages_per_request: 0,
             completion_inputs: vec![],
             speculative_allocations: vec![],
-            state_rows_per_request: None,
+            state_rows_per_request: None, grammar_exchange: false,
         },
     )
     .unwrap();
@@ -3115,7 +3116,7 @@ fn feedback_window_engine(rows: Option<usize>, policy: PolicyConfig) -> RequestS
             draft_pages_per_request: 0,
             completion_inputs: vec![],
             speculative_allocations: vec![],
-            state_rows_per_request: rows,
+            state_rows_per_request: rows, grammar_exchange: false,
         },
     )
     .unwrap();

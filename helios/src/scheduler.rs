@@ -107,6 +107,8 @@ pub struct SchedulerCapabilities {
     pub speculative_allocations: Vec<(usize, usize, usize, usize, crate::execution::PrefixAllocation)>,
     /// Execution state rows each active request holds; None, the widest speculative graph's width.
     pub state_rows_per_request: Option<usize>,
+    /// True when wide speculative graphs support in-graph asynchronous grammar mask exchange.
+    pub grammar_exchange: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2280,7 +2282,8 @@ impl RequestScheduler {
         let output = output.saturating_sub(self.pending_ceiling(request));
         let proposal = if request.host_stops
             || (request.grammar_constrained
-                && self.proposal_source == speculation::ProposalSource::Mtp)
+                && self.proposal_source == speculation::ProposalSource::Mtp
+                && !self.capabilities.grammar_exchange)
         {
             1
         } else if self.proposal_source == speculation::ProposalSource::Copy {

@@ -138,7 +138,7 @@ fn scheduler_with_geometry(active: usize, pages: u32, snapshots: u32, page_token
             draft_pages_per_request: 1,
             completion_inputs: vec![],
             speculative_allocations: vec![],
-            state_rows_per_request: None,
+            state_rows_per_request: None, grammar_exchange: false,
         },
     )
     .unwrap();
@@ -569,7 +569,7 @@ fn configured_prefill_chunks_and_tails_preserve_alignment_and_live_page_extents(
                 draft_pages_per_request: 1,
                 completion_inputs: vec![],
             speculative_allocations: vec![],
-                state_rows_per_request: None,
+                state_rows_per_request: None, grammar_exchange: false,
             },
         )
         .unwrap();
@@ -649,7 +649,7 @@ fn invalid_prefill_limits_reject_before_request_resources_are_created() {
                 draft_pages_per_request: 1,
                 completion_inputs: vec![],
             speculative_allocations: vec![],
-                state_rows_per_request: None,
+                state_rows_per_request: None, grammar_exchange: false,
             },
         );
         assert!(matches!(
@@ -2541,7 +2541,7 @@ fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validat
         draft_pages_per_request: 1,
         completion_inputs: vec![],
             speculative_allocations: vec![],
-        state_rows_per_request: None,
+        state_rows_per_request: None, grammar_exchange: false,
     };
     let limits = SchedulerLimits {
         request_slots: 1,
@@ -2609,7 +2609,7 @@ fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validat
             draft_pages_per_request: 9,
             completion_inputs: vec![],
             speculative_allocations: vec![],
-            state_rows_per_request: None,
+            state_rows_per_request: None, grammar_exchange: false,
             ..capabilities
         },
     ] {

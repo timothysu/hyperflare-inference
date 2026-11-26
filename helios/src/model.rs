@@ -335,6 +335,7 @@ pub fn scheduler_capabilities(config: &ModelConfig) -> SchedulerCapabilities {
                 .max()
                 .unwrap_or(1),
         ),
+        grammar_exchange: false,
     }
 }
 
@@ -347,6 +348,7 @@ pub fn scheduler_capabilities_with_manifest(
         return Err("model completion capacity differs from its execution manifest".into());
     }
     let mut capabilities = scheduler_capabilities(config);
+    capabilities.grammar_exchange = manifest.grammar_exchange.is_some();
     for graph in &manifest.graphs {
         let semantics = config.contract.graph(&graph.name)?;
         let inputs: Vec<_> = semantics.inputs.iter().filter(|binding|

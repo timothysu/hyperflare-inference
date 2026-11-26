@@ -285,6 +285,7 @@ pub struct PersistentWorkerDescriptor {
 #[derive(Clone, Debug)]
 pub struct ExecutionManifest {
     pub engram: Option<crate::engram::Binding>,
+    pub grammar_exchange: Option<crate::grammar_exchange::Binding>,
     /// Present when this rank's graphs launch collectives over a transport between hosts.
     pub collectives: Option<CollectiveHealth>,
     /// This rank's prefix checkpoint storage, present after cache allocation.
