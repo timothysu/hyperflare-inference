@@ -537,7 +537,13 @@ impl DiskReader {
         })
     }
 
-    pub fn gather(&mut self, planes: &[Plane; 2], ids: &[i64], output: &mut [u8]) -> Result<()> {
+    fn gather(
+        &mut self,
+        planes: &[Plane; 2],
+        ids: &[i64],
+        output: &mut [u8],
+        pool: Option<&GatherPool>,
+    ) -> Result<()> {
         let mut timing = DiskTimings {
             stats: &self.stats,
             plan: 0,
@@ -551,7 +557,7 @@ impl DiskReader {
         for (ordinal, plane) in planes.iter().enumerate() {
             if ordinal == 1 {
                 if let Some(scales) = &self.resident_scales {
-                    gather_resident(scales, plane.row_bytes, ids, &mut output[base..]);
+                    gather_resident(pool, scales, plane.row_bytes, ids, &mut output[base..]);
                     base += ids.len() * plane.row_bytes;
                     continue;
                 }
@@ -670,15 +676,45 @@ fn prefetch_read(ptr: *const u8) {
     let _ = ptr;
 }
 
-fn gather_thread_count(work_items: usize) -> usize {
-    if work_items < PARALLEL_GATHER_MIN_ROWS {
-        return 1;
+struct GatherPool {
+    // Rayon signals shutdown before the join handles are drained.
+    executor: rayon::ThreadPool,
+    _workers: GatherWorkers,
+}
+
+#[derive(Default)]
+struct GatherWorkers(Vec<std::thread::JoinHandle<()>>);
+
+impl Drop for GatherWorkers {
+    fn drop(&mut self) {
+        for worker in self.0.drain(..) {
+            let _ = worker.join();
+        }
     }
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .clamp(1, MAX_GATHER_THREADS)
-        .min(work_items.div_ceil(PARALLEL_GATHER_MIN_ROWS / 2))
+}
+
+impl GatherPool {
+    fn new(helpers: usize) -> Result<Self> {
+        let mut workers = GatherWorkers::default();
+        let executor = rayon::ThreadPoolBuilder::new()
+            .num_threads(helpers)
+            .spawn_handler(|worker| {
+                let handle = std::thread::Builder::new()
+                    .name(format!("flare-gather-{}", worker.index()))
+                    .spawn(move || worker.run())?;
+                workers.0.push(handle);
+                Ok(())
+            })
+            .build()
+            .map_err(|e| format!("start Engram gather workers: {e}"))?;
+        Ok(Self { executor, _workers: workers })
+    }
+
+    fn chunks(pool: Option<&Self>, rows: usize) -> Option<(&rayon::ThreadPool, usize)> {
+        let pool = pool.filter(|_| rows >= PARALLEL_GATHER_MIN_ROWS)?;
+        let lanes = (1 + pool.executor.current_num_threads()).min(rows.div_ceil(PARALLEL_GATHER_MIN_ROWS / 2));
+        Some((&pool.executor, rows.div_ceil(lanes)))
+    }
 }
 
 struct CachedReader {
@@ -727,6 +763,7 @@ fn copy_cached_hits_slice(
 }
 
 fn copy_cached_hits(
+    pool: Option<&GatherPool>,
     hits: &[(usize, usize, usize)],
     requests: &[(i64, usize)],
     output: &mut [u8],
@@ -736,17 +773,15 @@ fn copy_cached_hits(
 ) {
     let scale_base = total_rows * weights;
     let output_base = output.as_mut_ptr() as usize;
-    let threads = gather_thread_count(hits.len());
-    if threads <= 1 {
+    let Some((pool, chunk)) = GatherPool::chunks(pool, hits.len()) else {
         copy_cached_hits_slice(hits, requests, output_base, scale_base, weights, scales);
         return;
-    }
-    let chunk = hits.len().div_ceil(threads);
-    std::thread::scope(|scope| {
+    };
+    pool.in_place_scope(|scope| {
         let mut parts = hits.chunks(chunk);
         let first = parts.next().unwrap_or(&[]);
         for part in parts {
-            scope.spawn(move || {
+            scope.spawn(move |_| {
                 copy_cached_hits_slice(part, requests, output_base, scale_base, weights, scales);
             });
         }
@@ -818,7 +853,13 @@ impl CachedReader {
         })
     }
 
-    fn gather(&mut self, planes: &[Plane; 2], ids: &[i64], output: &mut [u8]) -> Result<()> {
+    fn gather(
+        &mut self,
+        planes: &[Plane; 2],
+        ids: &[i64],
+        output: &mut [u8],
+        pool: Option<&GatherPool>,
+    ) -> Result<()> {
         if ids.len() > self.max_rows {
             return Err("embedding gather exceeds the row cache workspace capacity".into());
         }
@@ -853,6 +894,7 @@ impl CachedReader {
             begin = end;
         }
         copy_cached_hits(
+            pool,
             &self.hit_groups,
             &self.requests,
             output,
@@ -873,6 +915,7 @@ impl CachedReader {
             planes,
             &self.miss_ids,
             &mut self.miss_output[..count * (weights + scales)],
+            pool,
         )?;
         for (index, (&id, &(begin, end))) in self.miss_ids.iter().zip(&self.miss_groups).enumerate()
         {
@@ -924,27 +967,32 @@ fn gather_resident_slice(data: &[u8], row_bytes: usize, ids: &[i64], output: &mu
     }
 }
 
-fn gather_resident(data: &Resident, row_bytes: usize, ids: &[i64], output: &mut [u8]) {
+fn gather_resident(
+    pool: Option<&GatherPool>,
+    data: &Resident,
+    row_bytes: usize,
+    ids: &[i64],
+    output: &mut [u8],
+) {
     let data = data.bytes();
-    let threads = gather_thread_count(ids.len());
-    if threads <= 1 {
+    let Some((pool, chunk_rows)) = GatherPool::chunks(pool, ids.len()) else {
         gather_resident_slice(data, row_bytes, ids, output);
         return;
-    }
-    let chunk_rows = ids.len().div_ceil(threads);
-    std::thread::scope(|scope| {
+    };
+    pool.in_place_scope(|scope| {
         let mut id_chunks = ids.chunks(chunk_rows);
         let mut out_chunks = output.chunks_mut(chunk_rows * row_bytes);
         let first_ids = id_chunks.next().unwrap_or(&[]);
         let first_out = out_chunks.next().unwrap_or(&mut []);
         for (id_chunk, out_chunk) in id_chunks.zip(out_chunks) {
-            scope.spawn(move || gather_resident_slice(data, row_bytes, id_chunk, out_chunk));
+            scope.spawn(move |_| gather_resident_slice(data, row_bytes, id_chunk, out_chunk));
         }
         gather_resident_slice(data, row_bytes, first_ids, first_out);
     });
 }
 pub(crate) struct Reader {
     data: Data,
+    pool: Option<Arc<GatherPool>>,
     stats: Arc<Stats>,
 }
 impl Reader {
@@ -1006,15 +1054,36 @@ impl Reader {
                 Data::Disk(disk)
             }
         };
-        Ok(Self { data, stats })
+        Ok(Self { data, stats, pool: None })
     }
     #[cfg(unix)]
     pub(super) fn resident(data: [Arc<Resident>; 2], stats: Arc<Stats>) -> Self {
         Self {
             data: Data::Ram(data),
+            pool: None,
             stats,
         }
     }
+    pub(super) fn share_gather_pool(
+        readers: &mut [Self],
+        max_rows: usize,
+        cpus: usize,
+    ) -> Result<()> {
+        // Every table already owns a reader that copies one chunk in place.
+        let helpers = cpus.min(MAX_GATHER_THREADS).saturating_sub(readers.len());
+        let copies_rows = readers.iter().any(|reader| match &reader.data {
+            Data::Disk(disk) => disk.resident_scales.is_some(),
+            Data::Ram(_) | Data::Cached(_) => true,
+        });
+        if helpers > 0 && max_rows >= PARALLEL_GATHER_MIN_ROWS && copies_rows {
+            let pool = Arc::new(GatherPool::new(helpers)?);
+            for reader in readers {
+                reader.pool = Some(pool.clone());
+            }
+        }
+        Ok(())
+    }
+
     pub fn gather(&mut self, planes: &[Plane; 2], ids: &[i64], output: &mut [u8]) -> Result<()> {
         if output.len() != ids.len() * planes.iter().map(|p| p.row_bytes).sum::<usize>() {
             return Err("Engram staging size differs from row count".into());
@@ -1028,13 +1097,14 @@ impl Reader {
             }
         }
         let begin = Instant::now();
+        let pool = self.pool.as_deref();
         let result = match &mut self.data {
-            Data::Disk(reader) => reader.gather(planes, ids, output),
-            Data::Cached(reader) => reader.gather(planes, ids, output),
+            Data::Disk(reader) => reader.gather(planes, ids, output, pool),
+            Data::Cached(reader) => reader.gather(planes, ids, output, pool),
             Data::Ram(data) => {
                 let mut base = 0;
                 for (plane, data) in planes.iter().zip(data) {
-                    gather_resident(data, plane.row_bytes, ids, &mut output[base..]);
+                    gather_resident(pool, data, plane.row_bytes, ids, &mut output[base..]);
                     base += ids.len() * plane.row_bytes;
                 }
                 Ok(())
@@ -1624,10 +1694,108 @@ mod tests {
             &mut expected[ids.len() * 256..],
         );
         let mut reader = Reader::open(&path, &planes, true, 0, ids.len(), Arc::default()).unwrap();
+        Reader::share_gather_pool(std::slice::from_mut(&mut reader), ids.len(), 3).unwrap();
         let mut actual = vec![0xA5u8; expected.len()];
         reader.gather(&planes, &ids, &mut actual).unwrap();
         assert_eq!(actual, expected);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_tables_reuse_gather_workers_and_join_on_drop() {
+        use std::cell::OnceCell;
+        use std::sync::Barrier;
+
+        const TABLES: usize = 4;
+        const ROWS: usize = 257;
+        let path =
+            std::env::temp_dir().join(format!("helios-engram-pool-{}.bin", std::process::id()));
+        let bytes: Vec<_> = (0..TABLES * ROWS * 54)
+            .map(|i| (i * 31 + i / 127) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let planes: Vec<_> = (0..TABLES)
+            .map(|table| {
+                let start = table * ROWS * 54;
+                [
+                    Plane {
+                        file: 0,
+                        offset: start as u64,
+                        nbytes: ROWS * 48,
+                        row_bytes: 48,
+                    },
+                    Plane {
+                        file: 0,
+                        offset: (start + ROWS * 48) as u64,
+                        nbytes: ROWS * 6,
+                        row_bytes: 6,
+                    },
+                ]
+            })
+            .collect();
+        let count = PARALLEL_GATHER_MIN_ROWS * 3 + 77;
+        let mut readers: Vec<_> = planes
+            .iter()
+            .map(|planes| Reader::open(&path, planes, true, 0, count, Arc::default()).unwrap())
+            .collect();
+        Reader::share_gather_pool(&mut readers, count, TABLES).unwrap();
+        assert!(readers.iter().all(|reader| reader.pool.is_none()));
+        Reader::share_gather_pool(&mut readers, count, TABLES + 2).unwrap();
+        let pool = readers[0].pool.as_ref().unwrap();
+        assert!(
+            readers
+                .iter()
+                .all(|r| Arc::ptr_eq(pool, r.pool.as_ref().unwrap()))
+        );
+        assert_eq!(pool.executor.current_num_threads(), 2);
+        assert!(GatherPool::chunks(Some(pool), PARALLEL_GATHER_MIN_ROWS - 1).is_none());
+
+        // Each helper releases its marker when the OS thread exits.
+        thread_local! { static LIFETIME: OnceCell<Arc<()>> = const { OnceCell::new() }; }
+        let lifetime = Arc::new(());
+        pool.executor
+            .broadcast(|_| LIFETIME.with(|slot| slot.set(lifetime.clone()).unwrap()));
+        assert_eq!(Arc::strong_count(&lifetime), 3);
+        let barrier = Barrier::new(TABLES);
+        std::thread::scope(|scope| {
+            for (reader, planes) in readers.iter_mut().zip(planes) {
+                let (barrier, bytes) = (&barrier, &bytes);
+                scope.spawn(move || {
+                    let mut output = vec![0xA5; count * 54];
+                    barrier.wait();
+                    for pass in 0..4 {
+                        let ids: Vec<i64> = (0..count)
+                            .map(|row| {
+                                if (row + pass) % 23 == 0 {
+                                    -1
+                                } else {
+                                    ((row * 37 + pass) % ROWS) as i64
+                                }
+                            })
+                            .collect();
+                        reader.gather(&planes, &ids, &mut output).unwrap();
+                        let mut offset = 0;
+                        for plane in &planes {
+                            for &id in &ids {
+                                let row = &output[offset..offset + plane.row_bytes];
+                                if id < 0 {
+                                    assert!(row.iter().all(|&byte| byte == 0));
+                                } else {
+                                    let start =
+                                        plane.offset as usize + id as usize * plane.row_bytes;
+                                    assert_eq!(row, &bytes[start..start + row.len()]);
+                                }
+                                offset += row.len();
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(Arc::strong_count(&lifetime), 3);
+        drop(readers);
+        assert_eq!(Arc::strong_count(&lifetime), 1);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1681,6 +1849,7 @@ mod tests {
         let stats = Arc::new(Stats::default());
         let mut reader =
             Reader::open(&path, &planes, false, 64 << 20, ids.len(), stats.clone()).unwrap();
+        Reader::share_gather_pool(std::slice::from_mut(&mut reader), ids.len(), 3).unwrap();
         // Warm cache on first pass so the follow-up gather exercises parallel copy_cached_hits.
         let mut warm = vec![0u8; expected.len()];
         reader.gather(&planes, &ids, &mut warm).unwrap();

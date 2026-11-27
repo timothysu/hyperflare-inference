@@ -384,7 +384,7 @@ impl Shared {
 
     fn with_readers(
         index: Arc<Index>,
-        readers: Vec<reader::Reader>,
+        mut readers: Vec<reader::Reader>,
         ranks: usize,
         max_tokens: usize,
         context: usize,
@@ -394,6 +394,9 @@ impl Shared {
         if ranks == 0 || ranks > 16 || max_tokens == 0 || readers.len() != index.tables.len() {
             return Err("invalid embedding delivery geometry".into());
         }
+        let max_heads = index.tables.iter().map(|table| table.heads).max().unwrap_or(0);
+        let cpus = thread::available_parallelism().map_or(1, usize::from);
+        reader::Reader::share_gather_pool(&mut readers, max_tokens.saturating_mul(max_heads), cpus)?;
         let stream = Stream::open(context, device)?;
         let mut layers = Vec::new();
         for (table, mut reader) in index.tables.iter().zip(readers) {
