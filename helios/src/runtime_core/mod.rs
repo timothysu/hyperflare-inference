@@ -994,6 +994,13 @@ impl NativeResources {
                                     attribute.id,
                                     value.as_ptr().cast(),
                                 );
+                                if is_unsupported_default_mem_sync_domain(
+                                    attribute.id,
+                                    status,
+                                    &value,
+                                ) {
+                                    continue;
+                                }
                                 if attribute.id == 2
                                     && value[0] as u32 != 0
                                     && (status == 720 || (status == 0 && partition_sms.is_some()))
@@ -1009,7 +1016,15 @@ impl NativeResources {
                                         value.as_ptr().cast(),
                                     );
                                 }
-                                driver.check("cuGraphKernelNodeSetAttribute", status)?;
+                                driver.check(
+                                    &format!(
+                                        "cuGraphKernelNodeSetAttribute(id={}) for graph {} node {}",
+                                        attribute.id,
+                                        graph.name,
+                                        nodes.len()
+                                    ),
+                                    status,
+                                )?;
                             }
                         }
                         Node::Memset {
@@ -1585,5 +1600,34 @@ unsafe fn apply_context_settings(
             let _ = (driver.context_set)(previous);
         }
         configured
+    }
+}
+
+/// CUDA graph kernel node attribute 11 (`CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN`) is
+/// recorded with an all-zero default payload (`CU_LAUNCH_MEM_SYNC_DOMAIN_DEFAULT`)
+/// on CUDA drivers that expose it during export, whereas drivers without graph-node
+/// attribute 11 support (such as CUDA 13.0 / driver 580.82.07) return
+/// `CUDA_ERROR_INVALID_VALUE` (1) from `cuGraphKernelNodeSetAttribute`. Skip only
+/// that all-zero default; non-zero sync domain values continue to fail.
+fn is_unsupported_default_mem_sync_domain(attribute_id: i32, status: i32, value: &[u64; 8]) -> bool {
+    attribute_id == 11 && status == 1 && value.iter().all(|&word| word == 0)
+}
+
+#[cfg(test)]
+mod kernel_attribute_tests {
+    use super::is_unsupported_default_mem_sync_domain;
+
+    #[test]
+    fn skips_only_unsupported_default_mem_sync_domain_attribute() {
+        assert!(is_unsupported_default_mem_sync_domain(11, 1, &[0; 8]));
+        assert!(!is_unsupported_default_mem_sync_domain(11, 0, &[0; 8]));
+        assert!(!is_unsupported_default_mem_sync_domain(11, 2, &[0; 8]));
+        assert!(!is_unsupported_default_mem_sync_domain(
+            11,
+            1,
+            &[1, 0, 0, 0, 0, 0, 0, 0]
+        ));
+        assert!(!is_unsupported_default_mem_sync_domain(10, 1, &[0; 8]));
+        assert!(!is_unsupported_default_mem_sync_domain(14, 1, &[0; 8]));
     }
 }
