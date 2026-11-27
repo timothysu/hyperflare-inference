@@ -189,11 +189,14 @@ packed targets may use fewer than `B*W` rows. Selecting a lower positive draft
 depth requires a captured producer at that depth; loading never relabels its `D`.
 A confidence-producing speculative operation captures proposal generation,
 fresh-confidence prefix allocation, target verification, and commit in one CUDA graph. The proposal
-backbone executes the full configured block. Before submission, cohort and target
-capacity selection use historical joint prefix survival and measured complete-round
-cost. Inside the graph, fresh confidence selects causal prefixes under the frozen
-host ceilings and physical capacity `P`. Verification outcomes update historical
-survival separately from these confidence forecasts.
+backbone executes the full configured block. Before submission, cohort and target capacity selection use historical joint
+prefix survival—calibrated per depth against observed verification outcomes and
+adjusted on crowded GPU-allocated packed rounds for the GPU allocator's
+empirical cross-lane order-statistic surplus—together with measured
+complete-round cost. Inside the graph, fresh confidence selects causal prefixes
+under the frozen host ceilings and physical capacity `P`. Verification outcomes
+update historical survival and per-depth calibration without mutating the
+stored per-request confidence forecasts.
 
 ## A speculative round is a state transaction
 

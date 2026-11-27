@@ -242,6 +242,7 @@ pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
     for worker in &manifest.persistent_workers {
         number(&mut bytes, worker.worker_sm_count as usize);
         string(&mut bytes, &worker.graph);
+        number(&mut bytes, worker.metrics_count);
     }
     number(&mut bytes, usize::from(manifest.cache.is_some()));
     if let Some(cache) = &manifest.cache {

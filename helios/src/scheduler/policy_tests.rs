@@ -172,7 +172,7 @@ fn completion_records(
             continue;
         };
         let count = match kind {
-            GraphKind::Prefill => {
+            GraphKind::Prefill | GraphKind::TerminalPrefill => {
                 usize::from(r.consumed_tokens + lane.tokens as u64 == r.prompt_tokens as u64)
             }
             GraphKind::Resume | GraphKind::Decode => 1,
@@ -3958,6 +3958,98 @@ fn fixed_host_cohort_competes_by_full_prefix_utility_within_the_row_budget() {
 }
 
 #[test]
+fn fixed_host_speculative_duration_ignores_unmeasured_same_width_sibling() {
+    let mut scheduler = engine(4, true);
+    scheduler.fixed_speculative_width(Some(8)).unwrap();
+    let mut graphs = super::tests::duration_graphs(4);
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = if graph.kind == GraphKind::Speculative
+            && graph.batch_capacity == 4
+            && graph.token_capacity == 8
+        {
+            0
+        } else {
+            10 * MS
+        };
+    }
+    graphs.push(crate::execution::GraphDescriptor {
+        tuned_bindings: vec![],
+        confidence_width: 0,
+        name: "speculative-b4-d7-w8-p5".into(),
+        kind: GraphKind::Speculative,
+        sampling_mode: SamplingMode::General,
+        draft_tokens: 7,
+        handle: 1,
+        batch_capacity: 4,
+        token_capacity: 8,
+        packed_token_capacity: 5,
+        prefill_capacity: 0,
+        estimated_duration_ns: MS,
+        input_bindings: vec![],
+    });
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    let handles = fixed_host_requests(&mut scheduler, &[8, 2]);
+    // Request with 2 remaining tokens fits both measured p=5 and unmeasured p=32;
+    // the unmeasured sibling must not zero out the measured duration.
+    assert_eq!(
+        scheduler.speculative_duration(scheduler.request(handles[1]).unwrap(), 4, 8),
+        Some(MS)
+    );
+    // Request with 8 remaining tokens only fits unmeasured p=32, so it remains unmeasured.
+    assert_eq!(
+        scheduler.speculative_duration(scheduler.request(handles[0]).unwrap(), 4, 8),
+        Some(0)
+    );
+}
+
+#[test]
+fn continuation_candidate_ignores_unmeasured_full_speculative_sibling() {
+    let mut scheduler = engine(4, true);
+    let mut graphs = super::tests::duration_graphs(4);
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = match (graph.kind, graph.batch_capacity, graph.token_capacity) {
+            (GraphKind::Snapshot, 1, 1) => MS,
+            (GraphKind::Speculative, 4, 8) => 0,
+            _ => 10 * MS,
+        };
+    }
+    graphs.push(crate::execution::GraphDescriptor {
+        tuned_bindings: vec![],
+        confidence_width: 0,
+        name: "speculative-b4-d7-w8-p16".into(),
+        kind: GraphKind::Speculative,
+        sampling_mode: SamplingMode::General,
+        draft_tokens: 7,
+        handle: 1,
+        batch_capacity: 4,
+        token_capacity: 8,
+        packed_token_capacity: 16,
+        prefill_capacity: 0,
+        estimated_duration_ns: 2 * MS,
+        input_bindings: vec![],
+    });
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    let prompt = add(&mut scheduler, 1, 64, 128);
+    initialize(&mut scheduler, prompt);
+    let prefill = step(&mut scheduler, 0);
+    assert_eq!(prefill.kind, GraphKind::Prefill);
+    assert_eq!(scheduler.request(prompt).unwrap().phase, RequestPhase::Snapshot);
+    assert_eq!(
+        scheduler.request(prompt).unwrap().boundary_capture.unwrap().resume,
+        RequestPhase::Decode
+    );
+    let (values, age_price, _) = scheduler.lane_values(0);
+    let mut candidates = Vec::new();
+    scheduler.candidates(&mut candidates, &values, age_price);
+    let snapshot = candidates
+        .iter()
+        .find(|candidate| candidate.kind == GraphKind::Snapshot)
+        .unwrap();
+    // Unmeasured full b4w8p32 must not collapse the continuation horizon to 0 ns.
+    assert_eq!(snapshot.rate.duration_ns, MS + 2 * MS);
+}
+
+#[test]
 #[ignore = "manual CPU scheduler planning measurement"]
 fn mixed_tail_planning_cpu_measurement() {
     use std::time::Instant;
@@ -4455,4 +4547,1255 @@ fn terminal_prefill_rejects_invalid_capacities_and_post_admission_registration()
     s.terminal_prefill_graphs(&[256, 512]).unwrap();
     let _ = add(&mut s, 1, 64, 1);
     assert!(s.terminal_prefill_graphs(&[512]).is_err());
+}
+
+#[test]
+fn terminal_prefill_rebases_service_price_when_rate_drops_from_intermediate_prefill() {
+    let mut s = engine_with_terminal_prefill(&[256, 512]);
+    set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);
+    set_cost(&mut s, GraphKind::Prefill, 1, 128, 8 * MS);
+    set_cost(&mut s, GraphKind::Prefill, 1, 256, 8 * MS);
+    set_cost(&mut s, GraphKind::Prefill, 1, 512, 10 * MS);
+    set_cost(&mut s, GraphKind::TerminalPrefill, 1, 256, 80 * MS);
+    set_cost(&mut s, GraphKind::TerminalPrefill, 1, 512, 100 * MS);
+    let prompt = add(&mut s, 1, 641, 16);
+    let init = s.plan().unwrap();
+    let init_fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, init_fence).unwrap();
+    complete(&mut s, &init, init_fence, 0, false);
+
+    // Run one fast intermediate Prefill chunk (512 tokens in 10 ms => 51.2 tok/ms).
+    let first = s.plan().unwrap();
+    assert_eq!((first.kind, first.token_capacity), (GraphKind::Prefill, 512));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&first, fence).unwrap();
+    s.advance_to(s.now_ns + 10 * MS).unwrap();
+    complete_timed(&mut s, &first, fence, 0, true, gpu_time(10 * MS));
+
+    // 129 tokens remain (> window 128), so TerminalPrefill(256) is required
+    // (130 useful tokens in 80 ms => 1.625 tok/ms, >31x slower than intermediate Prefill).
+    // Rebased prefill_token price must preserve normalized GPU-time share.
+    let (values, _, scale) = s.lane_values(0);
+    let unscaled_prefill_price = values[prompt.slot as usize].prefill_token * scale.exp();
+    let expected = 1.0 + s.policy.token_fairness / (130.0 / 80.0);
+    assert!(
+        (unscaled_prefill_price - expected).abs() < 1e-6,
+        "terminal prefill price should rebase to terminal feasible rate: got {unscaled_prefill_price}, expected {expected}"
+    );
+
+    // Completing TerminalPrefill moves through any prompt Snapshot to Decode and clears prefill_rate.
+    let terminal = s.plan().unwrap();
+    assert_eq!(
+        (terminal.kind, terminal.token_capacity),
+        (GraphKind::TerminalPrefill, 256)
+    );
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&terminal, fence).unwrap();
+    s.advance_to(s.now_ns + 80 * MS).unwrap();
+    complete_timed(&mut s, &terminal, fence, 1, true, gpu_time(80 * MS));
+    if s.request(prompt).unwrap().phase == RequestPhase::Snapshot {
+        let snap = s.plan().unwrap();
+        assert_eq!(snap.kind, GraphKind::Snapshot);
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&snap, fence).unwrap();
+        complete(&mut s, &snap, fence, 0, false);
+    }
+    assert_eq!(s.request(prompt).unwrap().phase, RequestPhase::Decode);
+    let decode = s.plan().unwrap();
+    assert_eq!(decode.kind, GraphKind::Decode);
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&decode, fence).unwrap();
+    assert!(s.request(prompt).unwrap().accounting.service.prefill_rate.is_none());
+}
+
+#[test]
+fn deferred_prefill_finish_early_skips_incomplete_terminal_snapshot() {
+    let mut s = engine_with_terminal_prefill(&[256, 512]);
+    let handle = add(&mut s, 1, 1536, 4);
+    let init = s.plan().unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, fence).unwrap();
+    complete(&mut s, &init, fence, 0, false);
+
+    // Chunk 0 runs non-terminal Prefill(512), leaving deferred continuation state.
+    let first = s.plan().unwrap();
+    assert_eq!((first.kind, first.token_capacity), (GraphKind::Prefill, 512));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&first, fence).unwrap();
+    assert!(s.request(handle).unwrap().deferred_prefill);
+    complete(&mut s, &first, fence, 0, false);
+    assert!(s.request(handle).unwrap().deferred_prefill);
+
+    // Ending early during deferred prefill must not retain a snapshot of incomplete state.
+    s.finish_early(handle, false).unwrap();
+    let request = s.request(handle).unwrap();
+    assert_eq!(request.phase, RequestPhase::Finishing);
+    assert!(request.terminal_snapshot.is_none());
+    assert!(s.finish(handle).unwrap().is_none());
+
+    // After TerminalPrefill completes, deferred state clears and finish_early retains a snapshot.
+    let second = add(&mut s, 2, 1024, 4);
+    let init = s.plan().unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, fence).unwrap();
+    complete(&mut s, &init, fence, 0, false);
+    for expected in [GraphKind::Prefill, GraphKind::TerminalPrefill] {
+        let plan = s.plan().unwrap();
+        assert_eq!((plan.kind, plan.token_capacity), (expected, 512));
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        complete(
+            &mut s,
+            &plan,
+            fence,
+            usize::from(expected == GraphKind::TerminalPrefill),
+            false,
+        );
+    }
+    assert!(!s.request(second).unwrap().deferred_prefill);
+    s.finish_early(second, false).unwrap();
+    let request = s.request(second).unwrap();
+    assert_eq!(request.phase, RequestPhase::Snapshot);
+    assert!(request.terminal_snapshot.is_some());
+}
+
+#[test]
+fn mixed_graphs_excluded_for_deferred_prefill_and_prompt_logprobs() {
+    let mut s = engine(2, false);
+    s.prefill_graphs(&[64, 128, 256, 512]).unwrap();
+    s.terminal_prefill_graphs(&[256, 512]).unwrap();
+    s.scored_prefill_graphs(&[64, 128, 256, 512]).unwrap();
+    s.mixed_graphs(&[(2, 1, 512)]).unwrap();
+    let mut graphs = super::tests::duration_graphs(2);
+    graphs.retain(|g| g.kind != GraphKind::Prefill);
+    for &capacity in &[64usize, 128, 256, 512] {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("prefill-{capacity}"),
+            kind: GraphKind::Prefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 100 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: (capacity as u64 / 64 + 1) * MS,
+            input_bindings: vec![],
+        });
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("scored-prefill-{capacity}"),
+            kind: GraphKind::ScoredPrefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 200 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: 20 * MS,
+            input_bindings: vec![],
+        });
+    }
+    for &capacity in &[256usize, 512] {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("terminal-prefill-{capacity}"),
+            kind: GraphKind::TerminalPrefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 1000 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: 40 * MS,
+            input_bindings: vec![],
+        });
+    }
+    graphs.push(crate::execution::GraphDescriptor {
+        tuned_bindings: vec![],
+        confidence_width: 0,
+        name: "mixed-2-1-512".into(),
+        kind: GraphKind::Mixed,
+        sampling_mode: SamplingMode::General,
+        draft_tokens: 0,
+        handle: 2000,
+        batch_capacity: 2,
+        token_capacity: 1,
+        packed_token_capacity: 0,
+        prefill_capacity: 512,
+        estimated_duration_ns: MS,
+        input_bindings: vec![],
+    });
+    s.measured_graph_durations(&graphs).unwrap();
+
+    // 1. prompt_logprobs requests exclude fast Mixed durations (1 ms) and price only ScoredPrefill (20 ms).
+    let scored = s
+        .admit(RequestSpec {
+            prompt: vec![7; 512],
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 1,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: true,
+            growable_output: false,
+        })
+        .unwrap();
+    let (scored_rate, _) = s.service_rates(s.request(scored).unwrap());
+    let expected_scored_rate = 513.0 / 20.0;
+    assert!(
+        (scored_rate.unwrap() - expected_scored_rate).abs() < 1e-9,
+        "prompt_logprobs service rate must exclude Mixed: got {scored_rate:?}, expected {expected_scored_rate}"
+    );
+    s.cancel(scored).unwrap();
+
+    // 2. A deferred-prefill request excludes Mixed in service_rates and candidate generation.
+    let decoder = add(&mut s, 10, 64, 8);
+    let init = s.plan().unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, fence).unwrap();
+    complete(&mut s, &init, fence, 0, false);
+    let pre = s.plan().unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&pre, fence).unwrap();
+    complete(&mut s, &pre, fence, 1, false);
+    if s.request(decoder).unwrap().phase == RequestPhase::Snapshot {
+        let snap = s.plan().unwrap();
+        assert_eq!(snap.kind, GraphKind::Snapshot);
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&snap, fence).unwrap();
+        complete(&mut s, &snap, fence, 0, false);
+    }
+    assert_eq!(s.request(decoder).unwrap().phase, RequestPhase::Decode);
+
+    let deferred = add(&mut s, 20, 1024, 4);
+    let init = s.phase_plan(GraphKind::Init, Some(deferred));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, fence).unwrap();
+    complete(&mut s, &init, fence, 0, false);
+
+    // Run non-terminal Prefill(512) to enter deferred_prefill state with 512 tokens remaining.
+    let first = s.phase_plan(GraphKind::Prefill, Some(deferred));
+    assert_eq!((first.kind, first.token_capacity), (GraphKind::Prefill, 512));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&first, fence).unwrap();
+    complete(&mut s, &first, fence, 0, false);
+    assert!(s.request(deferred).unwrap().deferred_prefill);
+
+    // service_rates must use TerminalPrefill(512) (40 ms => 513/40), not Mixed (1 ms => 513/1).
+    let (deferred_rate, _) = s.service_rates(s.request(deferred).unwrap());
+    let expected_deferred_rate = 513.0 / 40.0;
+    assert!(
+        (deferred_rate.unwrap() - expected_deferred_rate).abs() < 1e-9,
+        "deferred prefill service rate must exclude Mixed: got {deferred_rate:?}, expected {expected_deferred_rate}"
+    );
+
+    // mixed_candidates must not pair the deferred-prefill request into a Mixed step.
+    let (values, age_price, _) = s.lane_values(0);
+    let mut mixed_out = Vec::new();
+    s.mixed_candidates(&mut mixed_out, &values, age_price, false);
+    assert!(
+        mixed_out
+            .iter()
+            .all(|candidate| candidate.prefill_slot != Some(deferred.slot as usize)),
+        "deferred prefill request must not appear as a Mixed prefill lane"
+    );
+}
+
+#[test]
+fn short_prefill_tail_caps_service_price_on_decode_transition() {
+    let mut s = engine(4, true);
+    let caps = [128usize, 256, 512];
+    s.prefill_graphs(&caps).unwrap();
+    s.terminal_prefill_graphs(&caps).unwrap();
+    let mut graphs = super::tests::duration_graphs(4);
+    let terminal: Vec<_> = graphs
+        .iter()
+        .filter(|g| g.kind == GraphKind::Prefill && caps.contains(&g.token_capacity))
+        .cloned()
+        .map(|mut g| {
+            g.kind = GraphKind::TerminalPrefill;
+            g.name = format!("terminal-{}", g.token_capacity);
+            g
+        })
+        .collect();
+    graphs.extend(terminal);
+    s.measured_graph_durations(&graphs).unwrap();
+    for batch in [1usize, 2, 4] {
+        set_cost(&mut s, GraphKind::Init, batch, 1, MS);
+        set_cost(&mut s, GraphKind::Snapshot, batch, 1, 2 * MS);
+        for &w in &[1usize, 2, 4, 8] {
+            set_cost(&mut s, GraphKind::Speculative, batch, w, 8 * MS);
+        }
+    }
+    set_cost(&mut s, GraphKind::TerminalPrefill, 1, 128, 25 * MS);
+    let mut sp = super::tests::spec(30, 64);
+    sp.message_boundaries = vec![28];
+    let handle = s.admit(sp).unwrap();
+    initialize(&mut s, handle);
+    // Run 0..28 anchor chunk, anchor snapshot, and 2-token tail (3 useful tokens in 25 ms = 0.12 tok/ms).
+    for _ in 0..3 {
+        let plan = s.plan().unwrap();
+        let dt = plan.estimated_duration_ns();
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        s.advance_to(s.now_ns + dt).unwrap();
+        let mut records = completion_records(&s, &plan, fence, 0);
+        if plan.kind == GraphKind::TerminalPrefill {
+            let r = s.request(handle).unwrap();
+            let lane = &plan.lanes[0];
+            let end = lane.start_position + lane.tokens as u64;
+            let emitted = u32::from(end == r.prompt_tokens as u64);
+            records[handle.slot as usize].consumed_tokens = end as i64;
+            records[handle.slot as usize].generated_tokens = (r.generated_tokens + emitted) as i64;
+            records[handle.slot as usize].token_id = if emitted > 0 { 99 } else { -1 };
+            records[handle.slot as usize].status = 1;
+        }
+        let out = s.complete(fence, &records, gpu_time(dt)).unwrap();
+        for tok in out {
+            s.published_output(tok.request, fence).unwrap();
+        }
+    }
+    let req = s.request(handle).unwrap();
+    assert_eq!(req.phase, RequestPhase::Decode);
+    assert!(req.accounting.service.prefill_rate.is_some());
+    let (decode_rate, _) = s.service_rates(req);
+    let decode_rate = decode_rate.unwrap();
+    assert!(
+        decode_rate > 0.12,
+        "decode feasible rate should exceed 2-token padded tail rate"
+    );
+    // lane_values must cap upward rate jumps before the first decode commit.
+    let (values, _, scale) = s.lane_values(0);
+    let unscaled_token_price = (values[handle.slot as usize].output_token
+        - s.policy.output_token_value * (-scale).exp())
+        * scale.exp();
+    let normalized_share = unscaled_token_price * decode_rate;
+    assert!(
+        normalized_share <= s.policy.token_fairness + 1e-6,
+        "lane_values decode transition must not inflate normalized token share: got {normalized_share}, limit {}",
+        s.policy.token_fairness
+    );
+
+    // Committing the first decode step rebases upward in service_participants and clears prefill_rate.
+    let decode_plan = s.plan().unwrap();
+    assert_eq!(decode_plan.kind, GraphKind::Speculative);
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&decode_plan, fence).unwrap();
+    assert!(s.request(handle).unwrap().accounting.service.prefill_rate.is_none());
+    let (post_values, _, post_scale) = s.lane_values(0);
+    let post_unscaled_price = (post_values[handle.slot as usize].output_token
+        - s.policy.output_token_value * (-post_scale).exp())
+        * post_scale.exp();
+    let post_normalized_share = post_unscaled_price * decode_rate;
+    assert!(
+        post_normalized_share <= s.policy.token_fairness + 1e-6,
+        "service_participants decode transition must not inflate normalized token share: got {post_normalized_share}, limit {}",
+        s.policy.token_fairness
+    );
+}
+
+#[test]
+fn gpu_confidence_calibration_corrects_overconfident_forecasts_for_binary_and_survival_paths() {
+    for use_survival in [false, true] {
+        let mut scheduler = joined_round_engine(crate::execution::PrefixAllocation::Gpu);
+        let handle = add(&mut scheduler, 1, 64, 512);
+        ready(&mut scheduler, &[handle]);
+        let slots = scheduler.limits.request_capacity();
+        // GPU confidence claims 0.95 per draft step, while realized survival drops sharply after depth 0.
+        for _ in 0..32 {
+            let plan = scheduler.plan().unwrap();
+            let fence = Fence(scheduler.submitted.0 + 1);
+            scheduler.commit(&plan, fence).unwrap();
+            let mut records = completion_records(&scheduler, &plan, fence, 1);
+            let offered = plan.lanes[0].tokens.saturating_sub(1).min(4);
+            records[handle.slot as usize].vector.as_mut().unwrap().offered_drafts = offered as i64;
+            let confidence = vec![vec![0.95; 15]; plan.batch_capacity];
+            if use_survival {
+                let mut surv = vec![vec![-1.0f32; 15]; slots];
+                for d in 0..offered {
+                    surv[handle.slot as usize][d] = if d == 0 { 0.92 } else { 0.08 };
+                }
+                scheduler
+                    .complete_packed_round_with_survival(fence, &records, gpu_time(MS), &confidence, Some(&surv))
+                    .unwrap();
+            } else {
+                scheduler
+                    .complete_packed_round(fence, &records, gpu_time(MS), &confidence)
+                    .unwrap();
+            }
+        }
+        let request = scheduler.request(handle).unwrap();
+        let curve = scheduler.speculative_curve(request, false);
+        assert!(curve[0] > 0.8, "use_survival={use_survival}: depth 0 should stay high, got {:?}", &curve[..4]);
+        assert!(curve[1] < 0.25, "use_survival={use_survival}: depth 1 should calibrate down, got {:?}", &curve[..4]);
+        assert!(curve[2] <= curve[1], "calibrated curve must stay nonincreasing, got {:?}", &curve[..4]);
+    }
+}
+
+#[test]
+fn gpu_confidence_calibration_keeps_calibrated_drafter_near_unity() {
+    let mut scheduler = joined_round_engine(crate::execution::PrefixAllocation::Gpu);
+    let handle = add(&mut scheduler, 1, 64, 512);
+    ready(&mut scheduler, &[handle]);
+    let slots = scheduler.limits.request_capacity();
+    let per_step = 0.8f32;
+    for _ in 0..32 {
+        let plan = scheduler.plan().unwrap();
+        let fence = Fence(scheduler.submitted.0 + 1);
+        scheduler.commit(&plan, fence).unwrap();
+        let mut records = completion_records(&scheduler, &plan, fence, 1);
+        let offered = plan.lanes[0].tokens.saturating_sub(1).min(4);
+        records[handle.slot as usize].vector.as_mut().unwrap().offered_drafts = offered as i64;
+        let mut surv = vec![vec![-1.0f32; 15]; slots];
+        let mut prefix = 1.0f32;
+        for d in 0..offered {
+            prefix *= per_step;
+            surv[handle.slot as usize][d] = prefix;
+        }
+        scheduler
+            .complete_packed_round_with_survival(
+                fence, &records, gpu_time(MS), &vec![vec![per_step; 15]; plan.batch_capacity], Some(&surv),
+            )
+            .unwrap();
+    }
+    for d in 0..4 {
+        let f = scheduler.forecasts.calibration_factor(d);
+        assert!((f - 1.0).abs() < 0.03, "calibrated drafter factor at depth {d} drifted: {f}");
+    }
+}
+
+#[test]
+fn gpu_confidence_calibration_isolates_two_lane_observations() {
+    let mut scheduler = joined_round_engine(crate::execution::PrefixAllocation::Gpu);
+    let a = add(&mut scheduler, 1, 64, 512);
+    let b = add(&mut scheduler, 2, 64, 512);
+    ready(&mut scheduler, &[a, b]);
+    let slots = scheduler.limits.request_capacity();
+    for _ in 0..24 {
+        let plan = scheduler.plan().unwrap();
+        let fence = Fence(scheduler.submitted.0 + 1);
+        scheduler.commit(&plan, fence).unwrap();
+        let mut records = completion_records(&scheduler, &plan, fence, 1);
+        let mut surv = vec![vec![-1.0f32; 15]; slots];
+        let mut confidence = vec![vec![0.8f32; 15]; plan.batch_capacity];
+        let mut remaining = plan.packed_token_capacity.saturating_sub(plan.lanes.len());
+        for (row, lane) in plan.lanes.iter().enumerate() {
+            let max_off = lane.tokens.saturating_sub(1).min(remaining);
+            let offered = if row == 0 { max_off.min(2) } else { max_off.min(1) };
+            remaining = remaining.saturating_sub(offered);
+            let emitted = (offered.min(1) + 1) as i64;
+            {
+                let vec = records[lane.request.slot as usize].vector.as_mut().unwrap();
+                vec.offered_drafts = offered as i64;
+                vec.accepted_drafts = offered.min(1) as i64;
+                vec.emitted_count = emitted;
+            }
+            records[lane.request.slot as usize].generated_tokens =
+                scheduler.request(lane.request).unwrap().generated_tokens as i64 + emitted;
+            records[lane.request.slot as usize].consumed_tokens =
+                scheduler.request(lane.request).unwrap().consumed_tokens as i64 + emitted;
+            confidence[row] = vec![if row == 0 { 0.9 } else { 0.5 }; 15];
+            for d in 0..offered {
+                surv[lane.request.slot as usize][d] = if d == 0 {
+                    if row == 0 { 0.9 } else { 0.5 }
+                } else {
+                    0.1
+                };
+            }
+        }
+        scheduler
+            .complete_packed_round_with_survival(fence, &records, gpu_time(MS), &confidence, Some(&surv))
+            .unwrap();
+    }
+    // Depth 0 matched predictions on both lanes (~1.0); depth 1 was only offered on lane 0 with 0.1 vs 0.81.
+    assert!((scheduler.forecasts.calibration_factor(0) - 1.0).abs() < 0.05);
+    assert!(scheduler.forecasts.calibration_factor(1) < 0.35);
+}
+
+#[test]
+fn gpu_allocation_surplus_invariants_and_within_request_variance() {
+    // 1. Pure between-request heterogeneity (zero step-to-step variance): actual == forecast => factor == 1.0.
+    let mut forecasts = rounds::Forecasts::new(8);
+    let easy = vec![0.95f32, 0.90, 0.85, 0.80, 0.72, 0.65, 0.58];
+    let hard = vec![0.35f32, 0.10, 0.02, 0.0, 0.0, 0.0, 0.0];
+    for i in 0..32 {
+        let curve = if i % 2 == 0 { easy.clone() } else { hard.clone() };
+        forecasts.observe_surplus(curve.clone(), curve);
+    }
+    let table = forecasts.surplus_table(7).unwrap();
+    for lanes in [1, 2, 8, 16, 32] {
+        for budget in [0, lanes, 2 * lanes, 4 * lanes, 7 * lanes] {
+            let f = table.factor(lanes, budget, 1.0);
+            assert!((f - 1.0).abs() < 1e-9, "heterogeneity-only must stay 1.0 (lanes={lanes} budget={budget}): {f}");
+        }
+    }
+
+    // 2. Pure level shift (constant multiple, zero variance): factor == 1.0 everywhere.
+    let mut shifted = rounds::Forecasts::new(8);
+    for _ in 0..16 {
+        shifted.observe_surplus(
+            vec![0.80, 0.60, 0.40, 0.24, 0.12, 0.06, 0.02],
+            vec![0.40, 0.30, 0.20, 0.12, 0.06, 0.03, 0.01],
+        );
+    }
+    let shifted_table = shifted.surplus_table(7).unwrap();
+    assert!((shifted_table.factor(16, 32, 1.0) - 1.0).abs() < 1e-9);
+
+    // 3. Real within-request step-to-step burstiness: easy & hard steps share the same time-averaged forecast.
+    let mut bursty = rounds::Forecasts::new(8);
+    let mean: Vec<f32> = easy.iter().zip(&hard).map(|(a, b)| 0.5 * (a + b)).collect();
+    for i in 0..64 {
+        let actual = if i % 2 == 0 { easy.clone() } else { hard.clone() };
+        bursty.observe_surplus(actual, mean.clone());
+    }
+    let bursty_table = bursty.surplus_table(7).unwrap();
+    assert_eq!(bursty_table.factor(1, 2, 1.0), 1.0, "single lane has no cross-lane cherry-picking");
+    assert_eq!(bursty_table.factor(16, 16 * 7, 1.0), 1.0, "uncrowded shape has no cherry-picking surplus");
+    let packed_f = bursty_table.factor(16, 32, 1.0);
+    assert!(packed_f > 1.25 && packed_f < 1.60, "expected strong positive surplus at B=16, r=2, got {packed_f}");
+    let alpha06_f = bursty_table.factor(16, 32, 0.6);
+    assert!(alpha06_f > 1.0 && alpha06_f < packed_f, "smaller alpha should naturally reduce surplus: {alpha06_f} vs {packed_f}");
+}
+
+#[test]
+fn gpu_allocation_surplus_rescues_packed_speculative_at_alpha_one_and_falls_back_when_broken() {
+    let mut scheduler = engine(16, true);
+    throughput_only(&mut scheduler);
+    let mut graphs = super::tests::duration_graphs(16);
+    for g in &mut graphs {
+        g.estimated_duration_ns = match (g.kind, g.batch_capacity, g.token_capacity) {
+            (GraphKind::Init | GraphKind::Prefill, _, _) => MS,
+            (GraphKind::Speculative, 16, 1) => 10 * MS,
+            _ => 50 * MS,
+        };
+    }
+    // Add a packed B=16, D=7, W=8, P=48 GPU-allocated graph (22 ms) competing against B=16, W=1 (10 ms).
+    graphs.push(crate::execution::GraphDescriptor {
+        name: "packed-16x8-p48".into(),
+        kind: GraphKind::Speculative,
+        sampling_mode: SamplingMode::General,
+        handle: graphs.len() + 1,
+        batch_capacity: 16,
+        draft_tokens: 7,
+        token_capacity: 8,
+        packed_token_capacity: 48,
+        prefill_capacity: 0,
+        estimated_duration_ns: 22 * MS,
+        confidence_width: 7,
+        tuned_bindings: vec![],
+        input_bindings: vec![],
+    });
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    scheduler.capabilities.speculative_allocations =
+        vec![(16, 7, 8, 48, crate::execution::PrefixAllocation::Gpu)];
+    let handles: Vec<_> = (0..16).map(|i| add(&mut scheduler, i + 1, 64, 512)).collect();
+    ready(&mut scheduler, &handles);
+
+    // Mean curve [0.60, 0.47, 0.425, ...]:
+    //   without surplus: 16 + 16*(0.60+0.47) = 33.12 tok / 22ms = 1.505 tok/ms < B16xW1 (16 / 10ms = 1.60 tok/ms)
+    //   with bursty step-to-step variance (surplus ~1.49x): 16 + 17.12*1.49 = 41.5 tok / 22ms = 1.89 > 1.60
+    let easy = vec![0.95f32, 0.90, 0.85, 0.78, 0.70, 0.60, 0.50];
+    let hard = vec![0.25f32, 0.04, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let mean: Vec<f32> = easy.iter().zip(&hard).map(|(a, b)| 0.5 * (a + b)).collect();
+    scheduler.forecasts.population = mean.clone();
+    let without_surplus = scheduler.plan().unwrap();
+    assert_eq!((without_surplus.batch_capacity, without_surplus.token_capacity), (16, 1),
+        "without variance surplus, mean-only pricing should underprice P=48 below B16xW1");
+    for i in 0..64 {
+        let actual = if i % 2 == 0 { easy.clone() } else { hard.clone() };
+        scheduler.forecasts.observe_surplus(actual, mean.clone());
+    }
+    let plan = scheduler.plan().unwrap();
+    assert_eq!((plan.batch_capacity, plan.token_capacity, plan.packed_token_capacity), (16, 8, 48),
+        "order-statistic surplus should select packed B16xW8 P=48 at alpha=1.0");
+
+    // Now simulate a broken drafter (realized survival ~0 despite high predicted confidence):
+    // calibration pulls expected drafts near 0, so scheduler must cleanly fall back to W=1.
+    for _ in 0..64 {
+        for d in 0..7 {
+            scheduler.forecasts.observe_calibration(d, 0.0, f64::from(mean[d]));
+        }
+    }
+    let fallback = scheduler.plan().unwrap();
+    assert_eq!((fallback.batch_capacity, fallback.token_capacity), (16, 1),
+        "broken drafter must fall back cleanly to B16xW1 even with positive surplus history");
+}
+
+#[test]
+fn gpu_confidence_calibration_is_per_request_and_resists_cross_workload_bleed() {
+    let mut scheduler = joined_round_engine(crate::execution::PrefixAllocation::Gpu);
+    let slots = scheduler.limits.request_capacity();
+
+    // Simulate a preceding C=32 hard/overconfident workload that depresses global calibration to ~0.50.
+    for _ in 0..64 {
+        for d in 0..4 {
+            scheduler.forecasts.observe_calibration(d, 0.40, 0.80);
+        }
+    }
+    for d in 0..4 {
+        assert!(scheduler.forecasts.calibration_factor(d) < 0.55,
+            "precondition: global depth {d} should be depressed");
+    }
+
+    // Launch two concurrent fresh requests: A is well-calibrated (true f=1.0), B is overconfident (true f=0.5).
+    let a = add(&mut scheduler, 1, 64, 1024);
+    let b = add(&mut scheduler, 2, 64, 1024);
+    ready(&mut scheduler, &[a, b]);
+
+    // Before observing any rounds, fresh requests inherit the global prior (preserving instant broken-drafter safety).
+    assert!((scheduler.forecasts.request_calibration_factor(a, 0) - scheduler.forecasts.calibration_factor(0)).abs() < 1e-9);
+    assert!((scheduler.forecasts.request_calibration_factor(b, 0) - scheduler.forecasts.calibration_factor(0)).abs() < 1e-9);
+
+    let step_pair = |scheduler: &mut RequestScheduler, max_depth: usize| {
+        let plan = scheduler.plan().unwrap();
+        let fence = Fence(scheduler.submitted.0 + 1);
+        scheduler.commit(&plan, fence).unwrap();
+        let mut records = completion_records(scheduler, &plan, fence, 1);
+        let mut surv = vec![vec![-1.0f32; 15]; slots];
+        let mut confidence = vec![vec![0.85f32; 15]; plan.batch_capacity];
+        let mut remaining = plan.packed_token_capacity.saturating_sub(plan.lanes.len());
+        for (row, lane) in plan.lanes.iter().enumerate() {
+            let offered = lane.tokens.saturating_sub(1).min(max_depth).min(remaining);
+            remaining = remaining.saturating_sub(offered);
+            let emitted = (offered + 1) as i64;
+            {
+                let rec = &mut records[lane.request.slot as usize];
+                let vec = rec.vector.as_mut().unwrap();
+                vec.verification_width = lane.tokens as i64;
+                vec.offered_drafts = offered as i64;
+                vec.accepted_drafts = offered as i64;
+                vec.emitted_count = emitted;
+                for idx in 0..emitted as usize {
+                    vec.tokens[idx] = 1;
+                }
+                for idx in emitted as usize..vec.tokens.len() {
+                    vec.tokens[idx] = -1;
+                }
+                rec.token_id = 1;
+            }
+            records[lane.request.slot as usize].generated_tokens =
+                scheduler.request(lane.request).unwrap().generated_tokens as i64 + emitted;
+            records[lane.request.slot as usize].consumed_tokens =
+                scheduler.request(lane.request).unwrap().consumed_tokens as i64 + emitted;
+            confidence[row] = vec![0.85f32; 15];
+            let true_scale = if lane.request == a { 1.0f32 } else { 0.5f32 };
+            let mut prefix = 1.0f32;
+            for d in 0..offered {
+                prefix *= 0.85;
+                surv[lane.request.slot as usize][d] = prefix * true_scale;
+            }
+        }
+        scheduler
+            .complete_packed_round_with_survival(fence, &records, gpu_time(MS), &confidence, Some(&surv))
+            .unwrap();
+    };
+
+    // Run 20 rounds offering at most depths 0..2 (censoring depth 2).
+    for _ in 0..20 {
+        step_pair(&mut scheduler, 2);
+    }
+
+    // Lane A must escape the depressed global prior AND remain isolated from concurrent overconfident Lane B.
+    let a_f0 = scheduler.forecasts.request_calibration_factor(a, 0);
+    let b_f0 = scheduler.forecasts.request_calibration_factor(b, 0);
+    assert!(a_f0 > 0.90, "well-calibrated lane A should recover near 1.0, got {a_f0}");
+    assert!(b_f0 < 0.58, "overconfident lane B should stay near 0.5, got {b_f0}");
+    assert!(a_f0 - b_f0 > 0.35, "per-request calibration must isolate heterogeneous lanes: a={a_f0} b={b_f0}");
+
+    // Advance Lane A past 256+ generated tokens while keeping depth 2 censored, then deliver ONE probe at depth 2.
+    // Because Lane A's unobserved prior at depth 2 ages with a 128-token half-life, one probe escapes the
+    // depressed global prior (>0.78) instead of crawling by 1/32 (~+0.015).
+    for _ in 0..90 {
+        step_pair(&mut scheduler, 2);
+    }
+    let before_probe = scheduler.forecasts.request_calibration_factor(a, 2);
+    assert!(before_probe < 0.55, "depth 2 was never offered yet, should still reflect prior: {before_probe}");
+    step_pair(&mut scheduler, 3);
+    let after_probe = scheduler.forecasts.request_calibration_factor(a, 2);
+    assert!(after_probe > 0.78, "single probe after aging should rapidly escape censoring trap, got {after_probe}");
+}
+
+#[test]
+fn gpu_allocation_surplus_supports_width_two_depth_one_and_falls_back_conservatively() {
+    // 1. Pure between-request heterogeneity at depth=1 (width=2): factor == 1.0 identically.
+    let mut hetero = rounds::Forecasts::new(8);
+    for i in 0..32 {
+        let v = if i % 2 == 0 { vec![0.95f32] } else { vec![0.25f32] };
+        hetero.observe_surplus(v.clone(), v);
+    }
+    let hetero_table = hetero.surplus_table(1).unwrap();
+    assert!((hetero_table.factor(32, 16, 1.0) - 1.0).abs() < 1e-9);
+
+    // 2. Within-request step-to-step burstiness at depth=1 (e.g. crowded B=32, W=2, P=48):
+    //    realizes strong surplus at quota=0.5, returns 1.0 at uncrowded quota=1.0 or single lane.
+    let mut bursty = rounds::Forecasts::new(8);
+    for i in 0..64 {
+        let actual = if i % 2 == 0 { vec![0.95f32] } else { vec![0.25f32] };
+        bursty.observe_surplus(actual, vec![0.60f32]);
+    }
+    let table_d1 = bursty.surplus_table(1).unwrap();
+    assert_eq!(table_d1.factor(1, 1, 1.0), 1.0);
+    assert_eq!(table_d1.factor(32, 32, 1.0), 1.0, "uncrowded B=32xW=2 P=64 has zero surplus");
+    let f_w2 = table_d1.factor(32, 16, 1.0);
+    assert!(f_w2 > 1.45 && f_w2 < 1.65, "crowded B=32xW=2 P=48 should capture depth-1 Lorenz surplus, got {f_w2}");
+    let f_w2_a06 = table_d1.factor(32, 16, 0.6);
+    assert!(f_w2_a06 > 1.0 && f_w2_a06 < f_w2);
+
+    // 3. Conservative fallback: when only depth-1 history exists, surplus_table(7) falls back to eff_depth=1
+    //    (still pricing quota < 1.0 accurately, and returning 1.0 without extrapolating for quota >= 1.0).
+    let fallback_d7 = bursty.surplus_table(7).unwrap();
+    assert!((fallback_d7.factor(32, 16, 1.0) - f_w2).abs() < 1e-9);
+    assert_eq!(fallback_d7.factor(32, 32, 1.0), 1.0, "must not extrapolate beyond observed eff_depth=1");
+
+    // 4. End-to-end: crowded B=16, D=1, W=2, P=24 (draft_budget=8) beats B=16, W=1 once depth-1 surplus
+    //    is populated by completed W=2 rounds.
+    let mut scheduler = engine(16, true);
+    throughput_only(&mut scheduler);
+    let mut graphs = super::tests::duration_graphs(16);
+    for g in &mut graphs {
+        g.estimated_duration_ns = match (g.kind, g.batch_capacity, g.token_capacity) {
+            (GraphKind::Init | GraphKind::Prefill, _, _) => MS,
+            (GraphKind::Speculative, 16, 1) => 10 * MS,
+            _ => 50 * MS,
+        };
+    }
+    graphs.push(crate::execution::GraphDescriptor {
+        name: "packed-16x2-p24".into(),
+        kind: GraphKind::Speculative,
+        sampling_mode: SamplingMode::General,
+        handle: graphs.len() + 1,
+        batch_capacity: 16,
+        draft_tokens: 1,
+        token_capacity: 2,
+        packed_token_capacity: 24,
+        prefill_capacity: 0,
+        estimated_duration_ns: 135 * MS / 10, // 13.5 ms
+        confidence_width: 1,
+        tuned_bindings: vec![],
+        input_bindings: vec![],
+    });
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    scheduler.capabilities.speculative_allocations =
+        vec![(16, 1, 2, 24, crate::execution::PrefixAllocation::Gpu)];
+    let handles: Vec<_> = (0..16).map(|i| add(&mut scheduler, i + 1, 64, 512)).collect();
+    ready(&mut scheduler, &handles);
+    scheduler.forecasts.population = vec![0.60, 0.30, 0.15, 0.08, 0.04, 0.02, 0.01];
+    // Without surplus: 16 + 8*0.60 = 20.8 / 13.5ms = 1.54 tok/ms < B16xW1 (16 / 10ms = 1.60 tok/ms).
+    let before = scheduler.plan().unwrap();
+    assert_eq!((before.batch_capacity, before.token_capacity), (16, 1));
+    // With depth-1 surplus (~1.55x): 16 + 4.8*1.55 = 23.44 / 13.5ms = 1.74 > 1.60.
+    for i in 0..32 {
+        let actual = if i % 2 == 0 { vec![0.95f32] } else { vec![0.25f32] };
+        scheduler.forecasts.observe_surplus(actual, vec![0.60f32]);
+    }
+    let after = scheduler.plan().unwrap();
+    assert_eq!((after.batch_capacity, after.token_capacity, after.packed_token_capacity), (16, 2, 24),
+        "depth-1 surplus should rescue crowded B=16xW=2 P=24 at alpha=1.0");
+
+    // Completing a W=2 (depth_limit=1) round must also push entries into the depth-1 surplus ring
+    // without touching the deeper surplus ring.
+    let before_d1 = scheduler.forecasts.surplus_depth_one_entries();
+    let before_deep = scheduler.forecasts.surplus_deep_entries();
+    let fence = Fence(scheduler.submitted.0 + 1);
+    scheduler.commit(&after, fence).unwrap();
+    let mut records = completion_records(&scheduler, &after, fence, 0);
+    let mut remaining = after.packed_token_capacity.saturating_sub(after.lanes.len());
+    for lane in &after.lanes {
+        let offered = lane.tokens.saturating_sub(1).min(remaining);
+        remaining = remaining.saturating_sub(offered);
+        let vec = records[lane.request.slot as usize].vector.as_mut().unwrap();
+        vec.verification_width = lane.tokens as i64;
+        vec.offered_drafts = offered as i64;
+    }
+    let width = scheduler.capabilities.completion_token_capacity - 1;
+    let confidence = vec![vec![0.8f32; width]; after.batch_capacity];
+    scheduler.complete_packed_round(fence, &records, gpu_time(135 * MS / 10), &confidence).unwrap();
+    assert_eq!(scheduler.forecasts.surplus_depth_one_entries(), before_d1 + 16,
+        "completed W=2 packed round should feed depth-1 surplus ring");
+    assert_eq!(scheduler.forecasts.surplus_deep_entries(), before_deep,
+        "completed W=2 packed round must not evict or pollute deep surplus ring");
+}
+
+#[test]
+fn gpu_surplus_history_retains_256_lane_steps_and_isolates_depth_one_from_deep_ring() {
+    let mut forecasts = rounds::Forecasts::new(8);
+    let easy = vec![0.95f32, 0.90, 0.85, 0.78];
+    let hard = vec![0.25f32, 0.04, 0.0, 0.0];
+    let mean: Vec<f32> = easy.iter().zip(&hard).map(|(a, b)| 0.5 * (a + b)).collect();
+    for i in 0..256 {
+        let actual = if i % 2 == 0 { easy.clone() } else { hard.clone() };
+        forecasts.observe_surplus(actual, mean.clone());
+    }
+    assert_eq!(forecasts.surplus_deep_entries(), 256, "deep ring should retain 8 full C=32 rounds");
+    assert_eq!(forecasts.surplus_depth_one_entries(), 256, "depth-1 ring should retain 8 full C=32 rounds");
+
+    // 512 consecutive W=2 (depth=1) lane-steps must keep depth-1 fresh WITHOUT evicting deep curves,
+    // so querying depth=7 still falls back to observed depth=4 rather than starving deeper shapes.
+    for i in 0..512 {
+        let a0 = if i % 2 == 0 { 0.95f32 } else { 0.25f32 };
+        forecasts.observe_surplus(vec![a0], vec![0.60f32]);
+    }
+    assert_eq!(forecasts.surplus_deep_entries(), 256, "W=2 traffic must not evict deeper curves");
+    assert_eq!(forecasts.surplus_depth_one_entries(), 256, "depth-1 ring should cap cleanly at 256 entries");
+
+    let table_d7 = forecasts.surplus_table(7).expect("should fall back to observed depth 4");
+    let packed_f = table_d7.factor(16, 31, 1.0);
+    assert!(packed_f > 1.20 && packed_f < 1.60, "expected positive surplus at B=16, budget=31, got {packed_f}");
+    assert_eq!(table_d7.factor(16, 64, 1.0), 1.0, "uncrowded relative to observed depth 4 must stay 1.0");
+    assert_eq!(table_d7.factor(1, 2, 1.0), 1.0);
+}
+
+#[test]
+fn large_batch_single_low_acceptance_round_does_not_collapse_calibration() {
+    let mut scheduler = engine(32, true);
+    throughput_only(&mut scheduler);
+    let mut graphs = super::tests::duration_graphs(32);
+    for g in &mut graphs {
+        g.estimated_duration_ns = match (g.kind, g.batch_capacity, g.token_capacity) {
+            (GraphKind::Init | GraphKind::Prefill, _, _) => MS,
+            (GraphKind::Speculative, 32, 1) => 9 * MS,
+            (GraphKind::Speculative, 32, 2) => 12 * MS,
+            _ => 50 * MS,
+        };
+    }
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    scheduler.capabilities.speculative_allocations =
+        vec![(32, 1, 2, 64, crate::execution::PrefixAllocation::Gpu)];
+    let handles: Vec<_> = (0..32).map(|i| add(&mut scheduler, i + 1, 64, 512)).collect();
+    ready(&mut scheduler, &handles);
+    let slots = scheduler.limits.request_capacity();
+
+    // Establish 16 well-calibrated B=32 W=2 rounds (predicted=0.70, realized=0.68).
+    for _ in 0..16 {
+        let plan = scheduler.plan().unwrap();
+        assert_eq!((plan.batch_capacity, plan.token_capacity), (32, 2));
+        let fence = Fence(scheduler.submitted.0 + 1);
+        scheduler.commit(&plan, fence).unwrap();
+        let mut records = completion_records(&scheduler, &plan, fence, 1);
+        let mut surv = vec![vec![-1.0f32; 15]; slots];
+        let confidence = vec![vec![0.70; 15]; plan.batch_capacity];
+        for lane in &plan.lanes {
+            records[lane.request.slot as usize].vector.as_mut().unwrap().offered_drafts = 1;
+            surv[lane.request.slot as usize][0] = 0.68;
+        }
+        scheduler
+            .complete_packed_round_with_survival(fence, &records, gpu_time(12 * MS), &confidence, Some(&surv))
+            .unwrap();
+    }
+
+    // One correlated low-acceptance B=32 round (all 32 lanes drop to realized=0.05).
+    let plan = scheduler.plan().unwrap();
+    let fence = Fence(scheduler.submitted.0 + 1);
+    scheduler.commit(&plan, fence).unwrap();
+    let mut records = completion_records(&scheduler, &plan, fence, 1);
+    let mut surv = vec![vec![-1.0f32; 15]; slots];
+    let confidence = vec![vec![0.70; 15]; plan.batch_capacity];
+    for lane in &plan.lanes {
+        records[lane.request.slot as usize].vector.as_mut().unwrap().offered_drafts = 1;
+        surv[lane.request.slot as usize][0] = 0.05;
+    }
+    scheduler
+        .complete_packed_round_with_survival(fence, &records, gpu_time(12 * MS), &confidence, Some(&surv))
+        .unwrap();
+
+    // Both the once-per-round population prior and every lane's calibrated forecast must stay
+    // above the W=2 vs W=1 threshold (32*1.60/12ms > 32/9ms) instead of collapsing into W=1.
+    assert!(scheduler.forecasts.calibration_factor(0) > 0.85,
+        "single correlated B=32 round must not collapse population prior: {}",
+        scheduler.forecasts.calibration_factor(0));
+    let next = scheduler.plan().unwrap();
+    assert_eq!((next.batch_capacity, next.token_capacity), (32, 2),
+        "single correlated B=32 dip must not trap scheduler in W=1");
+}
+
+const DEEPSEEK_16K_PREFILL_CATALOG: [usize; 11] = [
+    256, 512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384,
+];
+
+fn realistic_sm120_duration_ns(kind: GraphKind, capacity: usize) -> u64 {
+    match kind {
+        GraphKind::Prefill => 15_000_000 + (capacity as u64 * 230_000_000) / 16_384,
+        GraphKind::TerminalPrefill => 18_000_000 + (capacity as u64 * 230_000_000) / 16_384,
+        GraphKind::ScoredPrefill => 20_000_000 + (capacity as u64 * 230_000_000) / 16_384,
+        GraphKind::Init | GraphKind::Restore => 150_000,
+        GraphKind::Snapshot => 500_000,
+        GraphKind::Decode | GraphKind::Resume => 12_000_000,
+        _ => 1_000_000,
+    }
+}
+
+fn cold_deepseek_16k_engine(with_terminal: bool) -> RequestScheduler {
+    let mut s = RequestScheduler::new(
+        [41; 32],
+        SchedulerLimits {
+            max_active: 1,
+            request_slots: 1,
+            max_sequence_tokens: 131_072,
+            prefill_chunk_size: 16_384,
+            pages: 4096,
+            snapshots: 32,
+        },
+        SchedulerCapabilities {
+            completion_token_capacity: 16,
+            vocabulary: 1024,
+            page_tokens: 64,
+            vision: crate::model::VisionCapabilities::disabled(),
+            draft_pages_per_request: 0,
+            completion_inputs: vec![],
+            speculative_allocations: vec![],
+            state_rows_per_request: None,
+        },
+    )
+    .unwrap();
+    s.prefill_graphs(&DEEPSEEK_16K_PREFILL_CATALOG).unwrap();
+    if with_terminal {
+        s.terminal_prefill_graphs(&DEEPSEEK_16K_PREFILL_CATALOG).unwrap();
+    }
+    let mut graphs = super::tests::duration_graphs(1);
+    graphs.retain(|g| g.kind != GraphKind::Prefill);
+    for &capacity in &DEEPSEEK_16K_PREFILL_CATALOG {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("prefill{capacity}"),
+            kind: GraphKind::Prefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 100 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: 0,
+            input_bindings: vec![],
+        });
+        if with_terminal {
+            graphs.push(crate::execution::GraphDescriptor {
+                tuned_bindings: vec![],
+                confidence_width: 0,
+                name: format!("terminal_prefill{capacity}"),
+                kind: GraphKind::TerminalPrefill,
+                sampling_mode: SamplingMode::General,
+                draft_tokens: 0,
+                handle: 1000 + capacity,
+                batch_capacity: 1,
+                token_capacity: capacity,
+                packed_token_capacity: 0,
+                prefill_capacity: 0,
+                estimated_duration_ns: 0,
+                input_bindings: vec![],
+            });
+        }
+    }
+    s.graph_durations(&graphs).unwrap();
+    s
+}
+
+#[derive(Debug)]
+struct PrefillRunMetrics {
+    launches: usize,
+    prefill_discoveries: usize,
+    total_discoveries: usize,
+    init_origin: PlanOrigin,
+    prefill_ns: u64,
+    sequence: Vec<(GraphKind, usize, usize, PlanOrigin)>,
+}
+
+fn run_cold_request_metrics(
+    s: &mut RequestScheduler,
+    req_id: u32,
+    prompt_tokens: usize,
+) -> PrefillRunMetrics {
+    let handle = add(s, req_id, prompt_tokens, 1);
+    let mut launches = 0usize;
+    let mut prefill_discoveries = 0usize;
+    let mut total_discoveries = 0usize;
+    let mut init_origin = PlanOrigin::Ordinary;
+    let mut prefill_ns = 0u64;
+    let mut sequence = Vec::new();
+    while s.request(handle).is_ok() {
+        let plan = s.plan().expect("request must make progress");
+        let dur = realistic_sm120_duration_ns(plan.kind, plan.token_capacity);
+        if plan.origin == PlanOrigin::Discovery {
+            total_discoveries += 1;
+        }
+        if plan.kind == GraphKind::Init {
+            init_origin = plan.origin;
+        }
+        if plan.kind.is_prefill() {
+            launches += 1;
+            if plan.origin == PlanOrigin::Discovery {
+                prefill_discoveries += 1;
+            }
+            prefill_ns += dur;
+            sequence.push((plan.kind, plan.token_capacity, plan.lanes[0].tokens, plan.origin));
+        }
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        s.advance_to(s.now_ns + dur).unwrap();
+        complete_timed(s, &plan, fence, 0, true, gpu_time(dur));
+    }
+    PrefillRunMetrics {
+        launches,
+        prefill_discoveries,
+        total_discoveries,
+        init_origin,
+        prefill_ns,
+        sequence,
+    }
+}
+
+#[test]
+fn cold_deepseek_16k_prefill_uses_natural_fit_discovery() {
+    let cases: [(&str, usize, usize, usize, usize); 6] = [
+        // (label, prompt_tokens, expected_launches, expected_req1_prefill_disc, expected_tail_cap)
+        ("8K", 8_192, 1, 1, 8_192),
+        ("16K", 16_384, 1, 1, 16_384),
+        ("32K", 32_768, 2, 2, 16_384),
+        ("64K", 65_536, 4, 2, 16_384),
+        ("124K", 126_976, 8, 2, 12_288),
+        ("124000", 124_000, 8, 2, 10_240),
+    ];
+    for (label, prompt, expected_launches, expected_req1_disc, expected_tail_cap) in cases {
+        let mut s = cold_deepseek_16k_engine(true);
+        for req in 1..=3u32 {
+            let m = run_cold_request_metrics(&mut s, req, prompt);
+            let ms = m.prefill_ns as f64 / 1e6;
+            let tok_s = prompt as f64 / (ms / 1e3);
+            let seq: Vec<String> = m
+                .sequence
+                .iter()
+                .map(|(k, c, t, o)| {
+                    let tag = match k {
+                        GraphKind::TerminalPrefill => "T",
+                        _ => "P",
+                    };
+                    let d = if *o == PlanOrigin::Discovery { "*" } else { "" };
+                    format!("{tag}{c}({t}){d}")
+                })
+                .collect();
+            println!(
+                "AB prompt={label}({prompt}) req={req} launches={} prefill_disc={} total_disc={} init={:?} ms={ms:.2} tok_s={tok_s:.0} seq=[{}]",
+                m.launches,
+                m.prefill_discoveries,
+                m.total_discoveries,
+                m.init_origin,
+                seq.join(",")
+            );
+            assert_eq!(m.launches, expected_launches, "{label} req={req} launches");
+            assert_eq!(
+                m.prefill_discoveries,
+                if req == 1 { expected_req1_disc } else { 0 },
+                "{label} req={req} prefill discoveries"
+            );
+            assert_eq!(
+                m.init_origin,
+                if req == 1 { PlanOrigin::Discovery } else { PlanOrigin::Ordinary },
+                "{label} req={req} init origin"
+            );
+            for &(kind, cap, _, _) in &m.sequence[..m.sequence.len() - 1] {
+                assert_eq!((kind, cap), (GraphKind::Prefill, 16_384), "{label} req={req} full chunk");
+            }
+            let &(last_kind, last_cap, _, _) = m.sequence.last().unwrap();
+            assert_eq!(
+                (last_kind, last_cap),
+                (GraphKind::TerminalPrefill, expected_tail_cap),
+                "{label} req={req} terminal chunk"
+            );
+        }
+    }
+
+    // Without TerminalPrefill catalog, a cold 124K prompt also runs 7x Prefill(16384) + Prefill(12288).
+    let mut no_term = cold_deepseek_16k_engine(false);
+    let r1 = run_cold_request_metrics(&mut no_term, 1, 126_976);
+    assert_eq!((r1.launches, r1.prefill_discoveries), (8, 2));
+    assert_eq!(
+        r1.sequence.iter().map(|&(_, cap, _, _)| cap).collect::<Vec<_>>(),
+        vec![16_384, 16_384, 16_384, 16_384, 16_384, 16_384, 16_384, 12_288]
+    );
+    let r2 = run_cold_request_metrics(&mut no_term, 2, 126_976);
+    assert_eq!((r2.launches, r2.prefill_discoveries, r2.total_discoveries), (8, 0, 0));
+}
+
+#[test]
+fn measured_faster_smaller_prefill_still_beats_larger_natural_fit_by_value_rate() {
+    let mut s = cold_deepseek_16k_engine(false);
+    // Measure Prefill(8192) at 100 ms (81.92 tok/ms), leaving every other prefill unmeasured.
+    set_cost(&mut s, GraphKind::Init, 1, 1, 150_000);
+    set_cost(&mut s, GraphKind::Snapshot, 1, 1, 500_000);
+    set_cost(&mut s, GraphKind::Prefill, 1, 8_192, 100 * MS);
+
+    let handle = add(&mut s, 1, 32_768, 1);
+    let init = measured_step(&mut s, 150_000, 0);
+    assert_eq!(init.kind, GraphKind::Init);
+
+    // Chunk 1 discovers the unmeasured natural-fit Prefill(16384) at 245 ms (66.87 tok/ms).
+    let first = measured_step(&mut s, 245 * MS, 0);
+    assert_eq!(
+        (first.kind, first.token_capacity, first.origin),
+        (GraphKind::Prefill, 16_384, PlanOrigin::Discovery)
+    );
+
+    // Chunks 2 and 3 have 16384 and 8192 remaining: measured Prefill(8192) beats Prefill(16384)
+    // by ordinary ValueRate (81.92 vs 66.87 tok/ms), and unmeasured smaller shapes do not preempt.
+    let second = measured_step(&mut s, 100 * MS, 0);
+    assert_eq!(
+        (second.kind, second.token_capacity, second.origin),
+        (GraphKind::Prefill, 8_192, PlanOrigin::Ordinary)
+    );
+    let third = measured_step(&mut s, 100 * MS, 0);
+    assert_eq!(
+        (third.kind, third.token_capacity, third.origin),
+        (GraphKind::Prefill, 8_192, PlanOrigin::Ordinary)
+    );
+    assert_eq!(s.request(handle).unwrap().consumed_tokens, 32_768);
+}
+
+#[test]
+fn refresh_start_still_calibrates_stale_smaller_prefill_shapes() {
+    let mut s = cold_deepseek_16k_engine(false);
+    set_cost(&mut s, GraphKind::Init, 1, 1, 150_000);
+    set_cost(&mut s, GraphKind::Snapshot, 1, 1, 500_000);
+    set_cost(&mut s, GraphKind::Prefill, 1, 8_192, 130 * MS);
+    set_cost(&mut s, GraphKind::Prefill, 1, 16_384, 245 * MS);
+
+    // Expire Prefill(8192) while keeping Init, Snapshot, and Prefill(16384) fresh.
+    s.advance_to(s.now_ns + s.policy.estimate_ttl_ns).unwrap();
+    set_cost(&mut s, GraphKind::Init, 1, 1, 150_000);
+    set_cost(&mut s, GraphKind::Snapshot, 1, 1, 500_000);
+    set_cost(&mut s, GraphKind::Prefill, 1, 16_384, 245 * MS);
+
+    let handle = add(&mut s, 1, 32_768, 1);
+    let init = measured_step(&mut s, 150_000, 0);
+    assert_eq!((init.kind, init.origin), (GraphKind::Init, PlanOrigin::Ordinary));
+
+    // With full refresh credit, RefreshStart probes stale Prefill(8192); unmeasured smaller
+    // capacities (256..6144, 10240..14336) never trigger Discovery.
+    s.refresh.credit_ns = refresh::CREDIT_CAP_NS;
+    let probe = measured_step(&mut s, 130 * MS, 0);
+    let key_8k = cost::Key {
+        drafts: 0,
+        kind: GraphKind::Prefill,
+        batch: 1,
+        tokens: 8_192,
+        prefill: 0,
+        packed: 0,
+    };
+    assert_eq!(
+        (probe.kind, probe.token_capacity, probe.origin),
+        (GraphKind::Prefill, 8_192, PlanOrigin::RefreshStart(key_8k))
+    );
+    let next = measured_step(&mut s, 245 * MS, 0);
+    assert_eq!(
+        (next.kind, next.token_capacity, next.origin),
+        (GraphKind::Prefill, 16_384, PlanOrigin::Ordinary)
+    );
+    assert_eq!(s.request(handle).unwrap().consumed_tokens, 24_576);
+}
+
+#[test]
+fn cold_scored_prefill_checkpoint_cuts_and_atomic_spans_use_natural_fit_discovery() {
+    // 1. Cold ScoredPrefill runs 32K in two 16384 chunks without stepping down.
+    let mut scored = cold_deepseek_16k_engine(false);
+    scored.scored_prefill_graphs(&DEEPSEEK_16K_PREFILL_CATALOG).unwrap();
+    let mut graphs = super::tests::duration_graphs(1);
+    graphs.retain(|g| g.kind != GraphKind::Prefill);
+    for &capacity in &DEEPSEEK_16K_PREFILL_CATALOG {
+        for (kind, base) in [(GraphKind::Prefill, 100usize), (GraphKind::ScoredPrefill, 2000)] {
+            graphs.push(crate::execution::GraphDescriptor {
+                tuned_bindings: vec![],
+                confidence_width: 0,
+                name: format!("{kind:?}-{capacity}"),
+                kind,
+                sampling_mode: SamplingMode::General,
+                draft_tokens: 0,
+                handle: base + capacity,
+                batch_capacity: 1,
+                token_capacity: capacity,
+                packed_token_capacity: 0,
+                prefill_capacity: 0,
+                estimated_duration_ns: 0,
+                input_bindings: vec![],
+            });
+        }
+    }
+    scored.graph_durations(&graphs).unwrap();
+    let h = scored
+        .admit(RequestSpec {
+            prompt: vec![7; 32_768],
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 1,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: true,
+            growable_output: false,
+        })
+        .unwrap();
+    assert_eq!(measured_step(&mut scored, 150_000, 0).kind, GraphKind::Init);
+    let c1 = measured_step(&mut scored, 250 * MS, 0);
+    assert_eq!(
+        (c1.kind, c1.token_capacity, c1.lanes[0].tokens, c1.origin),
+        (GraphKind::ScoredPrefill, 16_384, 16_384, PlanOrigin::Discovery)
+    );
+    let c2 = measured_step(&mut scored, 250 * MS, 0);
+    assert_eq!(
+        (c2.kind, c2.token_capacity, c2.lanes[0].tokens, c2.origin),
+        (GraphKind::ScoredPrefill, 16_384, 16_384, PlanOrigin::Ordinary)
+    );
+    assert_eq!(scored.request(h).unwrap().consumed_tokens, 32_768);
+
+    // 2. Cold checkpoint anchor cut discovers tightest fit (1024 for 1000), then tightest fit
+    // for remaining tail (4096 for 3096), without probing 256/512/2048.
+    let mut cut_sched = cold_deepseek_16k_engine(false);
+    let h = cut_sched
+        .admit(RequestSpec {
+            prompt: vec![8; 4_096],
+            message_boundaries: vec![1_000],
+            conditioning: vec![],
+            max_new_tokens: 4,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+        })
+        .unwrap();
+    assert_eq!(measured_step(&mut cut_sched, 150_000, 0).kind, GraphKind::Init);
+    let anchor_chunk = measured_step(&mut cut_sched, 30 * MS, 0);
+    assert_eq!(
+        (anchor_chunk.token_capacity, anchor_chunk.lanes[0].tokens, anchor_chunk.origin),
+        (1_024, 1_000, PlanOrigin::Discovery)
+    );
+    assert_eq!(measured_step(&mut cut_sched, 500_000, 0).kind, GraphKind::Snapshot);
+    let tail_chunk = measured_step(&mut cut_sched, 72 * MS, 0);
+    assert_eq!(
+        (tail_chunk.token_capacity, tail_chunk.lanes[0].tokens, tail_chunk.origin),
+        (4_096, 3_096, PlanOrigin::Discovery)
+    );
+    assert_eq!(cut_sched.request(h).unwrap().consumed_tokens, 4_096);
+
+    // 3. Cold atomic prefill span (10000..17000 inside 20000) achieves max single-step work
+    // 10000, so natural-fit discovery picks 10240 first, then 10240 for the remaining 10000.
+    let mut span_sched = cold_deepseek_16k_engine(false);
+    let h = add(&mut span_sched, 9, 20_000, 4);
+    span_sched.set_prefill_spans(h, &[10_000..17_000]).unwrap();
+    assert_eq!(measured_step(&mut span_sched, 150_000, 0).kind, GraphKind::Init);
+    let s1 = measured_step(&mut span_sched, 158 * MS, 0);
+    assert_eq!(
+        (s1.token_capacity, s1.lanes[0].tokens, s1.origin),
+        (10_240, 10_000, PlanOrigin::Discovery)
+    );
+    let s2 = measured_step(&mut span_sched, 158 * MS, 0);
+    assert_eq!(
+        (s2.token_capacity, s2.lanes[0].tokens, s2.origin),
+        (10_240, 10_000, PlanOrigin::Ordinary)
+    );
+    assert_eq!(span_sched.request(h).unwrap().consumed_tokens, 20_000);
 }

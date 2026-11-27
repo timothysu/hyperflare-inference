@@ -681,6 +681,10 @@ fn socket_parallel_execution_rejects_persistent_workers() {
         stop_flag_allocation: "worker_ctrl".into(),
         stop_flag_offset: 0,
         stop_flag_address: 0x2000_0000_0000,
+        metrics_allocation: None,
+        metrics_offset: 0,
+        metrics_address: 0,
+        metrics_count: 0,
         control: None,
     });
     let (root_stream, peer_stream) = crate::execution::rank_stream::test_pair().unwrap();

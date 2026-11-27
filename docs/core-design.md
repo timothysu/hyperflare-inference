@@ -948,9 +948,12 @@ Preparation proceeds in this order:
 6. After compiler workers exit, materialize final KV storage through
    `capture_forwards`' materialization callback. Bind live tensors and native
    handles, validate guards, and refresh cache-maintenance pointers.
-7. Warm every variant in rank order and capture each rank's graphs. Preserve
-   mutations, aliases, forks, and joins. Freeze storage and retain compiled
-   kernel owners through native drain.
+7. Warm compiled variants and capture each rank's graphs in descending order of
+   largest compiler-planned CUDA allocation (breaking ties by total planned bytes,
+   then catalog order, agreed across ranks by cross-rank maximum request size),
+   with uncompiled variants following in catalog order. Preserve mutations,
+   aliases, forks, and joins. Freeze storage and retain compiled kernel owners
+   through native drain.
 8. Validate the catalog and frontend assets, export the runtime core, and
    close the prepared model. `flare run CORE` loads the exported core.
 
@@ -991,9 +994,9 @@ enum values, invalid storage views, and incompatible input geometry reject loadi
 
 Each selected program's pending-token inputs determine its completion dependency.
 Host-fed pending tokens wait for the preceding completion. Device-fed generation
-declares a persistent read, and initialization, restoration, prefill, scored
-prefill, resume, decode, speculative, and mixed producers declare their state
-writes.
+declares a persistent read, and initialization, restoration, prefill, terminal
+prefill, scored prefill, resume, decode, speculative, and mixed producers declare
+their state writes.
 Each selected graph declares its continuation-row requirement and embedding-table
 resource IDs. A speculative completion cursor references the graph's updated
 history storage and a token lag, or is absent when the graph maintains no draft
@@ -1225,8 +1228,8 @@ submitted lane limits. Confidence producers declare `confidence_width` and write
 FP32 `[2, request_slots, draft_capacity]` completion frames.
 
 Host pending-token, grammar, history, stop, cost-discovery, and phase-transition
-dependencies serialize the affected program. Prefill, scored prefill, mixed,
-resume, vision, and state operations drain the queue. A copy stream transfers
+dependencies serialize the affected program. Prefill, terminal prefill, scored
+prefill, mixed, resume, vision, and state operations drain the queue. A copy stream transfers
 records behind production events; input staging and completion frames remain
 owned until their fences complete. Tensor-parallel retirement waits for all
 ranks, protecting frame reuse and cancellation cleanup.

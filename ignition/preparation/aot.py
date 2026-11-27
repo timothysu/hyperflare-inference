@@ -33,7 +33,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten, treespec_dumps, tr
 from ignition import runtime_patches
 
 from .compilation import (DEFAULT_CACHE_ROOT, _INVOCATIONS, _OPTIONS, _Invocation, _artifact_kernel_table,
-                          _byte_storage, _storage_region, _lower_storage, _compiler_recursion)
+                          _byte_storage, _compile_options, _storage_region, _lower_storage, _compiler_recursion)
 from .device_binding import bind_device, relocate_inductor, restore_device, restore_prepared_device
 from .host_memory import release_unused
 
@@ -119,23 +119,42 @@ class _GuardPickler(GuardsStatePickler):
         from triton.runtime import JITFunction
         from torch._dynamo.aot_compile_types import _deserialize_triton_kernel, _serialize_triton_kernel
 
+        if id(obj) in self.empty_values or id(obj) in self.missing_values:
+            return super().reducer_override(obj)
         if isinstance(obj, torch.device):
             return restore_device, (obj.type, obj.index)
-        if isinstance(obj, torch._subclasses.FakeTensor):
+        if isinstance(obj, torch.Tensor) and obj.device.type != "meta":
+            if id(obj) not in self.guard_tree_values:
+                return _Missing, ('tensor guard tree',)
+            if (type(obj) not in (torch.Tensor, torch.nn.Parameter, torch._subclasses.FakeTensor)
+                    or obj.layout != torch.strided or obj.is_nested or obj.is_quantized):
+                return super().reducer_override(obj)
             with torch._C._DisableTorchDispatch():
                 meta = torch.empty_strided(obj.shape, obj.stride(), dtype=obj.dtype,
                                           device="meta", requires_grad=obj.requires_grad)
-            from .forward_metadata import _TENSOR_KINDS
-            kinds = _TENSOR_KINDS.get()
-            kind = torch._subclasses.FakeTensor if kinds is None else kinds.get(obj, torch._subclasses.FakeTensor)
-            deferred = kind is torch._subclasses.FakeTensor
-            return type(self)._unpickle_tensor, (meta, obj.device, torch.Tensor if deferred else kind,
-                torch._C._dispatch_keys(obj).raw_repr(), obj.grad, deferred)
+            from .forward_metadata import _TENSOR_KINDS, _set_state, _tensor_user_attributes
+            if isinstance(obj, torch._subclasses.FakeTensor):
+                kinds = _TENSOR_KINDS.get()
+                kind = torch._subclasses.FakeTensor if kinds is None else kinds.get(obj, torch._subclasses.FakeTensor)
+                deferred = kind is torch._subclasses.FakeTensor
+                pytype = torch.Tensor if deferred else kind
+            else:
+                deferred = False
+                pytype = type(obj)
+            args = (meta, obj.device, pytype,
+                    torch._C._dispatch_keys(obj).raw_repr(), obj.grad, deferred)
+            user_attrs = _tensor_user_attributes(obj)
+            if user_attrs:
+                state = {key: value if id(value) in self.guard_tree_values
+                         else _Missing('unguarded attribute')
+                         for key, value in user_attrs.items()}
+                return type(self)._unpickle_tensor, args, state, None, None, _set_state
+            return type(self)._unpickle_tensor, args
         if isinstance(obj, JITFunction):
             return _deserialize_triton_kernel, (_serialize_triton_kernel(obj),)
-        if (hasattr(obj, '__dict__')
-                and type(obj).__module__.startswith(('ignition.', 'b12x.'))
-                and not inspect.isclass(obj) and not isinstance(obj, (torch.Tensor, torch.nn.Module))):
+        from .forward_metadata import _uses_custom_object_state
+
+        if _uses_custom_object_state(obj):
             state = {key: value if id(value) in self.guard_tree_values
                      else _Missing('unguarded attribute')
                      for key, value in vars(obj).items()}
@@ -402,9 +421,10 @@ class StorageBackend(SerializableCallable):
         module = torch.fx.GraphModule({}, graph)
         with _compiler_recursion(module):
             self.artifact = standalone_compile(module, examples, dynamic_shapes='from_example_inputs',
-                fake_mode=detect_fake_mode(examples), options={'config_patches': dict(_OPTIONS if options is None else options)},
+                fake_mode=detect_fake_mode(examples), options={'config_patches': _compile_options(options)},
                 aot=True, donate_graph_module=True)
         self._serialized_artifact = None
+        self._cuda_allocation_sizes = None
         self._tuning_frozen = False
         self._bound = None
 
@@ -436,12 +456,21 @@ class StorageBackend(SerializableCallable):
             artifact = (fn.artifact.serialize() if fn._serialized_artifact is None
                         else zlib.decompress(fn._serialized_artifact))
         calls = _serialized_invocations(fn.invocations)
-        return pickle.dumps((artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen))
+        sizes = getattr(fn, "_cuda_allocation_sizes", None)
+        if sizes is None:
+            graph = getattr(fn.artifact, "_flare_graph", None)
+            if graph is None:
+                entry, _, _ = pickle.loads(artifact)
+                graph = entry.compiled_fw.result
+            sizes = tuple(int(size) for device, size in getattr(graph, "_flare_pool_sizes", ())
+                          if device == "cuda")
+            fn._cuda_allocation_sizes = sizes
+        return pickle.dumps((artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen, sizes))
 
     @classmethod
     def deserialize_compile_artifacts(cls, data):
         fn = cls.__new__(cls)
-        artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen = pickle.loads(data)
+        artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen, fn._cuda_allocation_sizes = pickle.loads(data)
         devices = {item[4] for item in fn.signature if isinstance(item, tuple) and item[4].type == "cuda"}
         if len(devices) != 1:
             raise ValueError("compiled forwards require exactly one CUDA device")
@@ -479,7 +508,7 @@ def _execute(forward):
 
 def aot_forward(forward, *, options=None):
     runtime_patches.apply()
-    options = dict(_OPTIONS if options is None else options)
+    options = _compile_options(options)
     sources = r'.*\.(?:_?handle|stream_handle|launch_order|plans\[\d+\])$'
     with _guard_serialization(), torch.compiler.config.patch(unbacked_sources=sources):
         return torch.compile(_execute, backend=partial(StorageBackend, options=options), fullgraph=True,
@@ -527,6 +556,9 @@ class BoundForward:
     @property
     def capture_allocation_sizes(self):
         """CUDA allocation requests from the compiled forward's memory plan."""
+        sizes = getattr(self.backend, "_cuda_allocation_sizes", None)
+        if sizes is not None:
+            return sizes
         return tuple(int(size) for device, size in self.backend.artifact._flare_graph._flare_pool_sizes
                      if device == "cuda")
 
@@ -590,6 +622,26 @@ def _completed(pending):
             if future is None or future.done():
                 return pending.pop(index)
         wait([item[-2].pending for item in pending], return_when=FIRST_COMPLETED)
+
+
+def allocation_order(names, sizes, coordinator=None):
+    """Order compiled forwards by largest allocation request, agreed across ranks."""
+    names = tuple(names)
+    ranks = [(names, sizes)]
+    if coordinator is not None:
+        import torch.distributed as dist
+
+        ranks = [None] * len(coordinator.ranks)
+        dist.all_gather_object(ranks, (names, sizes), group=coordinator.group)
+        if any(selected != names or requests.keys() != sizes.keys() for selected, requests in ranks):
+            raise ValueError("tensor-parallel capture requires matching forward catalogs")
+
+    def priority(name):
+        requests = [rank_sizes[name] for _, rank_sizes in ranks if name in rank_sizes]
+        return (bool(requests), max((max(allocations, default=0) for allocations in requests), default=0),
+                max((sum(allocations) for allocations in requests), default=0))
+
+    return tuple(sorted(names, key=priority, reverse=True))
 
 
 # Command-line, planning, display, and diagnostic direct-execution sources do not change compiled forwards.
@@ -690,7 +742,7 @@ class ForwardCache:
         self.headroom_bytes = headroom_bytes
         self.compile_workers = compile_workers
         self.lock_gpu_clocks = lock_gpu_clocks
-        self.options = MappingProxyType(dict(_OPTIONS if options is None else options))
+        self.options = MappingProxyType(_compile_options(options))
         properties = torch.cuda.get_device_properties(device)
         options = {name: value for name, value in self.options.items() if name != 'compile_threads'}
         key = hashlib.sha256(pickle.dumps((namespace, options, torch_key(), runtime_patches.identity(),
@@ -713,58 +765,6 @@ class ForwardCache:
             result = self._warm(bound, path, name=name, progress=progress)
             release_unused()
             return result
-
-    def bind_group(self, template, forwards, *, signature, coordinator=None):
-        """Bind one compiled forward to owners with matching guards and storage aliases.
-
-        A grouped caller first prepares its representative through ``prepare_many``.
-        Every rank checks every owner before any grouped graph is captured; a
-        mismatch fails on all ranks and cannot trigger compilation on peers.
-        """
-        if (not forwards or not isinstance(template, BoundForward) or template.pending is not None
-                or not isinstance(template.backend, StorageBackend)):
-            raise ValueError("group binding requires a completed storage-bound forward")
-        artifact = template.artifact
-        failures = {}
-        for name, owner in forwards.items():
-            try:
-                template.prepare_capture()
-                artifact = template.artifact
-                if type(owner) is not type(template.owner):
-                    raise BindingMismatch("grouped forward type differs from its compiled representative")
-                if not artifact.guards.check({"forward": owner}):
-                    reason = artifact.guards.check_verbose({"forward": owner})
-                    raise BindingMismatch(f"compiled forward guard differs: {reason}")
-                token = _CHECK_BINDINGS.set(True)
-                try:
-                    try:
-                        artifact(owner)
-                    except _BindingsChecked:
-                        pass
-                    else:
-                        raise RuntimeError("grouped forward did not validate storage bindings")
-                finally:
-                    _CHECK_BINDINGS.reset(token)
-            except Exception as error:
-                failures[name] = f"{type(error).__name__}: {error}"
-        if coordinator is None:
-            gathered = ((tuple(forwards), signature, failures),)
-            ranks = (0,)
-        else:
-            import torch.distributed as dist
-
-            ranks = coordinator.ranks
-            gathered = [None] * len(ranks)
-            dist.all_gather_object(gathered, (tuple(forwards), signature, failures), group=coordinator.group)
-        if any(names != tuple(forwards) or selected != signature for names, selected, _ in gathered):
-            raise BindingMismatch("tensor-parallel ranks declared different grouped forward owners or signatures")
-        if any(items for _, _, items in gathered):
-            detail = [(rank, name, reason) for rank, (_, _, items) in zip(ranks, gathered, strict=True)
-                      for name, reason in sorted(items.items())]
-            raise BindingMismatch(f"grouped forward bindings differ from compiled guards: {detail[:4]}")
-        return {name: BoundForward(artifact, owner, template.cache_hit,
-                                   execution_identity=template.execution_identity)
-                for name, owner in forwards.items()}
 
     @contextmanager
     def _publication_lock(self, coordinator=None):
@@ -825,7 +825,7 @@ class ForwardCache:
                                        materialize=materialize, warmup=warmup, before_run=before_run)
         selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks,
                                         source_identity=self.root.name)
-        compiled, paths, pending = {}, {}, []
+        compiled, loaded, paths, pending = {}, {}, {}, []
         with phase(progress, "Compile model forwards", total=len(functions)) as stage, CompilePool(self.device,
                 headroom_bytes=self.headroom_bytes, options=self.options, compile_workers=self.compile_workers) as compiler:
             def finish():
@@ -834,19 +834,9 @@ class ForwardCache:
                     with _guard_code_cache(self.root / 'guards'):
                         if bound.pending is not None:
                             bound.pending.result()
-                        if materialize is None:
-                            if not bound.cache_hit:
-                                bound = self._load(bound.owner, path, required=True,
-                                                   before_run=None if before_run is None else lambda: before_run(name))
-                                bound.cache_hit = False
-                            compiled[name] = self._warm(bound, path, name=name, progress=None,
-                                                       selections=selections, warmup=warmup,
-                                                       before_run=None if before_run is None else lambda name=name: before_run(name))
-                            compiled[name].prepare_capture()
-                            selections.release(compiled[name])
-                            release_unused(generation=0)
-                        else:
-                            paths[name] = path
+                        elif materialize is None and bound.cache_hit:
+                            loaded[name] = bound
+                        paths[name] = path
                 except Exception as error:
                     raise RuntimeError(f"failed to prepare compiled forward {name}") from error
                 stage.update(advance=1)
@@ -864,21 +854,44 @@ class ForwardCache:
         release_unused()
         if materialize is not None:
             materialize()
-            with phase(progress, "Warm compiled forwards", total=len(functions)) as stage:
-                for name, forward in functions.items():
+        if len(functions) > 1:
+            sizes = {
+                name: (loaded[name].capture_allocation_sizes if name in loaded
+                       else self._allocation_sizes(paths[name]))
+                for name in functions
+            }
+            ordered_names = allocation_order(functions, sizes)
+        else:
+            ordered_names = tuple(functions)
+        with phase(progress, "Warm compiled forwards", total=len(functions)) as stage:
+            for name in ordered_names:
+                forward = functions[name]
+                try:
                     with _guard_code_cache(self.root / 'guards'):
-                        try:
-                            bound = self._load(forward, paths[name], required=True,
-                                               before_run=None if before_run is None else lambda name=name: before_run(name))
-                        except BindingMismatch:
-                            bound = BoundForward(aot_forward(forward, options=self.options), forward, False)
+                        if name in loaded:
+                            bound = loaded.pop(name)
+                        else:
+                            try:
+                                bound = self._load(forward, paths[name], required=True,
+                                                   before_run=None if before_run is None else lambda name=name: before_run(name))
+                            except BindingMismatch:
+                                if materialize is None:
+                                    raise
+                                bound = BoundForward(aot_forward(forward, options=self.options), forward, False)
+                            else:
+                                if materialize is None:
+                                    bound.cache_hit = False
                         compiled[name] = self._warm(bound, paths[name], name=name, progress=None,
                                                    selections=selections, warmup=warmup,
                                                    before_run=None if before_run is None else lambda name=name: before_run(name))
                         compiled[name].prepare_capture()
                         selections.release(compiled[name])
                         release_unused(generation=0)
-                    stage.update(advance=1)
+                except Exception as error:
+                    if materialize is None:
+                        raise RuntimeError(f"failed to prepare compiled forward {name}") from error
+                    raise
+                stage.update(advance=1)
         release_unused()
         return compiled
 
@@ -1054,22 +1067,29 @@ class ForwardCache:
         if coordinator.spans_hosts:
             _share_artifacts([sorted({path for path, _ in compiled.values()}) for compiled, _ in outcomes],
                              group, ranks)
-        error = None
+        error, sizes = None, None
         try:
             release_unused()
             if materialize is not None:
                 materialize()
+            sizes = {
+                name: (selected[name].capture_allocation_sizes if name in selected
+                       else self._allocation_sizes(paths[name, getattr(forward, "compilation_variant", "shared")][0]))
+                for name, forward in functions.items()
+            }
         except Exception as failure:
             error = f"{type(failure).__name__}: {failure}"
         errors = [None] * len(ranks)
         dist.all_gather_object(errors, error, group=group)
         if any(errors):
             raise RuntimeError(f"compiled forward materialization failed: {errors}")
+        ordered_names = allocation_order(functions, sizes, coordinator)
         selections = InductorSelections(self.device, coordinator=coordinator,
                                         lock_gpu_clocks=self.lock_gpu_clocks, source_identity=self.root.name)
         published, released = [], 0
         with phase(progress, "Load and warm compiled forwards", total=len(functions)) as stage:
-            for name, forward in functions.items():
+            for name in ordered_names:
+                forward = functions[name]
                 failure = None
                 try:
                     if name not in selected:
@@ -1113,6 +1133,17 @@ class ForwardCache:
         if coordinator.spans_hosts:
             _share_artifacts(selections._gather(published), group, ranks)
         return selected
+
+    def _allocation_sizes(self, path):
+        from torch._dynamo.aot_compile import AOTCompileUnpickler
+
+        with Path(path).open('rb') as file:
+            compiled = AOTCompileUnpickler({}, file).load()
+        deserializer, payload = compiled['compiled_fn']
+        if deserializer != StorageBackend.deserialize_compile_artifacts:
+            raise TypeError(f"{path} does not contain a Flare storage backend")
+        _, _, _, _, _, sizes = pickle.loads(payload)
+        return sizes
 
     def _load(self, forward, path, *, required=False, before_run=None):
         with bind_device(self.device, freeze_tuning=self.options.get(

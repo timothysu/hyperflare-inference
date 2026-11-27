@@ -3266,6 +3266,7 @@ mod payload_core_tests {
                 },
             ]
         };
+        #[allow(deprecated)]
         let deployment = |id: &str, tp: u32, ranks: Vec<PublishRank>| PublishDeployment {
             body: pw::DeploymentBody {
                 deployment_id: id.into(),
@@ -3284,6 +3285,7 @@ mod payload_core_tests {
                 engram: None,
                 payloads: vec![],
                 ranks: vec![],
+                preparation: None,
             },
             payloads: vec![],
             ranks,

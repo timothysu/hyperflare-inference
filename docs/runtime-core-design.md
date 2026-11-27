@@ -273,6 +273,25 @@ N-gram table payloads are appended directly from checkpoint
 file ranges during rank export, without materializing their contents in
 preparation memory.
 
+### Checkpoint codec layout
+
+The optional `CacheContract.codec_layout` (`CodecLayout`) declares lossless
+storage formats that Selene may use for cache write-back and restore across
+memory, local disk, and pool tiers.
+Cores without this field serve with compression off. Requesting compression
+requires a supported layout.
+
+The optional `CodecLayout.gpu_module` names a compiled cubin module stored in
+each rank's `modules` table for GPU checkpoint compression. Helios skips loading
+this module when `--lossless-kv-compression` is `off` or `cpu`, and loads it
+lazily when `--lossless-kv-compression gpu` is requested. Cores exported without
+`gpu_module` continue to serve with `off` and `cpu`.
+
+A unit is one rank's share of a logical cache page or one continuation row.
+Each field names an execution buffer, a byte offset and length within its
+unit, and a storage encoding. Revision 1 field encodings and block sizes are
+specified in [`selene-manager/PROTOCOL.md`](../selene-manager/PROTOCOL.md#lossless-packet-format).
+
 ### Native export transfers and progress
 
 The exporter in `heliopause/src/export/` performs bulk I/O while the GIL is
@@ -345,38 +364,63 @@ change: `ignition sign` and `ignition combine` sign with a publisher key, and
 See [payload cores](core-format-design.md) for the present-state rules on
 canonical forms, packing, publication, locations, and conversion.
 
-### Preparation rebuild metadata
+### Preparation metadata
 
-Exports through `ignition export` record `RebuildManifest`. Export
-staging carries it as `ModelIndex.rebuild`, and the published payload core
-signs it as `DeploymentBody.rebuild`.
-It identifies the recipe, preparation source identity, qualified checkpoint
-repository and revision, tensor-parallel size, concurrency, chunk size,
-speculation, selected preparation settings (including prompt logprobs,
-autotune effort, native dense activations, and GPU clock locking), and
-canonical `ignition export` reproduction arguments in `reproduction_args`
-without host-local paths or secrets. A local checkpoint override
-is marked explicitly and carries no asserted upstream revision. Runtime
-collective preparation records the complete offline ladder as
-`RebuildManifest.collective_ladder_json`; rebuilding does not depend on the
-original ladder file path. Helios does not interpret that preparation input.
+Exports through `ignition export` record `PreparationManifest`. Export
+staging carries it as `ModelIndex.preparation` (field 12), and the published
+payload core signs it as `DeploymentBody.preparation` (field 10).
+`PreparationManifest` fixes only the core provenance fields (`version`,
+`recipe`, `source_identity`, `checkpoint_repository`, `checkpoint_revision`,
+`local_checkpoint`, and canonical `ignition export` arguments in
+`reproduction_args` without host-local paths or secrets) and stores all
+Ignition-owned preparation options in `repeated PreparationParameter` entries
+ordered strictly by unique key. Adding or removing an Ignition-only option
+requires no changes to `runtime_core.proto`, `core.proto`, or Helios. A local
+checkpoint override is marked explicitly and carries no asserted upstream
+revision.
 
-Online MXFP8 conversion records its resolved projection group in
-`RebuildManifest.online_mxfp8_scope`. An absent or empty field means `all`,
-independently of the recipe's preparation default. Explicit `all` and `kda-input`
-values retain their meanings. Weight reuse and core combination reject
-different conversion groups; changing a recipe default never changes stored
-weights or the serving behavior of an exported core.
+Each `PreparationParameter` pairs a key and typed `PreparationValue` (boolean,
+signed or unsigned 64-bit integer, finite 64-bit float, string, or nested list)
+with a `PreparationParameterScope` that tells Rust how to compare preparation
+compatibility without embedding Ignition option names or default-inheritance
+rules:
 
-For DFlash2, an omitted `RebuildSpeculation.draft_body_quantization` inherits
-MXFP8 body conversion when `online_mxfp8` is true and the stored scope is `all`
-(including an absent or empty scope). Otherwise omission retains checkpoint
-precision. Core combination and cached-weight reuse compare this effective
-format, so an explicit `mxfp8` override remains compatible with inherited MXFP8.
-They still reject checkpoint-precision versus MXFP8 body mismatches. With
-`--reuse-weights --no-mtp`, only target views are consumed, so draft-body settings
-do not constrain reuse. Normalizing a comparison does not rewrite the recorded
-metadata or change stored weight bytes.
+- `PREPARATION_PARAMETER_SCOPE_DEPLOYMENT`: deployment-local preparation
+  options (capacities, compiler, transport, tuning, and speculative shape
+  settings). Retained for inspection and reproduction; ignored by core
+  combination and cached-weight reuse.
+- `PREPARATION_PARAMETER_SCOPE_COMBINE`: shared preparation semantics (such as
+  `language_model_only`, `mla_compute_mode`, and
+  `speculation.vocabulary_parallel_sampling`) that must agree across combined
+  deployments without constraining target-only cached-weight reuse.
+- `PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT`: target-model weight conversion
+  and packing semantics (such as `online_mxfp8`, resolved `online_mxfp8_scope`,
+  and `expert_scale_compression`) that must agree for both core combination and
+  cached-weight reuse.
+- `PREPARATION_PARAMETER_SCOPE_DRAFT_WEIGHT`: draft-model weight semantics
+  (`speculation.has_draft`, resolved `speculation.draft_body_quantization`,
+  `speculation.draft_head_quantization`, and
+  `speculation.markov_head_quantization`) that must agree for core combination
+  and for cached-weight reuse when the export prepares a draft model. With
+  `--reuse-weights --no-mtp`, the export omits draft-weight parameters and
+  reuses target views independently of cached draft settings.
+
+Ignition resolves effective defaults and inheritance before export—including
+explicitly recording `online_mxfp8_scope` (`all` when omitted) and DFlash2's
+effective `speculation.draft_body_quantization` (`mxfp8` when `online_mxfp8` is
+enabled with `all` scope)—so core combination and cached-weight reuse perform
+generic scope equality checks. Packed speculative preparation still requires an
+explicit positive `speculation.graph_budget`.
+
+`RebuildManifest` and `RebuildSpeculation` (`ModelIndex.rebuild` field 11 and
+`DeploymentBody.rebuild` field 6) are deprecated and retained only for loading,
+inspecting, combining, and reusing weights from cores exported with that
+schema. During core combination and cached-weight reuse, Helios projects a
+deprecated `RebuildManifest` into the equivalent scoped `PreparationManifest`
+view (applying the empty-scope-to-`all` and DFlash2 inheritance rules) so
+cores carrying `RebuildManifest` remain compatible with cores carrying
+`PreparationManifest` without rewriting stored metadata or weight bytes. A
+deployment carrying both `preparation` and `rebuild` is rejected.
 
 Each recipe also supplies its named weight owners. After reachability pruning,
 the exporter records retained tensor views in `BundleIndex.rebuild_weights`:
@@ -405,26 +449,22 @@ Designed, not implemented: that importer and a core rebuild command.
 payloads. Offloaded embedding planes are described by their typed table
 metadata.
 
-Speculative rebuild metadata records the resolved physical graph-count budget
-as `RebuildSpeculation.graph_budget`. Packed speculative preparation requires
-an explicit positive budget; rebuilding a catalog must use that recorded value
-rather than selecting a recipe default.
-
-`RebuildSpeculation.mtp_only` records whether preparation omitted MTP-disabled
-execution graphs. Its absent value is false. Graph selection uses the captured
-execution catalog; this preparation setting adds no runtime policy.
-
-`flare inspect --json` reports the manifest as `rebuild` and per-rank tensor
-counts as `rebuild_weights` for logical-resource cores; `--all` includes the
-tensor catalogs. Absent manifests are reported as null. For payload cores
-`rebuild` is the selected deployment's `DeploymentBody.rebuild`, read after the
-signatures verify, or from the bounded primary-file metadata with
-`--unverified`. With `--unverified` it is null when no single deployment is
-selected, and each `deployments[]` entry carries its own `rebuild`.
-`rebuild_weights` is null for payload cores.
-Helios ignores rebuild metadata during loading and replay, including unfamiliar
-catalog versions. Serving validates the execution layout and prepared model contract independently.
-Changing signed rebuild metadata requires signing the core again.
+`flare inspect --json` reports `PreparationManifest` as `preparation` (with
+human-readable scope names and native JSON parameter values) and deprecated
+`RebuildManifest` as `rebuild`, leaving whichever is absent as null. Human-readable
+`flare inspect` renders `reproduction_args` from `preparation` when present,
+falling back to `rebuild` for legacy cores. For logical-resource cores,
+per-rank tensor counts appear under `rebuild_weights` (`--all` includes the
+tensor catalogs). For payload cores `preparation` and `rebuild` come from the
+selected deployment's `DeploymentBody`, read after the signatures verify, or
+from the bounded primary-file metadata with `--unverified`. With `--unverified`
+they are null when no single deployment is selected, and each `deployments[]`
+entry carries its own `preparation` and `rebuild`. `rebuild_weights` is null
+for payload cores.
+Helios ignores preparation and rebuild metadata during loading and replay,
+including unfamiliar versions and scopes. Serving validates the execution
+layout and prepared model contract independently. Changing signed preparation
+metadata requires signing the core again.
 
 ### Publisher authentication and executable access
 
@@ -604,12 +644,18 @@ loaded, instantiated under their partition's green context (clamping
 cooperative grids to that partition's SM count), and uploaded on their
 partition's non-blocking stream before the persistent worker starts; the
 executor launches the worker graph once on its worker stream only after startup
-completes, while compute graphs replay on the compute green context. Shutdown
+completes, while compute graphs replay on the compute green context. When the
+entry also declares an optional mapped-host `metrics` reference with positive
+`metrics_count`, Helios validates that the range is 8-byte aligned and in bounds
+for `metrics_count` 64-bit counters and exposes read-only atomic snapshots of
+worker state and counter values to Prometheus `/metrics`, `GET /v1/worker`, and
+the serving dashboard without synchronizing GPU streams. Shutdown
 drains compute and copy streams first, writes `1u32` (release) to the
 mapped-host `stop_flag` reference, and polls `cuStreamQuery` on the worker
 stream against a bounded drain timeout with context save/restore (returning
 `ExecutionError::Drain` and retaining GPU resources on timeout). Resource
-teardown stops any still-running worker, synchronizes the primary context, and
+teardown stops any still-running worker, synchronizes the primary context,
+drains active telemetry counter readers before unmapping allocations, and
 only after context synchronization succeeds destroys worker and compute
 streams, executables, modules, mappings, green contexts, virtual-address
 reservations, and the primary context.
@@ -670,7 +716,9 @@ Helios rejects graph operation identifiers 10, 11, and 13 and the graph kinds
 implemented: loading and serving cores that recorded those operations.
 
 Unselected graph templates and executables are never reconstructed. Functions
-used only by omitted graphs are dropped, as are unused modules without globals.
+used only by omitted graphs are dropped, as are unused modules without globals,
+except the codec module named by `CodecLayout.gpu_module` while
+`--lossless-kv-compression gpu` is active.
 Modules with globals retain their persistent contents. Weights, MTP weights,
 and fixed scratch remain intact because opaque kernel parameters and persistent
 device storage can embed their addresses. `SchedulerLimits.max_active` controls

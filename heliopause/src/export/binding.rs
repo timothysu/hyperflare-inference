@@ -209,6 +209,189 @@ pub(crate) fn execution(
                 .ok_or_else(|| super::invalid("invalid tuning graph"))?.remove("handle");
         }
     }
+    if let Some(workers) = object.get("persistent_workers").cloned() {
+        if workers.is_null() {
+            object.remove("persistent_workers");
+        } else {
+            let workers = workers
+                .as_array()
+                .ok_or_else(|| super::invalid("persistent_workers must be an array"))?;
+            if workers.len() > 1 {
+                return Err(super::invalid(
+                    "at most one persistent worker is supported per rank",
+                ));
+            }
+            let buffers = object
+                .get("buffers")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| super::invalid("execution buffers must be an array"))?;
+            let serving_names: Vec<&str> = object
+                .get("graphs")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|g| g.get("name").and_then(|n| n.as_str()))
+                .collect();
+            let tuning_names: Vec<&str> = object
+                .get("tuning_graphs")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|g| g.get("name").and_then(|n| n.as_str()))
+                .collect();
+            let resolve_mapped_host =
+                |buf_name: &str, offset: u64, nbytes: u64| -> super::Result<(String, u64)> {
+                    if let Some(buf) = buffers
+                        .iter()
+                        .find(|b| b.get("name").and_then(|n| n.as_str()) == Some(buf_name))
+                    {
+                        let buf_nbytes = buf.get("nbytes").and_then(|v| v.as_u64()).ok_or_else(
+                            || super::invalid("persistent worker buffer lacks nbytes"),
+                        )?;
+                        let end = offset.checked_add(nbytes).ok_or_else(|| {
+                            super::invalid("persistent worker buffer offset overflow")
+                        })?;
+                        if end > buf_nbytes {
+                            return Err(super::invalid(
+                                "persistent worker range exceeds registered buffer",
+                            ));
+                        }
+                        let reference = buf
+                            .get("reference")
+                            .and_then(|v| v.as_object())
+                            .ok_or_else(|| {
+                                super::invalid(
+                                    "persistent worker buffer lacks allocation reference",
+                                )
+                            })?;
+                        let alloc_name = reference
+                            .get("allocation")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                super::invalid("persistent worker reference lacks allocation name")
+                            })?;
+                        let alloc_offset = reference
+                            .get("offset")
+                            .and_then(|v| v.as_u64())
+                            .ok_or_else(|| {
+                                super::invalid("persistent worker reference lacks offset")
+                            })?;
+                        let alloc = allocations
+                            .iter()
+                            .find(|a| a.name == alloc_name)
+                            .ok_or_else(|| {
+                                super::invalid("persistent worker allocation not found")
+                            })?;
+                        if alloc.memory != "mapped_host" || alloc.sizing.is_some() {
+                            return Err(super::invalid(
+                                "persistent worker stop flag must reside in a fixed mapped_host allocation",
+                            ));
+                        }
+                        let final_offset = alloc_offset.checked_add(offset).ok_or_else(|| {
+                            super::invalid("persistent worker allocation offset overflow")
+                        })?;
+                        let final_end = final_offset.checked_add(nbytes).ok_or_else(|| {
+                            super::invalid("persistent worker allocation offset overflow")
+                        })?;
+                        if final_end > alloc.nbytes {
+                            return Err(super::invalid(
+                                "persistent worker range exceeds mapped_host allocation",
+                            ));
+                        }
+                        return Ok((alloc_name.to_owned(), final_offset));
+                    }
+                    if let Some(alloc) = allocations.iter().find(|a| a.name == buf_name) {
+                        if alloc.memory != "mapped_host" || alloc.sizing.is_some() {
+                            return Err(super::invalid(
+                                "persistent worker stop flag must reside in a fixed mapped_host allocation",
+                            ));
+                        }
+                        let end = offset.checked_add(nbytes).ok_or_else(|| {
+                            super::invalid("persistent worker allocation offset overflow")
+                        })?;
+                        if end > alloc.nbytes {
+                            return Err(super::invalid(
+                                "persistent worker range exceeds mapped_host allocation",
+                            ));
+                        }
+                        return Ok((buf_name.to_owned(), offset));
+                    }
+                    Err(super::invalid(
+                        "persistent worker references unknown stop_flag buffer or allocation",
+                    ))
+                };
+            let mut resolved = Vec::with_capacity(workers.len());
+            for worker in workers {
+                let mut worker_obj = worker
+                    .as_object()
+                    .ok_or_else(|| super::invalid("persistent worker entry must be an object"))?
+                    .clone();
+                worker_obj.remove("handle");
+                let sm_count = worker_obj
+                    .get("worker_sm_count")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| {
+                        super::invalid(
+                            "persistent worker requires a positive uint32 worker_sm_count",
+                        )
+                    })?;
+                if sm_count == 0 || sm_count > u32::MAX as u64 {
+                    return Err(super::invalid(
+                        "persistent worker requires a positive uint32 worker_sm_count",
+                    ));
+                }
+                let graph = worker_obj
+                    .get("graph")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        super::invalid("persistent worker requires a nonempty graph name")
+                    })?;
+                if serving_names.contains(&graph) || tuning_names.contains(&graph) {
+                    return Err(super::invalid(
+                        "persistent worker graph must be distinct from serving and tuning graphs",
+                    ));
+                }
+                let stop_flag = worker_obj
+                    .get("stop_flag")
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| {
+                        super::invalid("persistent worker requires a stop_flag reference")
+                    })?;
+                let stop_name = stop_flag
+                    .get("allocation")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        super::invalid("persistent worker stop_flag requires an allocation name")
+                    })?
+                    .to_owned();
+                let stop_off = match stop_flag.get("offset") {
+                    None => 0,
+                    Some(v) => v.as_u64().ok_or_else(|| {
+                        super::invalid(
+                            "persistent worker stop_flag offset must be a nonnegative integer",
+                        )
+                    })?,
+                };
+                let (stop_alloc, stop_final_off) = resolve_mapped_host(&stop_name, stop_off, 4)?;
+                if stop_final_off % 4 != 0 {
+                    return Err(super::invalid(
+                        "persistent worker stop flag offset must be 4-byte aligned",
+                    ));
+                }
+                worker_obj.insert(
+                    "stop_flag".into(),
+                    serde_json::json!({"allocation": stop_alloc, "offset": stop_final_off}),
+                );
+                resolved.push(serde_json::Value::Object(worker_obj));
+            }
+            object.insert(
+                "persistent_workers".into(),
+                serde_json::Value::Array(resolved),
+            );
+        }
+    }
     message("Execution", &value)
 }
 
@@ -814,15 +997,46 @@ pub(crate) fn serving_metadata(
         ));
     }
     index.frontend = Some(frontend);
-    if let Some(rebuild) = server.remove("rebuild_manifest") {
-        if rebuild.get("speculation").and_then(|s| s.get("history_drafts")).is_some() {
-            return Err(super::invalid("history_drafts is a runtime option and cannot be exported"));
+    let preparation = server.remove("preparation_manifest");
+    let rebuild = server.remove("rebuild_manifest");
+    if preparation.is_some() && rebuild.is_some() {
+        return Err(super::invalid(
+            "cannot specify both preparation_manifest and deprecated rebuild_manifest",
+        ));
+    }
+    if let Some(preparation) = preparation {
+        let manifest: super::wire::PreparationManifest =
+            message("PreparationManifest", &preparation)?;
+        if manifest
+            .parameters
+            .iter()
+            .any(|parameter| parameter.key == "speculation.history_drafts")
+        {
+            return Err(super::invalid(
+                "history_drafts is a runtime option and cannot be exported",
+            ));
         }
-        let manifest: super::wire::RebuildManifest = message("RebuildManifest", &rebuild)?;
-        if manifest.reproduction_args.iter().any(|arg| arg.is_empty()) {
-            return Err(super::invalid("reproduction_args entries must be non-empty"));
+        helios_core::runtime_core::validate_preparation_manifest(&manifest)?;
+        index.preparation = Some(manifest);
+    }
+    if let Some(rebuild) = rebuild {
+        #[allow(deprecated)]
+        {
+            if rebuild
+                .get("speculation")
+                .and_then(|s| s.get("history_drafts"))
+                .is_some()
+            {
+                return Err(super::invalid(
+                    "history_drafts is a runtime option and cannot be exported",
+                ));
+            }
+            let manifest: super::wire::RebuildManifest = message("RebuildManifest", &rebuild)?;
+            if manifest.reproduction_args.iter().any(|arg| arg.is_empty()) {
+                return Err(super::invalid("reproduction_args entries must be non-empty"));
+            }
+            index.rebuild = Some(manifest);
         }
-        index.rebuild = Some(manifest);
     }
     server
         .entry("speculative_proposal_source")
@@ -868,6 +1082,124 @@ mod tests {
         assert_eq!(encoded.tuning_graphs[0].status_buffer, "status");
         assert_eq!(encoded.graphs[0].tuned_bindings[0].tuning_graph, "tune");
         assert_eq!(encoded.graphs[0].tuned_bindings[0].buffer, "winner");
+    }
+
+    #[test]
+    fn persistent_workers_export_resolves_stop_flag_and_rejects_invalid() {
+        let host_alloc = super::super::Allocation {
+            name: "host-0".into(),
+            address: 0x0c00_0000_0000,
+            nbytes: 4096,
+            alignment: 4096,
+            initialize: "snapshot".into(),
+            relocations: vec![],
+            preserve_address: true,
+            memory: "mapped_host".into(),
+            snapshot_spans: None,
+            sizing: None,
+        };
+        let dynamic_host_alloc = super::super::Allocation {
+            name: "host-dynamic".into(),
+            address: 0x0c00_0001_0000,
+            nbytes: 4096,
+            alignment: 4096,
+            initialize: "zero".into(),
+            relocations: vec![],
+            preserve_address: true,
+            memory: "mapped_host".into(),
+            snapshot_spans: None,
+            sizing: Some(serde_json::json!({"capacity": "KV_PAGES", "unit_bytes": 4096, "maximum": 1})),
+        };
+        let dev_alloc = super::super::Allocation {
+            name: "device-0".into(),
+            address: 0x0800_0000_0000,
+            nbytes: 4096,
+            alignment: 4096,
+            initialize: "snapshot".into(),
+            relocations: vec![],
+            preserve_address: true,
+            memory: "device".into(),
+            snapshot_spans: None,
+            sizing: None,
+        };
+        let allocs = [host_alloc, dynamic_host_alloc, dev_alloc];
+        let value = serde_json::json!({
+            "abi_version": 6, "max_active": 1, "input_frame_bytes": 8,
+            "buffers": [
+                {"name": "worker_ctrl", "address": 0x0c00_0000_0040u64, "nbytes": 128,
+                 "dtype": "uint8", "shape": [128], "strides": [1]},
+                {"name": "dev_buf", "address": 0x0800_0000_0000u64, "nbytes": 64,
+                 "dtype": "uint8", "shape": [64], "strides": [1]}
+            ],
+            "graphs": [{"name": "decode", "kind": "decode", "handle": 11}],
+            "tuning_graphs": [{"name": "tune", "handle": 12, "outputs": ["out"], "status_buffer": "status"}],
+            "persistent_workers": [{
+                "worker_sm_count": 8,
+                "graph": "worker_launch",
+                "handle": 99,
+                "stop_flag": {"allocation": "worker_ctrl", "offset": 0}
+            }]
+        });
+        let encoded = execution(&value, &allocs).unwrap();
+        assert_eq!(encoded.persistent_workers.len(), 1);
+        let pw = &encoded.persistent_workers[0];
+        assert_eq!(pw.worker_sm_count, 8);
+        assert_eq!(pw.graph, "worker_launch");
+        let stop = pw.stop_flag.as_ref().expect("stop_flag present");
+        assert_eq!(stop.allocation, "host-0");
+        assert_eq!(stop.offset, 0x40);
+
+        let mut direct_alloc = value.clone();
+        direct_alloc["persistent_workers"][0]["stop_flag"] =
+            serde_json::json!({"allocation": "host-0", "offset": 16});
+        let direct = execution(&direct_alloc, &allocs).unwrap();
+        let direct_stop = direct.persistent_workers[0].stop_flag.as_ref().unwrap();
+        assert_eq!(direct_stop.allocation, "host-0");
+        assert_eq!(direct_stop.offset, 16);
+
+        let mut empty = value.clone();
+        empty["persistent_workers"] = serde_json::json!([]);
+        assert!(execution(&empty, &allocs).unwrap().persistent_workers.is_empty());
+
+        let mut too_many = value.clone();
+        let second = too_many["persistent_workers"][0].clone();
+        too_many["persistent_workers"].as_array_mut().unwrap().push(second);
+        let err = execution(&too_many, &allocs).unwrap_err().to_string();
+        assert!(err.contains("at most one persistent worker"), "{err}");
+
+        let mut bad_mem = value.clone();
+        bad_mem["persistent_workers"][0]["stop_flag"]["allocation"] = serde_json::json!("dev_buf");
+        assert!(execution(&bad_mem, &allocs).is_err());
+
+        let mut bad_sized = value.clone();
+        bad_sized["persistent_workers"][0]["stop_flag"]["allocation"] =
+            serde_json::json!("host-dynamic");
+        assert!(execution(&bad_sized, &allocs).is_err());
+
+        let mut bad_align = value.clone();
+        bad_align["persistent_workers"][0]["stop_flag"]["offset"] = serde_json::json!(2);
+        assert!(execution(&bad_align, &allocs).is_err());
+
+        let mut bad_oob = value.clone();
+        bad_oob["persistent_workers"][0]["stop_flag"]["offset"] = serde_json::json!(128);
+        assert!(execution(&bad_oob, &allocs).is_err());
+
+        let mut bad_missing = value.clone();
+        bad_missing["persistent_workers"][0]["stop_flag"]["allocation"] =
+            serde_json::json!("missing");
+        assert!(execution(&bad_missing, &allocs).is_err());
+
+        let mut bad_sm = value.clone();
+        bad_sm["persistent_workers"][0]["worker_sm_count"] = serde_json::json!(0);
+        assert!(execution(&bad_sm, &allocs).is_err());
+
+        let mut bad_serve_collision = value.clone();
+        bad_serve_collision["persistent_workers"][0]["graph"] = serde_json::json!("decode");
+        assert!(execution(&bad_serve_collision, &allocs).is_err());
+
+        let mut bad_tune_collision = value.clone();
+        bad_tune_collision["persistent_workers"][0]["graph"] = serde_json::json!("tune");
+        assert!(execution(&bad_tune_collision, &allocs).is_err());
     }
 
     fn rebuild_catalog() -> (super::super::wire::RebuildWeights, Vec<super::super::wire::Allocation>) {
@@ -1022,6 +1354,7 @@ mod tests {
         }
     }
     #[test]
+    #[allow(deprecated)]
     fn export_embeds_reproduction_arguments_and_rejects_empty_entries() {
         let base = || {
             serde_json::json!({
@@ -1033,29 +1366,30 @@ mod tests {
                     "frequency_penalty": 0.0
                 },
                 "assets": {"chat_template": "t", "tokenizer": "k"},
-                "rebuild_manifest": {
+                "preparation_manifest": {
                     "version": 1,
                     "recipe": "kimi31",
-                    "prompt_logprobs": true,
-                    "autotune_effort": "default",
-                    "native_dense_activations": true,
-                    "lock_gpu_clocks": true,
                     "reproduction_args": [
                         "ignition", "export", "moonshotai/Kimi-K3.1-Pro@d9e99b07",
                         "--gpus", "0-15", "--online-mxfp8", "--online-mxfp8-scope", "kda-input"
+                    ],
+                    "parameters": [
+                        {"key": "autotune_effort", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"string_value": "default"}},
+                        {"key": "lock_gpu_clocks", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"bool_value": true}},
+                        {"key": "native_dense_activations", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"bool_value": true}},
+                        {"key": "prompt_logprobs", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"bool_value": true}}
                     ]
                 }
             })
         };
         let mut index = super::super::wire::ModelIndex::default();
         serving_metadata(&mut index, &base()).unwrap();
-        let rebuild = index.rebuild.expect("rebuild manifest embedded");
-        assert!(rebuild.prompt_logprobs);
-        assert_eq!(rebuild.autotune_effort, "default");
-        assert!(rebuild.native_dense_activations);
-        assert!(rebuild.lock_gpu_clocks);
+        assert!(index.rebuild.is_none());
+        let preparation = index.preparation.expect("preparation manifest embedded");
+        assert_eq!(preparation.recipe, "kimi31");
+        assert_eq!(preparation.parameters.len(), 4);
         assert_eq!(
-            rebuild.reproduction_args,
+            preparation.reproduction_args,
             vec![
                 "ignition", "export", "moonshotai/Kimi-K3.1-Pro@d9e99b07",
                 "--gpus", "0-15", "--online-mxfp8", "--online-mxfp8-scope", "kda-input"
@@ -1063,10 +1397,35 @@ mod tests {
         );
 
         let mut bad = base();
-        bad["rebuild_manifest"]["reproduction_args"] = serde_json::json!(["ignition", ""]);
+        bad["preparation_manifest"]["reproduction_args"] = serde_json::json!(["ignition", ""]);
         let mut index = super::super::wire::ModelIndex::default();
         let error = serving_metadata(&mut index, &bad).unwrap_err();
         assert!(error.to_string().contains("reproduction_args"));
+
+        let mut unsorted = base();
+        unsorted["preparation_manifest"]["parameters"] = serde_json::json!([
+            {"key": "z_param", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"bool_value": true}},
+            {"key": "a_param", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"bool_value": false}}
+        ]);
+        let mut index = super::super::wire::ModelIndex::default();
+        assert!(serving_metadata(&mut index, &unsorted).is_err());
+
+        let mut both = base();
+        both["rebuild_manifest"] = serde_json::json!({"version": 1, "recipe": "kimi31"});
+        let mut index = super::super::wire::ModelIndex::default();
+        assert!(serving_metadata(&mut index, &both).is_err());
+
+        let mut history = base();
+        history["preparation_manifest"]["parameters"] = serde_json::json!([
+            {"key": "speculation.history_drafts", "scope": "PREPARATION_PARAMETER_SCOPE_COMBINE", "value": {"bool_value": true}}
+        ]);
+        let mut index = super::super::wire::ModelIndex::default();
+        assert!(
+            serving_metadata(&mut index, &history)
+                .unwrap_err()
+                .to_string()
+                .contains("runtime option and cannot be exported")
+        );
     }
     #[test]
     fn execution_buffers_resolve_allocation_relative_offsets() {

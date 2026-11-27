@@ -231,6 +231,16 @@ def _fake_fill(destination, value):
     pass
 
 
+@torch.library.custom_op('flare_test_lifetimes::accumulate', mutates_args=('destination',))
+def _accumulate(destination: torch.Tensor, source: torch.Tensor) -> None:
+    destination.add_(source)
+
+
+@_accumulate.register_fake
+def _fake_accumulate(destination, source):
+    pass
+
+
 @pytest.mark.parametrize('offset', [0, 16])
 def test_lowered_opaque_writes_keep_caller_storage_and_intermediate_values(offset):
     storage = torch.zeros(64)
@@ -374,3 +384,116 @@ def test_compiled_dtype_view_gathers_write_every_slice_in_place(world, rows):
     finally:
         compilation._INVOCATIONS.reset(token)
     torch.testing.assert_close(observed.view(torch.int32), expected.view(torch.int32), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('computed', [False, True])
+def test_compiled_mutated_clones_keep_selected_source_offsets(computed):
+    from torch._inductor import standalone_compile
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    from ignition import runtime_patches
+
+    runtime_patches.apply()
+    source = torch.arange(3 * 8, dtype=torch.float32).reshape(1, 3, 8)
+    output = torch.empty_like(source)
+
+    def forward(source, output):
+        values = source + 1 if computed else source
+        for index in range(3):
+            selected = values[:, index].clone()
+            _accumulate(selected.view(1, 8), selected.view(1, 8))
+            output[:, index].copy_(selected)
+        return (output,)
+
+    module = make_fx(forward)(source, output)
+    calls = compilation._lower_storage(module)
+    assert any(node.target is torch.ops.flare.snapshot.default for node in module.graph.nodes)
+    module.recompile()
+    compiled = standalone_compile(module, [source, output], dynamic_shapes='from_example_inputs', aot=True,
+        options={'config_patches': {'memory_planning': True, 'memory_pool': 'combined', 'compile_threads': 1}})
+    token = compilation._INVOCATIONS.set(calls)
+    try:
+        for step in range(3):
+            source.add_(step)
+            output.fill_(float('nan'))
+            expected = (source + 1 if computed else source) * 2
+            (result,) = compiled(source, output)
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    finally:
+        compilation._INVOCATIONS.reset(token)
+
+
+def test_lower_storage_skips_snapshot_for_single_use_full_temp_and_deferred_copy_clones():
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    def single_use_temp_forward(source):
+        temp = source + 1
+        cloned = temp.clone()
+        _accumulate(cloned.view(1, 8), cloned.view(1, 8))
+        return (cloned,)
+
+    def deferred_copy_forward(source, other):
+        temp = source[:, 1].clone()
+        temp.copy_(other)
+        return (temp,)
+
+    source = torch.arange(24, dtype=torch.float32).reshape(1, 3, 8)
+    single_module = make_fx(single_use_temp_forward)(source[:, 0].contiguous())
+    compilation._lower_storage(single_module)
+    assert not any(node.target is torch.ops.flare.snapshot.default for node in single_module.graph.nodes)
+
+    deferred_module = make_fx(deferred_copy_forward)(source, torch.ones((1, 8), dtype=torch.float32))
+    compilation._lower_storage(deferred_module)
+    assert not any(node.target is torch.ops.flare.snapshot.default for node in deferred_module.graph.nodes)
+
+    def strided_offset_zero_forward(source, output):
+        selected = source[:, :, 0].clone()
+        _accumulate(selected.view(1, 3), selected.view(1, 3))
+        output[:, :, 0].copy_(selected)
+        return (output,)
+
+    output = torch.empty_like(source)
+    strided_module = make_fx(strided_offset_zero_forward)(source, output)
+    compilation._lower_storage(strided_module)
+    assert any(node.target is torch.ops.flare.snapshot.default for node in strided_module.graph.nodes)
+
+
+class _ScalarConstantForward:
+    def __init__(self):
+        self.source = torch.linspace(-2.0, 2.0, 16, dtype=torch.float32)
+        self.output = torch.empty_like(self.source)
+
+    def __call__(self):
+        self.output.copy_(self.source * torch.tensor(2.5, dtype=torch.float32))
+
+
+def test_lower_storage_rewrites_cpu_scalar_lift_fresh_copy_to_scalar_tensor():
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    def forward():
+        return torch.tensor(3.5, dtype=torch.float32) + torch.ones(4, dtype=torch.float32)
+
+    module = make_fx(forward)()
+    lifted = [node.args[0].target for node in module.graph.nodes
+              if node.target is torch.ops.aten.lift_fresh_copy.default]
+    assert lifted
+    calls = compilation._lower_storage(module)
+    module.recompile()
+    assert not any(node.target is torch.ops.aten.lift_fresh_copy.default for node in module.graph.nodes)
+    assert any(node.target is torch.ops.aten.scalar_tensor.default for node in module.graph.nodes)
+    assert all(not hasattr(module, name) for name in lifted)
+    token = compilation._INVOCATIONS.set(calls)
+    try:
+        result = module()
+    finally:
+        compilation._INVOCATIONS.reset(token)
+    torch.testing.assert_close(result, torch.full((4,), 4.5), rtol=0, atol=0)
+
+
+def test_aot_forward_inlines_zero_dimensional_cpu_tensor_constants():
+    from ignition.preparation import aot
+
+    forward = _ScalarConstantForward()
+    compiled = aot.aot_forward(forward, options={'compile_threads': 1})
+    compiled(forward)
+    torch.testing.assert_close(forward.output, forward.source * 2.5, rtol=0, atol=0)

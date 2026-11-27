@@ -15,6 +15,7 @@ pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/flare.runtime.rs"));
 }
 
+#[allow(deprecated)]
 impl wire::RebuildManifest {
     /// Resolve the recorded draft-body conversion for preparation compatibility.
     /// An omitted DFlash2 override inherits online conversion's `all` scope;
@@ -325,6 +326,46 @@ pub(super) fn validate_persistent_workers(core: &Core, execution: &wire::Executi
             "persistent worker stop flag offset must be 4-byte aligned and in bounds",
         ));
     }
+    match (worker.metrics.as_ref(), worker.metrics_count) {
+        (None, 0) => {}
+        (Some(_), 0) => {
+            return Err(invalid(
+                "persistent worker metrics reference requires a positive metrics_count",
+            ));
+        }
+        (None, _) => {
+            return Err(invalid(
+                "persistent worker metrics_count requires a metrics reference",
+            ));
+        }
+        (Some(metrics), count) => {
+            let metrics_alloc = core
+                .allocations
+                .iter()
+                .find(|a| {
+                    a.name == metrics.allocation
+                        && matches!(a.memory, Memory::MappedHost)
+                        && a.sizing.is_none()
+                })
+                .ok_or_else(|| {
+                    invalid("persistent worker metrics must reside in a mapped host allocation")
+                })?;
+            let metrics_offset = size(metrics.offset)?;
+            let metrics_bytes = (count as usize)
+                .checked_mul(std::mem::size_of::<u64>())
+                .ok_or_else(|| invalid("persistent worker metrics size overflow"))?;
+            let metrics_end = metrics_offset
+                .checked_add(metrics_bytes)
+                .ok_or_else(|| invalid("persistent worker metrics offset overflow"))?;
+            if metrics_offset % std::mem::align_of::<u64>() != 0
+                || metrics_end > metrics_alloc.nbytes
+            {
+                return Err(invalid(
+                    "persistent worker metrics offset must be 8-byte aligned and in bounds",
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -420,6 +461,7 @@ mod tests {
     use prost::Message;
 
     #[test]
+    #[allow(deprecated)]
     fn draft_body_precision_resolves_only_documented_inheritance() {
         for (method, online, scope, explicit, expected) in [
             ("dflash2", true, "all", None, Some("mxfp8")),
@@ -1666,12 +1708,28 @@ mod payload_tests {
                 allocation: "worker_ctrl".into(),
                 offset: 0,
             }),
+            metrics: None,
+            metrics_count: 0,
         };
-        // Round-trip through protobuf wire encoding.
+        // Round-trip through protobuf wire encoding without metrics.
         let encoded = valid.encode_to_vec();
         let decoded = wire::PersistentWorker::decode(encoded.as_slice()).unwrap();
         assert_eq!(decoded, valid);
         base_core(vec![decoded.clone()]).validate().unwrap();
+
+        // Round-trip with optional mapped-host u64 counters.
+        let valid_with_metrics = wire::PersistentWorker {
+            metrics: Some(wire::Reference {
+                allocation: "worker_ctrl".into(),
+                offset: 64,
+            }),
+            metrics_count: 8,
+            ..valid.clone()
+        };
+        let encoded_metrics = valid_with_metrics.encode_to_vec();
+        let decoded_metrics = wire::PersistentWorker::decode(encoded_metrics.as_slice()).unwrap();
+        assert_eq!(decoded_metrics, valid_with_metrics);
+        base_core(vec![decoded_metrics.clone()]).validate().unwrap();
 
         // Declaring more than one persistent worker is rejected explicitly.
         let mut second = decoded.clone();
@@ -1682,8 +1740,12 @@ mod payload_tests {
             .to_string();
         assert!(err.contains("at most one persistent worker"), "{err}");
 
-        for mutation in 0..8 {
-            let mut bad = decoded.clone();
+        for mutation in 0..13 {
+            let mut bad = if mutation < 8 {
+                decoded.clone()
+            } else {
+                decoded_metrics.clone()
+            };
             match mutation {
                 0 => bad.worker_sm_count = 0,
                 1 => bad.graph = "missing".into(),
@@ -1692,7 +1754,12 @@ mod payload_tests {
                 4 => bad.stop_flag = None,
                 5 => bad.stop_flag.as_mut().unwrap().allocation = "device_buf".into(),
                 6 => bad.stop_flag.as_mut().unwrap().offset = 2,
-                _ => bad.stop_flag.as_mut().unwrap().offset = 4096,
+                7 => bad.stop_flag.as_mut().unwrap().offset = 4096,
+                8 => bad.metrics = None,
+                9 => bad.metrics_count = 0,
+                10 => bad.metrics.as_mut().unwrap().allocation = "device_buf".into(),
+                11 => bad.metrics.as_mut().unwrap().offset = 68,
+                _ => bad.metrics.as_mut().unwrap().offset = 4096 - 56,
             }
             assert!(
                 base_core(vec![bad]).validate().is_err(),

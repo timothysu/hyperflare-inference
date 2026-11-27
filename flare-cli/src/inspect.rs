@@ -276,7 +276,9 @@ fn render_payload(value: &Value, mut canvas: Canvas) -> String {
         if !deployment["vision"].is_null() {
             canvas.row("Vision", &text(&deployment["vision"]));
         }
-        if let Some(command) = reproduction_command(&deployment["rebuild"]) {
+        if let Some(command) = reproduction_command(&deployment["preparation"])
+            .or_else(|| reproduction_command(&deployment["rebuild"]))
+        {
             canvas.row("Reproduction", &command);
         }
     }
@@ -844,7 +846,9 @@ pub fn render(value: &Value, width: usize, color: bool) -> String {
         },
     );
     sampling(&mut canvas, &value["sampling_defaults"]);
-    if let Some(command) = reproduction_command(&value["rebuild"]) {
+    if let Some(command) = reproduction_command(&value["preparation"])
+        .or_else(|| reproduction_command(&value["rebuild"]))
+    {
         canvas.row("reproduction", &command);
     }
     canvas.open("Rank resources");
@@ -1782,7 +1786,7 @@ mod tests {
             Some("ignition export org/model@abc123 --gpus 0-15 'a b'")
         );
         let mut value = document();
-        value["rebuild"] = json!({
+        value["preparation"] = json!({
             "reproduction_args": ["ignition", "export", "org/model@abc123", "--gpus", "0"]
         });
         let rendered = render(&value, 100, false);
@@ -1790,6 +1794,17 @@ mod tests {
             rendered.contains("reproduction")
                 && rendered.contains("ignition export org/model@abc123 --gpus 0"),
             "{rendered}"
+        );
+        // Legacy cores without `preparation` still render `rebuild.reproduction_args`.
+        let mut legacy = document();
+        legacy["rebuild"] = json!({
+            "reproduction_args": ["ignition", "export", "org/legacy@def456", "--gpus", "0"]
+        });
+        let legacy_rendered = render(&legacy, 100, false);
+        assert!(
+            legacy_rendered.contains("reproduction")
+                && legacy_rendered.contains("ignition export org/legacy@def456 --gpus 0"),
+            "{legacy_rendered}"
         );
     }
 }

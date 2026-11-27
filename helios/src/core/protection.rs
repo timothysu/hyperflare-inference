@@ -1607,6 +1607,7 @@ mod tests {
                 body_digest: sha256(body).to_vec(),
             })
             .collect();
+        #[allow(deprecated)]
         let deployment = wire::DeploymentBody {
             deployment_id: "sm120-tp2".into(),
             architecture: vec![12, 0],
@@ -1617,6 +1618,7 @@ mod tests {
             engram: None,
             payloads: vec![payload(1, fixture_executable_nbytes())],
             ranks: deployment_ranks,
+            preparation: None,
         };
         body.deployments[0].body_digest =
             sha256(&wire::DeploymentBody::encode_to_vec(&deployment)).to_vec();

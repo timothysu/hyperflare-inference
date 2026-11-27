@@ -2841,43 +2841,35 @@ fn engram_semantics_compatible(
     Ok(())
 }
 
-/// Compares the semantic preparation inputs of two rebuild manifests.
-///
-/// Tensor-parallel size, capacity, concurrency, chunking, and speculative shape
-/// settings legitimately differ between deployments; checkpoint identity,
-/// recipe packing, quantization/preparation switches, and target architecture
-/// must agree. Preparer source revisions may differ because each deployment
-/// retains its own `source_identity`; only the declared semantics must match.
+/// Compares the preparation semantics of two deployments, supporting both
+/// `PreparationManifest` and deprecated `RebuildManifest` cores, including
+/// cross-version combination between a legacy core and a newly exported core.
+#[allow(deprecated)]
+fn deployment_preparation_compatible(
+    a: &wire::DeploymentBody,
+    b: &wire::DeploymentBody,
+) -> Result<bool> {
+    let a = crate::runtime_core::resolve_preparation(a.preparation.as_ref(), a.rebuild.as_ref())?;
+    let b = crate::runtime_core::resolve_preparation(b.preparation.as_ref(), b.rebuild.as_ref())?;
+    Ok(crate::runtime_core::compatible_for_combine(
+        a.as_deref(),
+        b.as_deref(),
+    ))
+}
+
+#[cfg(test)]
+#[allow(deprecated)]
 fn rebuild_compatible(
     a: &Option<runtime::RebuildManifest>,
     b: &Option<runtime::RebuildManifest>,
 ) -> bool {
-    let (Some(a), Some(b)) = (a, b) else {
-        return a.is_none() && b.is_none();
-    };
-    let speculation = |value: &Option<runtime::RebuildSpeculation>| {
-        value.as_ref().map(|s| {
-            (
-                s.proposal_source.clone(),
-                s.history_drafts,
-                s.draft_head_quantization.clone(),
-                s.markov_head_quantization.clone(),
-                s.vocabulary_parallel_sampling,
-            )
-        })
-    };
-    a.recipe == b.recipe
-        && a.checkpoint_repository == b.checkpoint_repository
-        && a.checkpoint_revision == b.checkpoint_revision
-        && a.local_checkpoint == b.local_checkpoint
-        && a.expert_scale_compression == b.expert_scale_compression
-        && a.online_mxfp8 == b.online_mxfp8
-        && (if a.online_mxfp8_scope.is_empty() { "all" } else { &a.online_mxfp8_scope })
-            == (if b.online_mxfp8_scope.is_empty() { "all" } else { &b.online_mxfp8_scope })
-        && a.language_model_only == b.language_model_only
-        && a.mla_compute_mode == b.mla_compute_mode
-        && a.effective_draft_body_quantization() == b.effective_draft_body_quantization()
-        && speculation(&a.speculation) == speculation(&b.speculation)
+    let a = a
+        .as_ref()
+        .map(crate::runtime_core::from_legacy_rebuild_manifest);
+    let b = b
+        .as_ref()
+        .map(crate::runtime_core::from_legacy_rebuild_manifest);
+    crate::runtime_core::compatible_for_combine(a.as_ref(), b.as_ref())
 }
 
 /// Combines independently prepared TP cores into one signed core.
@@ -3044,8 +3036,10 @@ pub fn combine(request: &CombineRequest<'_>) -> Result<crate::core::export::Publ
                 ));
             }
             for (deployment_index, deployment) in source.deployments.iter().enumerate() {
-                if !rebuild_compatible(&deployment.body.rebuild, &canonical_deployment.body.rebuild)
-                {
+                if !deployment_preparation_compatible(
+                    &deployment.body,
+                    &canonical_deployment.body,
+                )? {
                     return Err(invalid(
                         "source deployments disagree on checkpoint or preparation semantics",
                     ));
@@ -5014,6 +5008,7 @@ mod tests {
         shard
     }
 
+    #[allow(deprecated)]
     fn publish_source_with(
         scratch: &Scratch,
         name: &str,
@@ -5044,6 +5039,7 @@ mod tests {
         )
     }
 
+    #[allow(deprecated)]
     fn publish_source_impl(
         scratch: &Scratch,
         name: &str,
@@ -5071,6 +5067,7 @@ mod tests {
         )
     }
 
+    #[allow(deprecated)]
     fn publish_source_impl_with_alias(
         scratch: &Scratch,
         name: &str,
@@ -5081,6 +5078,38 @@ mod tests {
         publisher: &Publisher,
         model: &str,
         engram: EngramFixture,
+        rebuild: Option<runtime::RebuildManifest>,
+        aliased: bool,
+    ) -> PathBuf {
+        publish_source_full(
+            scratch,
+            name,
+            tp,
+            halves,
+            columns,
+            key,
+            publisher,
+            model,
+            engram,
+            None,
+            rebuild,
+            aliased,
+        )
+    }
+
+    #[allow(deprecated)]
+    #[allow(clippy::too_many_arguments)]
+    fn publish_source_full(
+        scratch: &Scratch,
+        name: &str,
+        tp: u32,
+        halves: &[&[u8]],
+        columns: &[&[u8]],
+        key: &signature::Ed25519KeyPair,
+        publisher: &Publisher,
+        model: &str,
+        engram: EngramFixture,
+        preparation: Option<runtime::PreparationManifest>,
         rebuild: Option<runtime::RebuildManifest>,
         aliased: bool,
     ) -> PathBuf {
@@ -5589,6 +5618,7 @@ mod tests {
                     contract: Some(Default::default()),
                     engram: engram_body,
                     rebuild,
+                    preparation,
                     ..Default::default()
                 },
                 ranks,
@@ -7336,6 +7366,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn combine_preserves_independent_source_identities_but_rejects_semantic_differences() {
         let scratch = Scratch::new("rebuild-identity");
         let rng = SystemRandom::new();
@@ -9320,5 +9351,179 @@ mod tests {
 
         // Acyclic diamond: D -> B and D -> C.
         assert!(!derivation_introduces_cycle(&emitted, &copy_recipe(4, &[2, 3])));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn rebuild_manifest_row_shard_prefill_defaults_false_for_legacy_json_and_round_trips() {
+        let mut legacy = serde_json::to_value(runtime::RebuildManifest::default()).unwrap();
+        assert!(legacy.as_object_mut().unwrap().remove("row_shard_prefill").is_some());
+        let omitted: runtime::RebuildManifest = serde_json::from_value(legacy).unwrap();
+        assert!(!omitted.row_shard_prefill);
+
+        let mut enabled = omitted.clone();
+        enabled.row_shard_prefill = true;
+        let decoded = runtime::RebuildManifest::decode(enabled.encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.row_shard_prefill);
+        assert!(rebuild_compatible(&Some(omitted), &Some(decoded)));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn combine_supports_preparation_manifest_and_cross_version_legacy_rebuild() {
+        let scratch = Scratch::new("preparation-combine");
+        let rng = SystemRandom::new();
+        let pkcs8 = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key = signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let publisher = Publisher {
+            name: "Example".into(),
+            namespace: "example".into(),
+            public_key,
+            development: false,
+        };
+        let full: Vec<u8> = (0..8).collect();
+        let matrix: Vec<u8> = (10..18).collect();
+        let half0 = &full[0..4];
+        let half1 = &full[4..8];
+        let col0 = [10u8, 12, 14, 16];
+        let col1 = [11u8, 13, 15, 17];
+
+        let legacy_tp1 = runtime::RebuildManifest {
+            version: 1,
+            recipe: "qwen38".into(),
+            source_identity: "legacy-source".into(),
+            checkpoint_repository: "owner/model".into(),
+            checkpoint_revision: "revision".into(),
+            online_mxfp8: true,
+            mla_compute_mode: "auto".into(),
+            speculation: Some(runtime::RebuildSpeculation {
+                method: "dflash2".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let modern_tp2 = runtime::PreparationManifest {
+            version: crate::runtime_core::PREPARATION_MANIFEST_VERSION,
+            recipe: "qwen38".into(),
+            source_identity: "modern-source".into(),
+            checkpoint_repository: "owner/model".into(),
+            checkpoint_revision: "revision".into(),
+            local_checkpoint: false,
+            reproduction_args: vec!["ignition".into(), "export".into(), "owner/model@revision".into()],
+            parameters: vec![
+                runtime::PreparationParameter {
+                    key: "future_deployment_flag".into(),
+                    scope: runtime::PreparationParameterScope::Deployment as i32,
+                    value: Some(runtime::PreparationValue {
+                        value: Some(runtime::preparation_value::Value::BoolValue(true)),
+                    }),
+                },
+                runtime::PreparationParameter {
+                    key: "language_model_only".into(),
+                    scope: runtime::PreparationParameterScope::Combine as i32,
+                    value: Some(runtime::PreparationValue {
+                        value: Some(runtime::preparation_value::Value::BoolValue(false)),
+                    }),
+                },
+                runtime::PreparationParameter {
+                    key: "mla_compute_mode".into(),
+                    scope: runtime::PreparationParameterScope::Combine as i32,
+                    value: Some(runtime::PreparationValue {
+                        value: Some(runtime::preparation_value::Value::StringValue("auto".into())),
+                    }),
+                },
+                runtime::PreparationParameter {
+                    key: "online_mxfp8".into(),
+                    scope: runtime::PreparationParameterScope::TargetWeight as i32,
+                    value: Some(runtime::PreparationValue {
+                        value: Some(runtime::preparation_value::Value::BoolValue(true)),
+                    }),
+                },
+                runtime::PreparationParameter {
+                    key: "online_mxfp8_scope".into(),
+                    scope: runtime::PreparationParameterScope::TargetWeight as i32,
+                    value: Some(runtime::PreparationValue {
+                        value: Some(runtime::preparation_value::Value::StringValue("all".into())),
+                    }),
+                },
+                runtime::PreparationParameter {
+                    key: "speculation.draft_body_quantization".into(),
+                    scope: runtime::PreparationParameterScope::DraftWeight as i32,
+                    value: Some(runtime::PreparationValue {
+                        value: Some(runtime::preparation_value::Value::StringValue("mxfp8".into())),
+                    }),
+                },
+                runtime::PreparationParameter {
+                    key: "speculation.has_draft".into(),
+                    scope: runtime::PreparationParameterScope::DraftWeight as i32,
+                    value: Some(runtime::PreparationValue {
+                        value: Some(runtime::preparation_value::Value::BoolValue(true)),
+                    }),
+                },
+                runtime::PreparationParameter {
+                    key: "speculation.vocabulary_parallel_sampling".into(),
+                    scope: runtime::PreparationParameterScope::Combine as i32,
+                    value: Some(runtime::PreparationValue {
+                        value: Some(runtime::preparation_value::Value::BoolValue(false)),
+                    }),
+                },
+            ],
+        };
+
+        let tp1 = publish_source_full(
+            &scratch, "cross-tp1", 1, &[full.as_slice()], &[matrix.as_slice()],
+            &key, &publisher, "model", EngramFixture::None, None, Some(legacy_tp1), false,
+        );
+        let tp2 = publish_source_full(
+            &scratch, "cross-tp2", 2, &[half0, half1], &[col0.as_slice(), col1.as_slice()],
+            &key, &publisher, "model", EngramFixture::None, Some(modern_tp2.clone()), None, false,
+        );
+        let combined = scratch.join("cross-combined");
+        combine(&CombineRequest {
+            sources: &[tp1.clone(), tp2],
+            output: &combined,
+            publishers: std::slice::from_ref(&publisher),
+            accepted: "example",
+            target_accepted: "example",
+            target_publisher: None,
+            key: &key,
+        })
+        .unwrap();
+
+        let metadata = Metadata::open(&combined).unwrap();
+        let envelope = protect::envelope(&metadata.envelope).unwrap();
+        let tp1_body = wire::DeploymentBody::decode(envelope.deployments[0].body.as_slice()).unwrap();
+        let tp2_body = wire::DeploymentBody::decode(envelope.deployments[1].body.as_slice()).unwrap();
+        assert!(tp1_body.rebuild.is_some() && tp1_body.preparation.is_none());
+        assert!(tp2_body.rebuild.is_none() && tp2_body.preparation.as_ref() == Some(&modern_tp2));
+
+        // A new semantic Ignition parameter in Combine scope must match across deployments.
+        let mut mismatch = modern_tp2;
+        mismatch.parameters.push(runtime::PreparationParameter {
+            key: "z_future_semantic_flag".into(),
+            scope: runtime::PreparationParameterScope::Combine as i32,
+            value: Some(runtime::PreparationValue {
+                value: Some(runtime::preparation_value::Value::StringValue("custom".into())),
+            }),
+        });
+        let tp2_mismatch = publish_source_full(
+            &scratch, "cross-tp2-mismatch", 2, &[half0, half1], &[col0.as_slice(), col1.as_slice()],
+            &key, &publisher, "model", EngramFixture::None, Some(mismatch), None, false,
+        );
+        let error = combine(&CombineRequest {
+            sources: &[tp1, tp2_mismatch],
+            output: &scratch.join("cross-mismatch-combined"),
+            publishers: std::slice::from_ref(&publisher),
+            accepted: "example",
+            target_accepted: "example",
+            target_publisher: None,
+            key: &key,
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "source deployments disagree on checkpoint or preparation semantics"
+        );
     }
 }

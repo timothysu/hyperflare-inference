@@ -69,9 +69,14 @@ def test_missing_source_fails_without_publishing(tmp_path):
 def test_payload_promotion_preserves_rank_and_rebuild_metadata(tmp_path):
     from tests.preparation.test_core_protection import development_publisher, development_profile
     original = development_publisher()
-    index = proto.ModelIndex(version=4, rebuild=proto.RebuildManifest(
+    index = proto.ModelIndex(version=4, preparation=proto.PreparationManifest(
         version=1, recipe='fixture', checkpoint_repository='test/weights', checkpoint_revision='b' * 40,
-        tensor_parallel=1))
+        reproduction_args=['ignition', 'export', 'test/weights@' + 'b' * 40, '--gpus', '0'],
+        parameters=[proto.PreparationParameter(
+            key='tensor_parallel',
+            scope=proto.PREPARATION_PARAMETER_SCOPE_DEPLOYMENT,
+            value=proto.PreparationValue(uint_value=1),
+        )]))
     source = rank_source(tmp_path / 'source', index=index)
     output = tmp_path / 'development'
     combine(output, [source], [], publisher=original)
@@ -86,8 +91,9 @@ def test_payload_promotion_preserves_rank_and_rebuild_metadata(tmp_path):
     assert [rank.body for rank in before.ranks] == [rank.body for rank in after.ranks]
     before_deployment = schema()('DeploymentBody').FromString(before.deployments[0].body)
     after_deployment = schema()('DeploymentBody').FromString(after.deployments[0].body)
-    assert before_deployment.rebuild == after_deployment.rebuild
-    assert after_deployment.rebuild.SerializeToString(deterministic=True) == index.rebuild.SerializeToString(deterministic=True)
+    assert before_deployment.preparation == after_deployment.preparation
+    assert after_deployment.preparation.SerializeToString(deterministic=True) == index.preparation.SerializeToString(deterministic=True)
+    assert not after_deployment.HasField('rebuild')
 
 
 def test_payload_promotion_carries_the_exported_license(tmp_path):

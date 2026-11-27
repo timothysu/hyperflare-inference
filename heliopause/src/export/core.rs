@@ -797,6 +797,7 @@ pub(crate) fn publish_payload(
             )?);
             assembly.advance(1);
         }
+        #[allow(deprecated)]
         let deployment = pwire::DeploymentBody {
             deployment_id: deployment_id.clone(),
             architecture,
@@ -807,6 +808,7 @@ pub(crate) fn publish_payload(
             engram,
             payloads: vec![],
             ranks: vec![],
+            preparation: root_rank.preparation.clone(),
         };
         let staged_payloads =
             core_payloads.len() + rank_plans.iter().map(|r| r.payloads.len()).sum::<usize>();
@@ -2763,6 +2765,7 @@ mod payload_export_tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn reuse_weights_publishes_cached_payloads_without_live_weight_sources() -> Result<()> {
         use crate::export::{
             CaptureRequest, WeightPayloadGroup, WeightPayloadSourceSpan, WeightPayloadSources,
@@ -2871,8 +2874,18 @@ mod payload_export_tests {
         )?;
         assert!(stored_rank.prepared_weights.is_none());
         assert!(stored_rank.compressed_prepared_weights.is_some());
-        metadata["rebuild_manifest"] = serde_json::json!({"version":1,"recipe":"fixture",
-            "checkpoint_repository":"fixture/model","checkpoint_revision":"revision-a","tensor_parallel":1});
+        // A new export carrying `PreparationManifest` can reuse weights from a cached
+        // legacy `RebuildManifest` deployment when target-weight semantics agree.
+        metadata["preparation_manifest"] = serde_json::json!({
+            "version": 1,
+            "recipe": "fixture",
+            "checkpoint_repository": "fixture/model",
+            "checkpoint_revision": "revision-a",
+            "parameters": [
+                {"key": "online_mxfp8", "scope": "PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT", "value": {"bool_value": false}},
+                {"key": "online_mxfp8_scope", "scope": "PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT", "value": {"string_value": "all"}}
+            ]
+        });
         // Live sources contain only fresh state; the weight bytes cannot be read here.
         fs::write(stages.join("storage-0.bin"), vec![0x77u8; 32])?;
         let bundle = &mut rank.index.ranks[0];
@@ -3030,7 +3043,7 @@ mod payload_export_tests {
         // Reuse rejects a changed checkpoint or a changed tuned layout.
         let original = request.options.reuse_weights.clone();
         let mut changed = metadata.clone();
-        changed["rebuild_manifest"]["checkpoint_revision"] = "revision-b".into();
+        changed["preparation_manifest"]["checkpoint_revision"] = "revision-b".into();
         request.options.reuse_weights = Some(serde_json::from_value(changed)?);
         assert!(super::super::capture::resolve_staged_weight_payload(&request, &mut rank).is_err());
         request.options.reuse_weights = original;
@@ -3516,14 +3529,17 @@ mod payload_export_tests {
             let root = Root::open(directory.path().join("cache"))?;
             let mut rank = staged_rank(&stages);
             let world = if partitioned { 2 } else { 1 };
-            rank.index.rebuild = Some(wire::RebuildManifest {
-                version: 1,
-                recipe: "fixture".into(),
-                checkpoint_repository: "fixture/model".into(),
-                checkpoint_revision: "revision-a".into(),
-                tensor_parallel: world,
-                ..Default::default()
-            });
+            #[allow(deprecated)]
+            {
+                rank.index.rebuild = Some(wire::RebuildManifest {
+                    version: 1,
+                    recipe: "fixture".into(),
+                    checkpoint_repository: "fixture/model".into(),
+                    checkpoint_revision: "revision-a".into(),
+                    tensor_parallel: world,
+                    ..Default::default()
+                });
+            }
             let mut table = wire::EngramTable {
                 layer: 1,
                 rows: world as u64,

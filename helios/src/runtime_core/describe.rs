@@ -69,10 +69,12 @@ impl super::protection::LegacyVerified {
     }
 }
 
+#[allow(deprecated)]
 struct DescribeSections<'a> {
     contract: &'a wire::ServingContract,
     frontend: &'a wire::FrontendSettings,
     sampling: &'a wire::DefaultSamplingParameters,
+    preparation: Option<&'a wire::PreparationManifest>,
     rebuild: Option<&'a wire::RebuildManifest>,
     first_rank_max_active: Option<u64>,
     kv_page_bytes: u64,
@@ -94,6 +96,7 @@ fn describe_common(sections: DescribeSections<'_>, options: InspectionOptions) -
     let mut value = json!({
         // Preparation metadata is optional and never supplies serving policy. Cores
         // without it, including version 4 exports, retain their complete serving contract.
+        "preparation": sections.preparation.map(super::preparation::preparation_json),
         "rebuild": sections.rebuild,
         "model": {
             "model_id": contract.model_id,
@@ -259,12 +262,15 @@ pub(super) fn describe_index(
         .enumerate()
         .map(|(i, bundle)| rank_json(rank.unwrap_or(i), bundle, options))
         .collect::<Result<Vec<_>>>()?;
+    #[allow(deprecated)]
+    let rebuild = index.rebuild.as_ref();
     describe_common(
         DescribeSections {
             contract,
             frontend,
             sampling,
-            rebuild: index.rebuild.as_ref(),
+            preparation: index.preparation.as_ref(),
+            rebuild,
             first_rank_max_active: index
                 .ranks
                 .first()
@@ -346,12 +352,15 @@ pub(super) fn describe_payload(
             )
         })
         .collect::<Result<Vec<_>>>()?;
+    #[allow(deprecated)]
+    let rebuild = deployment.rebuild.as_ref();
     describe_common(
         DescribeSections {
             contract,
             frontend,
             sampling,
-            rebuild: deployment.rebuild.as_ref(),
+            preparation: deployment.preparation.as_ref(),
+            rebuild,
             first_rank_max_active: cores
                 .first()
                 .and_then(|c| c.execution.as_ref())
@@ -877,12 +886,14 @@ mod tests {
     use prost::Message;
 
     #[test]
+    #[allow(deprecated)]
     fn serialized_cores_without_rebuild_metadata_keep_serving_descriptions() {
         // Version 4, one empty rank, empty sampling/frontend messages, and a typed
         // serving contract with an empty model contract; no rebuild fields on wire.
         let bytes = [8, 4, 18, 0, 58, 0, 66, 0, 82, 2, 26, 0];
         let mut index = wire::ModelIndex::decode(bytes.as_slice()).unwrap();
         let before = describe_index(&index, InspectionOptions::default(), None).unwrap();
+        assert!(before["preparation"].is_null());
         assert!(before["rebuild"].is_null());
         assert!(before["ranks"][0]["rebuild_weights"].is_null());
         // Serving metadata remains usable even if preparation requires an importer
@@ -898,11 +909,38 @@ mod tests {
         let after = describe_index(&index, InspectionOptions::default(), None).unwrap();
         assert_eq!(before["model"], after["model"]);
         assert_eq!(before["cache"], after["cache"]);
+        assert!(after["preparation"].is_null());
         assert_eq!(after["rebuild"]["version"], 99);
         assert_eq!(after["ranks"][0]["rebuild_weights"]["version"], 99);
+
+        // New cores populate `preparation` and leave deprecated `rebuild` null.
+        index.rebuild = None;
+        index.preparation = Some(wire::PreparationManifest {
+            version: 99,
+            recipe: "fixture".into(),
+            reproduction_args: vec!["ignition".into(), "export".into(), "org/model".into()],
+            parameters: vec![wire::PreparationParameter {
+                key: "row_shard_prefill".into(),
+                scope: wire::PreparationParameterScope::Deployment as i32,
+                value: Some(wire::PreparationValue {
+                    value: Some(wire::preparation_value::Value::BoolValue(true)),
+                }),
+            }],
+            ..Default::default()
+        });
+        let modern = describe_index(&index, InspectionOptions::default(), None).unwrap();
+        assert_eq!(before["model"], modern["model"]);
+        assert!(modern["rebuild"].is_null());
+        assert_eq!(modern["preparation"]["version"], 99);
+        assert_eq!(modern["preparation"]["recipe"], "fixture");
+        assert_eq!(
+            modern["preparation"]["parameters"],
+            json!([{"key": "row_shard_prefill", "scope": "deployment", "value": true}])
+        );
     }
 
     #[test]
+    #[allow(deprecated)]
     fn rebuild_metadata_without_a_chain_field_describes_its_recorded_shape() {
         // Field 22 (`roce_chain`) is absent from rebuild metadata serialized without it; such a
         // ring core keeps its ring shape and reads as not a chain.

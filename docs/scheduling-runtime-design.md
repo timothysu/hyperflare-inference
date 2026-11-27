@@ -18,8 +18,9 @@ only for decode rounds, and it estimates graph costs with a 7/8 moving average
 that reverts to unmeasured after 30 seconds. The duration estimates, funded
 refresh, and acceptance learning specified below describe Helios alone.
 
-The native catalog contains prefill, scored prefill, ordinary decode, complete
-speculative generation, mixed prefill/generation, vision, and state operations.
+The native catalog contains prefill, terminal prefill, scored prefill, ordinary
+decode, complete speculative generation, mixed prefill/generation, vision, and
+state operations.
 A complete speculative graph contains proposal generation, optional confidence
 and prefix allocation, target verification, and accepted-state commit. Proposal
 and verification are internal stages, not independently scheduled operations.
@@ -83,13 +84,13 @@ but need not agree bitwise. Exact request identities, consumption, emitted
 prefixes, and committed state agree across ranks.
 
 Confidence forecasts and verified acceptance are separate observations.
-A request's forecast averages its completed joint-prefix probabilities,
+A request's stored forecast averages its completed joint-prefix probabilities,
 starting from a population prior. That prior begins at `0.5^d` for the `d`-th
 draft position and moves toward each observed prefix value with weight one
 sixty-fourth. It is one mean per position across all requests, so it follows
 whichever traffic ran most recently. A model whose graphs allocate prefix
-lengths on the GPU takes the value from the completed prefix probability of
-each lane in the round's confidence sidecar; a model with any such graph is
+lengths on the GPU takes the stored value from the completed prefix probability
+of each lane in the round's confidence sidecar; a model with any such graph is
 treated this way for all its rounds. Every other model takes it from the
 verification outcome: for each position a completed MTP round determined, the
 value is the reported survival, or one for an accepted position and zero for a
@@ -101,9 +102,66 @@ estimates start at the population with weight two; with GPU confidence, and
 for copy proposals, they start at `0.5^d`. Forecast and acceptance prefix
 estimates start with weight two, cap at 128, and age with a half-life of 128
 generated tokens.
-Unobserved suffixes retain their means. Ordinary selection uses the historical
-means; funded acceptance learning uses the bounded optimistic estimate
-`min(1, mean + sqrt(ln(20) / (2 * aged_weight)))`.
+Unobserved suffixes retain their means.
+
+When pricing candidate shapes on a GPU-confidence model, the stored per-request
+confidence forecast is adjusted by two online corrections derived solely from
+completed rounds:
+
+1. **Hierarchical per-request, per-depth drafter calibration (`RequestCalibration`
+   + `DepthCalibration`):** A slow round-level global prior `DepthCalibration`
+   (`clamp(realized / predicted, 0.0, 2.0)`, defaulting to `1.0` when
+   `predicted <= 1e-6`, initialized at `realized == predicted == 0.5^d` with
+   prior weight `4.0`, updated **once per completed round** from the mean
+   realized and predicted survival across contributing lanes with EWMA cap
+   `64.0`) provides instant model-wide protection for brand-new requests (e.g.,
+   if a drafter breaks globally) while preventing a single correlated
+   large-batch dip from overwriting the prior in one step. Each live request
+   maintains its own aged per-depth `RequestCalibration` (seeded
+   scale-invariantly at `anchor = max(predicted, 0.05)` with prior weight `2.0`
+   from the live global factor on its first observation at that depth, EWMA cap
+   `32.0`, 128-token half-life aging matching `PrefixEstimate`) so sequential
+   workloads, context lengths, and heterogeneous concurrent lanes do not bleed
+   calibration across requests, and censored unobserved depths decay their prior
+   weight so a single funded acceptance probe can escape stale priors. Updates
+   use the exact offered, determined prefix outcomes computed once in
+   `complete_inner` (Rao-Blackwellized with `completion_speculative_survival`
+   when reported, else binary acceptance/rejection). Pricing multiplies each
+   depth's stored mean by the request's calibration factor, adds the Hoeffding
+   optimistic margin using the minimum aged weight of the confidence forecast
+   and verification calibration during funded acceptance learning, clamps to
+   `[0, 1]`, and enforces nonincreasing prefix survival across depths.
+2. **Cross-lane order-statistic allocation surplus (`SurplusHistory`):** Inside
+   a packed GPU-allocated round (`B >= 2`, `P < B * W`, `depth >= 1`), the
+   device allocator observes fresh per-step confidences across all active lanes
+   and allocates the `P - B` draft slots to the highest-confidence
+   `(lane, depth)` pairs of that step. By Jensen's inequality, `E[sum
+   Top-(P-B)(S_step)] >= sum Top-(P-B)(E[S])`, so pricing packed rounds from
+   time-averaged lane curves systematically undervalues crowded packed graphs
+   relative to plain `W=1` and uncrowded small batches. The scheduler maintains
+   two 256-entry rolling ring buffers (8 full `C=32` / 4 full `C=64` rounds): a
+   deep ring for `depth >= 2` paired `(actual_calibrated, pre_step_forecast)`
+   lane curves and a dedicated depth-1 (`width = 2`) ring fed by every round
+   with `depth >= 1` so sustained `W=2` traffic keeps depth-1 surplus fresh
+   without evicting deeper curves. Table construction (`min 4` samples) uses the
+   deepest `eff_depth` in `2..=depth` with at least `4` entries in the deep
+   ring (falling back to the depth-1 ring when querying `depth == 1` or when no
+   deeper history exists yet, never extrapolating beyond observed depths),
+   computes the normalized Lorenz concentration ratio over linear calibrated
+   survival at quota `r = (P - b) / b`, scales the excess surplus by `(1 - 1/b)
+   * min(alpha, 1.0)` (so it applies in full at `alpha = 1.0` and dampens
+   smoothly when `alpha < 1.0` already applies a concave boost), clamps to
+   `[1.0, 2.0]`, and caps total draft value by the physical `draft_budget`
+   maximum (100% survival per allocated draft row). The normalized ratio equals
+   `1.0` identically for single-lane cohorts (`b = 1`), uncrowded graphs
+   (`P - b >= total_ceiling_drafts` or `r >= eff_depth`), pure mean shifts, and
+   pure between-request heterogeneity (preventing double-counting of
+   per-request forecasts).
+
+Ordinary selection uses the calibrated historical means (plus cross-lane
+allocation surplus on crowded GPU-allocated shapes); funded acceptance learning
+uses the bounded optimistic estimate
+`min(1, calibrated_mean + sqrt(ln(20) / (2 * aged_weight)))`.
 
 A prepared program may also write `completion_speculative_survival`, cumulative
 products of `min(1, p(token)/q(token))` for evaluated prefixes. These replace
@@ -136,7 +194,21 @@ output delivery: g/z
 ```
 
 Only decoding requests have a delivery coordinate or output-age cost. Normalized
-service prices follow the entropy-dual update in `scheduling-utility.md`. Actual
+service prices follow the entropy-dual update in `scheduling-utility.md`. When a
+prefilling request's maximum feasible token rate changes between chunks (for
+example from a faster intermediate `PREFILL` chunk to a slower
+`TERMINAL_PREFILL` chunk or a short prompt tail), `ServicePrice::rebase`
+rescales its stored token price by the rate ratio so its normalized GPU-time
+share `p * m` stays continuous across prefill transitions. When the request
+completes prompt consumption and enters decode, `ServicePrice::rebase_upward`
+caps any upward feasible-rate jump (such as exiting a slow padded prefill tail
+into speculative decode) so normalized decode priority cannot inflate above its
+pre-transition share, then clears the tracked prefill rate while leaving
+downward rate transitions into decode unchanged. Individually feasible prefill
+service rates price each request from the prefill catalog and operation it can
+execute (`PREFILL`, `TERMINAL_PREFILL`, or `SCORED_PREFILL`), excluding `MIXED`
+durations for `prompt_logprobs` requests and for requests holding incomplete
+deferred prefill state. Actual
 service updates history; expected acceptance scores choices. Conditional
 acceptance is estimated per request, started from the population mean when the
 model reports no GPU confidence, and respects available proposals, grammar and stop
@@ -205,6 +277,23 @@ and prompt length also restrict logical work. A graph with 64 useful prompt toke
 earns 64 prompt units and at most one output token, regardless of physical capacity.
 Candidate scoring has no smallest-fitting-shape filter, duration ceiling, forced
 oldest-request filter, or per-chunk prefill lateness cost.
+
+When a prepared model registers `TERMINAL_PREFILL` graphs for a subset of
+aligned prefill capacities, Helios infers the tail-protection window as the
+largest ordinary `PREFILL` capacity absent from the terminal catalog. For
+capacities present in the terminal catalog, Helios schedules `TERMINAL_PREFILL`
+at prompt completion, checkpoint cuts, conditioned-window boundaries, and any
+penultimate chunk leaving at most the tail-protection window, while earlier
+chunks run `PREFILL`. Committing a non-terminal `PREFILL` chunk at a capacity
+present in the terminal catalog marks the request as holding deferred
+continuation state until a `TERMINAL_PREFILL` chunk completes. While deferred
+state is active, the scheduler excludes the request from `MIXED` graphs and
+suppresses checkpoint and early-retirement snapshot capture so incomplete
+continuation state is never published. Checkpoint cut budgeting prices
+non-terminal and terminal chunks using their separate measured durations with
+sibling fallback when only one operation is measured, skipping unmeasured
+larger capacities that consume no additional tokens and unmeasured non-target
+capacities on terminal-prefill catalogs.
 
 With no active decoder, the age term vanishes. Fully occupied large prefill
 graphs win when their useful value rate is highest. With decoding streams, a
@@ -304,7 +393,10 @@ middle pair when fewer than nine samples give an even count. An entry becomes st
 without a valid observation. Its measured cost remains available for selection
 and service-rate normalization. The first valid observation of a stale entry
 replaces its estimate directly; elapsed time alone never makes a measured graph
-unknown.
+unknown. When multiple packed speculative shapes cover a `(batch, width)` lookup
+for service-rate normalization or continuation pricing, Helios takes the minimum
+positive measured duration across matching shapes and returns zero only when
+every matching shape is unmeasured.
 
 The raw device observation is the maximum positive rank-local CUDA replay interval.
 When the prepared graphs expose frame-owned readiness timestamps, the cost sample
@@ -315,9 +407,15 @@ Graph estimates use these GPU observations for both isolated and queued executio
 Host dispatch, completion delivery, and polling time do not enter a graph's cost.
 Missing or zero device intervals neither change an estimate nor make it fresh.
 
-Prefill exploration excludes a larger unmeasured graph when a smaller prepared
-capacity consumes the same tokens up to the next message or prompt endpoint.
-Measured graphs remain eligible according to their observed costs.
+Pure prefill exploration restricts unmeasured graphs (`PREFILL`,
+`TERMINAL_PREFILL`, and `SCORED_PREFILL`) to the natural-fit capacity: the
+smallest registered catalog capacity that achieves the maximum single-step
+token work through the next checkpoint cut, atomic span, or prompt endpoint
+(respecting terminal-completion requirements). Smaller unmeasured prefill
+shapes do not preempt larger fitting graphs during cold discovery, and larger
+padded unmeasured shapes that consume no additional tokens are excluded.
+Measured prefill graphs of every capacity remain eligible according to their
+observed costs and funded timing refresh.
 
 An indeterminate candidate wins over a determinate candidate, then competes by
 expected useful value. Equal values prefer shorter known time, more served

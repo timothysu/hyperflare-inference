@@ -110,7 +110,7 @@ def test_startup_waits_for_every_rank_and_rejects_any_failed_status(monkeypatch,
     from contextlib import nullcontext
     from threading import Barrier
     import torch
-    from ignition.preparation.startup_tuning import replay_startup_tuning
+    from ignition.direct.executor import replay_startup_tuning
 
     barrier = Barrier(2, timeout=5)
     values = [None, None]
@@ -141,7 +141,7 @@ def test_startup_waits_for_every_rank_and_rejects_any_failed_status(monkeypatch,
 
 
 def test_startup_rank_catalog_mismatch_rejects_before_launch(monkeypatch):
-    from ignition.preparation.startup_tuning import replay_startup_tuning
+    from ignition.direct.executor import replay_startup_tuning
     events = []
     model = startup_model(events, coordinator=SimpleNamespace(same_on_every_rank=lambda value: False))
     with pytest.raises(RuntimeError, match="order or binding schema differs"):
@@ -153,7 +153,7 @@ def test_startup_unknown_drain_requires_process_teardown(monkeypatch):
     from contextlib import nullcontext
     import os
     import torch
-    from ignition.preparation.startup_tuning import replay_startup_tuning
+    from ignition.direct.executor import replay_startup_tuning
 
     class Terminated(BaseException):
         pass
@@ -169,7 +169,7 @@ def test_startup_unknown_drain_requires_process_teardown(monkeypatch):
 
 @pytest.mark.parametrize('difference', ['outputs', 'status', 'serving-binding'])
 def test_startup_agrees_full_binding_schema_before_launch(difference):
-    from ignition.preparation.startup_tuning import replay_startup_tuning
+    from ignition.direct.executor import replay_startup_tuning
 
     remote_producer = ('tune', ('selector',), 'status')
     remote_consumer = ('decode', (('selector', 'tune'),))
@@ -195,7 +195,7 @@ def test_startup_rank_storage_mismatch_rejects_before_launch(monkeypatch, buffer
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier
     import torch
-    from ignition.preparation.startup_tuning import replay_startup_tuning
+    from ignition.direct.executor import replay_startup_tuning
 
     barrier = Barrier(2, timeout=5)
     signatures = [None, None]

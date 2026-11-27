@@ -129,9 +129,12 @@ the checkpoint identifier or any alias, including repository IDs with slashes.
 Unknown names return a JSON 404.
 See [the API reference](../docs/api.md) for discovery fields and generation routes.
 HTTP admission reserves at most `queue_capacity + max_active` requests before
-reading JSON bodies. Admitted requests await a bounded CPU preparation worker;
-each of the `frontend_workers` permits, two by default, prepares one request at
-a time.
+reading JSON bodies. Admitted requests await one of `frontend_workers` CPU
+preparation permits (two by default), so at most `frontend_workers` requests
+prepare concurrently. `frontend_workers` also caps the shared thread budget
+(`min(frontend_workers, available_parallelism(), 16)`) for parallel long-prompt
+tokenization, bounding the helper threads any preparing request can borrow
+alongside its own worker thread.
 `ignition` cores set the queue to four times the concurrency limit, one worker per
 concurrent request, and a body limit of the recipe's per-image byte allowance
 times its image limit plus 32 bytes per context token.
@@ -421,7 +424,9 @@ when available. Host delays and queue wait do not enter graph estimates. An
 unmeasured candidate ranks ahead of every measured candidate; unmeasured
 candidates compete among themselves by expected useful value. Both
 unmeasured and stale physical dispatches require an empty queue and completion
-before another submission.
+before another submission. When multiple packed speculative shapes cover a
+`(batch, width)` duration lookup, Helios uses the minimum positive measured
+duration and returns zero only when every matching shape is unmeasured.
 
 Ordinary valid execution earns refresh credit at `0.002 / 0.998` times its
 measured duration, capped at 5 ms. Full credit permits a stale alternative to
@@ -434,11 +439,21 @@ This bounds aggregate refresh expense, not individual stalls; see
 
 Speculative width selection combines this cost with expected prefix survival,
 estimated per request and, on a model without GPU confidence, started from the
-population mean of earlier requests. Complete programs learn from terminal verification and keep
-completed confidence forecasts separate from acceptance outcomes. Ordinary selection uses
-historical means, while a separate 1% raw-time budget funds optimistic
-acceptance probes. Observational weight ages without changing unobserved means;
-width-one rounds still measure cost. See
+population mean of earlier requests. Complete programs learn from terminal
+verification and keep stored confidence forecasts separate from acceptance
+outcomes. When pricing GPU-confidence shapes, stored per-depth forecasts are
+scaled by a request-local aged per-depth verification calibration ratio (seeded
+scale-invariantly with prior weight `2` from a once-per-round population prior
+capped at weight `64`, 128-token half-life, request EWMA cap `32`, clamped to
+`[0, 2]`), and crowded GPU-allocated packed shapes (`B >= 2`, `P < B * W`,
+`depth >= 1`) additionally apply a bounded empirical cross-lane order-statistic
+surplus (from dual 256-entry rolling windows—one for `depth >= 2` curves and a
+dedicated depth-1 ring for `W=2`—with conservative `eff_depth <= depth`
+fallback, excess scaled by `(1 - 1/b) * min(alpha, 1)` and capped at 100% draft
+survival) to capture the GPU allocator's per-step cherry-picking gain.
+Ordinary selection uses calibrated historical means, while a separate 1%
+raw-time budget funds optimistic acceptance probes. Observational weight ages
+without changing unobserved means; width-one rounds still measure cost. See
 [funded acceptance learning](../docs/scheduling-runtime-design.md#funded-acceptance-learning).
 
 Fairness enters selection through per-request service prices. Each resident

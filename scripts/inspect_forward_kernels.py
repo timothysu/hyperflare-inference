@@ -59,7 +59,7 @@ def main():
             deserializer, serialized = state['compiled_fn']
             if deserializer != StorageBackend.deserialize_compile_artifacts:
                 raise TypeError(f'{path} does not contain a Flare storage backend')
-            compiled, _, _, _, frozen = pickle.loads(serialized)
+            compiled, _, _, _, frozen, _ = pickle.loads(serialized)
             entry, kernels, constants = pickle.loads(compiled)
         if kernels or constants:
             raise ValueError(f'{path} contains unsupported static native bindings')

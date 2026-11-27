@@ -660,11 +660,20 @@ mod tests {
     #[test]
     fn scheduler_pane_renders_at_terminal_sizes_with_legible_units_and_no_nan() {
         let (view, metrics, history) = fixture();
+        let worker = super::worker::WorkerView::default();
         for (width, height) in [(150, 38), (100, 30), (80, 24), (40, 12), (1, 1), (0, 0)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| {
-                    render_pane(frame, "Qwen", &history, &view, &metrics, Pane::Scheduler)
+                    render_pane(
+                        frame,
+                        "Qwen",
+                        &history,
+                        &view,
+                        &worker,
+                        &metrics,
+                        Pane::Scheduler,
+                    )
                 })
                 .unwrap();
             let buffer = terminal.backend().buffer();

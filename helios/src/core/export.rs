@@ -2254,11 +2254,7 @@ mod tests {
                     architecture: vec![12, 0],
                     tensor_parallel: 1,
                     contract: None,
-                    cluster: None,
-                    rebuild: None,
-                    engram: None,
-                    payloads: vec![],
-                    ranks: vec![],
+                    ..Default::default()
                 },
                 ranks: vec![PublishRank {
                     body: wire::RankBody {
@@ -2392,11 +2388,7 @@ mod tests {
                     architecture: vec![12, 0],
                     tensor_parallel: 1,
                     contract: Some(crate::runtime_core::wire::ServingContract::default()),
-                    cluster: None,
-                    rebuild: None,
-                    engram: None,
-                    payloads: vec![],
-                    ranks: vec![],
+                    ..Default::default()
                 },
                 ranks: vec![PublishRank {
                     body: wire::RankBody {
@@ -2523,11 +2515,7 @@ mod tests {
                     architecture: vec![12, 0],
                     tensor_parallel: 1,
                     contract: Some(crate::runtime_core::wire::ServingContract::default()),
-                    cluster: None,
-                    rebuild: None,
-                    engram: None,
-                    payloads: vec![],
-                    ranks: vec![],
+                    ..Default::default()
                 },
                 ranks: vec![],
                 payloads: vec![],
@@ -2586,11 +2574,7 @@ mod tests {
                     architecture: vec![12, 0],
                     tensor_parallel: 1,
                     contract: None,
-                    cluster: None,
-                    rebuild: None,
-                    engram: None,
-                    payloads: vec![],
-                    ranks: vec![],
+                    ..Default::default()
                 },
                 ranks: vec![PublishRank {
                     body: wire::RankBody {
@@ -2667,11 +2651,7 @@ mod tests {
                     architecture: vec![12, 0],
                     tensor_parallel: 1,
                     contract: None,
-                    cluster: None,
-                    rebuild: None,
-                    engram: None,
-                    payloads: vec![],
-                    ranks: vec![],
+                    ..Default::default()
                 },
                 ranks: vec![],
                 payloads: vec![],
@@ -2834,11 +2814,7 @@ mod tests {
                     architecture: vec![12, 0],
                     tensor_parallel: 1,
                     contract: Some(crate::runtime_core::wire::ServingContract::default()),
-                    cluster: None,
-                    rebuild: None,
-                    engram: None,
-                    payloads: vec![],
-                    ranks: vec![],
+                    ..Default::default()
                 },
                 payloads: vec![],
                 ranks: vec![PublishRank {
@@ -3034,11 +3010,7 @@ mod tests {
                     architecture: vec![12, 0],
                     tensor_parallel: 2,
                     contract: Some(crate::runtime_core::wire::ServingContract::default()),
-                    cluster: None,
-                    rebuild: None,
-                    engram: None,
-                    payloads: vec![],
-                    ranks: vec![],
+                    ..Default::default()
                 },
                 ranks: (0..2)
                     .map(|number| PublishRank {

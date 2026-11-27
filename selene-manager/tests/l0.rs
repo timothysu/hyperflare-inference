@@ -801,7 +801,7 @@ async fn l0_10_cancel_drains_and_staging_gauge() {
 async fn l0_12_round_robin_and_dead_client_cleanup() {
     let mut host = Host::with_storage(8 * 1024 * 1024, 64 * 1024 * 1024);
     host.run();
-    let mut a = host.client().await;
+    let a = host.client().await;
     let mut client = host.client().await;
     let mut previous = None;
     for index in 1..=160u64 {
@@ -1339,7 +1339,7 @@ async fn l0_52_hold_slots_stay_busy_until_writes_drain() {
         let window = client
             .session
             .take(|m| match m {
-                M::PutGrant(g) if g.put_id == id => g.window,
+                M::PutGrant(g) if g.put_id == id => g.window.clone(),
                 _ => None,
             })
             .await;
@@ -1562,7 +1562,7 @@ async fn l0_55_cancelled_get_lease_keeps_its_bytes() {
     let mut client = host.client().await;
     let stored = client.store(key(64), None).await;
     let held = client.hold(&[key(64)], 0, 1).await;
-    let window = held.windows[0].window.unwrap();
+    let window = held.windows[0].window.clone().unwrap();
     assert!(window.page_count > 0 && window.first_page == 0);
     // Cancelled; the window is neither released nor fenced.
     let terminal = client.drop_held(&held).await;
@@ -1902,7 +1902,7 @@ async fn l0_63_a_paused_put_keeps_its_window_past_the_deadline() {
     let grant = client
         .session
         .take(|m| match m {
-            M::PutGrant(grant) if grant.put_id == id => Some(*grant),
+            M::PutGrant(grant) if grant.put_id == id => Some(grant.clone()),
             _ => None,
         })
         .await;

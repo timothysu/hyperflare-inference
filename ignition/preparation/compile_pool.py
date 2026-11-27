@@ -16,7 +16,7 @@ import torch
 from ignition import runtime_patches
 
 from . import host_memory
-from .compilation import _OPTIONS, _defer_full_collection
+from .compilation import _OPTIONS, _compile_options, _defer_full_collection
 from .host_memory import cpu_workers, device_memory_info
 
 # Device memory one compiler worker can hold: its CUDA context plus Inductor's constant folding.
@@ -38,7 +38,7 @@ def compiler_resources(device, *, headroom_bytes=0, options=None, compile_worker
     """Sample a rank's device capacity and its host's compiler memory budget."""
     if type(headroom_bytes) is not int or headroom_bytes < 0:
         raise ValueError("headroom_bytes must be a nonnegative byte count")
-    options = _OPTIONS if options is None else options
+    options = _compile_options(options)
     limit = min(cpu_workers(compile_workers), cpu_workers())
     if compile_workers is None:
         limit = min(limit, options['compile_threads'])
@@ -123,7 +123,7 @@ class CompilePool:
         """Use admitted workers, or size one rank's pool from its host and device resources."""
         self.device = torch.device(device)
         self.pool = None
-        options = dict(_OPTIONS if options is None else options)
+        options = _compile_options(options)
         if workers is None:
             resources = compiler_resources(self.device, headroom_bytes=headroom_bytes, options=options,
                                            compile_workers=compile_workers)
@@ -144,6 +144,7 @@ class CompilePool:
         from torch._inductor.compile_worker.subproc_pool import SubprocKind, SubprocPool
 
         if self.pool is None:
+            runtime_patches.apply()
             if os.name == "nt":
                 self.pool = ProcessPoolExecutor(self.workers, mp_context=multiprocessing.get_context("spawn"))
             else:

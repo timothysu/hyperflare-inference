@@ -98,7 +98,7 @@ fn ranked_prefix_allocation_matches_greedy_frontiers() {
                     };
                     (0..7).map(|depth| [0.0, 0.25, 0.75, 1.0][(row + depth) % 4]).collect::<Vec<_>>()
                 }).collect();
-                scheduler.observe_packed_forecasts(&round, &records, &confidence);
+                scheduler.observe_packed_forecasts(&round, &records, &confidence, &[]);
                 for seed in 0..4 {
                     scheduler.policy.adaptive_verification_alpha = [0.5, 1.0, 2.0, 4.0][seed];
                     let mut mask = 0u64;

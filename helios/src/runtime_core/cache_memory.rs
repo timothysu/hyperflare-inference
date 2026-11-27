@@ -40,17 +40,18 @@ impl Chunk {
         }
         let row = geometry.row.unit_bytes;
         let unit = geometry.planes[self.plane].unit_bytes;
+        let plane_bytes = geometry.page_capacity * unit;
         let end = self.row_offset + self.row_bytes;
         for id in
             (self.row_offset / row).max(execution)..end.div_ceil(row).min(geometry.row_capacity)
         {
             let first = self.offset + (id * row).saturating_sub(self.row_offset);
-            let last = self.offset + ((id + 1) * row).min(end) - self.row_offset;
-            let range = &mut aliases[(id - execution) as usize];
-            range.start = range.start.min((first / unit) as u32);
-            range.end = range
-                .end
-                .max(last.div_ceil(unit).min(geometry.page_capacity) as u32);
+            let last = (self.offset + ((id + 1) * row).min(end) - self.row_offset).min(plane_bytes);
+            if first < last {
+                let range = &mut aliases[(id - execution) as usize];
+                range.start = range.start.min((first / unit) as u32);
+                range.end = range.end.max(last.div_ceil(unit) as u32);
+            }
         }
     }
 }
@@ -221,8 +222,8 @@ impl Layout {
         if cursor < row_end {
             return Err(invalid("KV backing cannot cover continuation aliases"));
         }
-        for (snapshot, range) in aliases.iter_mut().enumerate() {
-            if (execution + snapshot as u64 + 1) * row_bytes <= fixed_bytes {
+        for range in &mut aliases {
+            if *range == (u32::MAX..0) {
                 *range = 0..0;
             } else if range.start >= range.end {
                 return Err(invalid("continuation alias lacks a KV conflict range"));
@@ -422,7 +423,7 @@ impl Layout {
         let mut covered = u32::MAX..0;
         for (planned, compact) in self.aliases.iter().zip(&mut aliases) {
             if planned.is_empty() {
-                if !compact.is_empty() {
+                if !Range::is_empty(compact) {
                     return None;
                 }
                 *compact = 0..0;
@@ -433,7 +434,7 @@ impl Layout {
             }
             covered.start = covered.start.min(planned.start);
             covered.end = covered.end.max(planned.end);
-            if compact.is_empty() || compact.start < planned.start || compact.end > covered.end {
+            if Range::is_empty(compact) || compact.start < planned.start || compact.end > covered.end {
                 return None;
             }
         }
@@ -606,6 +607,8 @@ mod tests {
                     unit_bytes: unit,
                 })
                 .collect(),
+            placement: Default::default(),
+            codec_fields: Vec::new(),
             snapshot_pages: Vec::new(),
         }
     }
@@ -1047,6 +1050,27 @@ mod tests {
     }
 
     #[test]
+    fn plane_granule_padding_backs_snapshots_without_kv_conflicts() {
+        let alignment = 2 << 20;
+        let geometry = geometry(256 << 10, &[64 << 10, 4 << 10], 1000, 8 + 16);
+        let layout = Layout::new(&geometry, 8, &[alignment; 2], alignment).unwrap();
+        assert_eq!(layout.aliases.len(), 16);
+        let mut unconflicted = 0usize;
+        for (snapshot, range) in layout.aliases.iter().enumerate() {
+            let pages = conflicts(&layout, &geometry, 8 + snapshot as u64);
+            if pages.is_empty() {
+                assert_eq!(range, &(0..0));
+                unconflicted += 1;
+            } else {
+                assert!(range.start <= range.end && range.end <= 1000);
+                assert!((range.start as u64) <= *pages.first().unwrap());
+                assert!((range.end as u64) > *pages.last().unwrap());
+            }
+        }
+        assert!(unconflicted > 0);
+    }
+
+    #[test]
     #[ignore = "requires an assigned CUDA_VISIBLE_DEVICES GPU"]
     fn cuda_aliases_preserve_rows_while_unowned_pages_are_rewritten() {
         use super::super::{
@@ -1252,6 +1276,8 @@ mod tests {
                     unit_bytes: row_bytes,
                 },
                 planes,
+                placement: Default::default(),
+                codec_fields: Vec::new(),
                 snapshot_pages: Vec::new(),
             };
             let layout =

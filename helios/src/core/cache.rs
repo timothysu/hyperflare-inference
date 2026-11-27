@@ -8522,11 +8522,7 @@ mod selection_tests {
                         state_rows: 2,
                         ..Default::default()
                     }),
-                    cluster: None,
-                    rebuild: None,
-                    engram: None,
-                    payloads: vec![],
-                    ranks: vec![],
+                    ..Default::default()
                 },
                 payloads: vec![],
                 ranks: vec![PublishRank {

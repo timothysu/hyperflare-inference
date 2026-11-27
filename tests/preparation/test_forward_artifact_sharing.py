@@ -101,6 +101,7 @@ class _Artifact:
         backend = StorageBackend.__new__(StorageBackend)
         backend.artifact = SimpleNamespace(inner_fn=SimpleNamespace(compiled_fn=execute))
         backend._serialized_artifact = b"portable backend"
+        backend._cuda_allocation_sizes = ()
         backend._tuning_frozen = False
         guards = SimpleNamespace(check=lambda arguments: isinstance(arguments["forward"], _Forward),
                                  check_verbose=lambda arguments: "forward type differs")
@@ -222,6 +223,7 @@ def _lending_rank(rank, world, store, root, outcome, lifecycle=None, fail_shutdo
                 int(capacity), 40 << 30, 16, 32 << 30, 8 << 30)
         aot.ForwardCache._load = lambda self, forward, path, required=False, before_run=None: aot.BoundForward(
             _Artifact(lambda owner: None), forward, True)
+        aot.ForwardCache._allocation_sizes = lambda self, path: ()
         dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
         cache = aot.ForwardCache.__new__(aot.ForwardCache)
         cache.root, cache.device, cache.headroom_bytes, cache.options = root, "cpu", 0, aot.MappingProxyType({})
@@ -400,6 +402,7 @@ def _cached_rank(rank, world, store, root, deferred, outcome):
             assert restored and all(reference() is None for reference in restored)
 
         aot.ForwardCache._load = load
+        aot.ForwardCache._allocation_sizes = lambda self, path: ()
         dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
         cache = aot.ForwardCache.__new__(aot.ForwardCache)
         cache.root, cache.device, cache.headroom_bytes, cache.options = root, "cpu", 0, aot.MappingProxyType({})

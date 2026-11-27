@@ -84,6 +84,27 @@ impl Reachability {
         Ok(this)
     }
 
+    pub(crate) fn execution(&mut self, execution: &wire::Execution) -> ExportResult<()> {
+        for buffer in &execution.buffers {
+            self.reference(
+                &buffer
+                    .reference
+                    .as_ref()
+                    .ok_or_else(|| invalid("execution buffer lacks allocation reference"))?
+                    .allocation,
+            )?;
+        }
+        for worker in &execution.persistent_workers {
+            if let Some(stop_flag) = &worker.stop_flag {
+                self.reference(&stop_flag.allocation)?;
+            }
+            if let Some(metrics) = &worker.metrics {
+                self.reference(&metrics.allocation)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn reference(&mut self, name: &str) -> ExportResult<()> {
         if !self.allocations.contains_key(name) {
             return Err(invalid(format!("unregistered graph allocation: {name}")));
@@ -584,5 +605,102 @@ mod tests {
         .unwrap();
         typed.contents(&source, 0, &bytes).unwrap();
         assert!(typed.reached.is_empty());
+    }
+
+    #[test]
+    fn persistent_worker_execution_roots_retain_stop_flag_allocation() {
+        let mut stop_alloc = allocation("host-stop", 0x0c00_0000_0000);
+        stop_alloc.memory = "mapped_host".into();
+        stop_alloc.nbytes = 4096;
+        let execution = wire::Execution {
+            persistent_workers: vec![wire::PersistentWorker {
+                worker_sm_count: 8,
+                graph: "worker_launch".into(),
+                stop_flag: Some(wire::Reference {
+                    allocation: "host-stop".into(),
+                    offset: 0,
+                }),
+                metrics: None,
+                metrics_count: 0,
+            }],
+            ..Default::default()
+        };
+        let mut reach = Reachability::new(&[stop_alloc], &[], &[], &[]).unwrap();
+        reach.execution(&execution).unwrap();
+        assert!(reach.reached.contains("host-stop"));
+    }
+
+    #[test]
+    fn persistent_worker_descriptors_retain_mapped_host_planes_when_not_numeric() {
+        let mut host_planes = Vec::new();
+        for (idx, label) in ["plane-a", "plane-b", "plane-c", "plane-d"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut alloc = allocation(
+                &format!("host-{label}"),
+                0x0c00_0000_0000 + idx as u64 * 0x10000,
+            );
+            alloc.memory = "mapped_host".into();
+            alloc.nbytes = 4096;
+            host_planes.push(alloc);
+        }
+        let mut worker_descs = allocation("worker_descs", 0x0800_0000_0000);
+        worker_descs.nbytes = 192;
+        let mut control_table = allocation("control_table", 0x0800_0001_0000);
+        control_table.nbytes = 192;
+
+        let mut allocations = host_planes.clone();
+        allocations.push(worker_descs.clone());
+        allocations.push(control_table.clone());
+
+        let mut desc_bytes = vec![0u8; 192];
+        for (idx, plane) in host_planes.iter().enumerate() {
+            desc_bytes[idx * 8..(idx + 1) * 8].copy_from_slice(&plane.address.to_le_bytes());
+        }
+        let mut ctrl_bytes = vec![0u8; 192];
+        for (idx, plane) in host_planes.iter().enumerate() {
+            let off = 8 + idx * 8;
+            ctrl_bytes[off..off + 8].copy_from_slice(&plane.address.to_le_bytes());
+        }
+
+        // Omitting pointer-bearing descriptor allocations from numeric ranges retains every mapped-host plane.
+        let mut worker_reach =
+            Reachability::new(&allocations, &[], &[], &["worker_descs".into()]).unwrap();
+        worker_reach.contents(&worker_descs, 0, &desc_bytes).unwrap();
+        let mut serve_reach =
+            Reachability::new(&allocations, &[], &[], &["control_table".into()]).unwrap();
+        serve_reach.contents(&control_table, 0, &ctrl_bytes).unwrap();
+        for plane in &host_planes {
+            assert!(
+                worker_reach.reached.contains(&plane.name),
+                "worker descriptor missed {}",
+                plane.name
+            );
+            assert!(
+                serve_reach.reached.contains(&plane.name),
+                "control table missed {}",
+                plane.name
+            );
+        }
+
+        // Classifying pointer-bearing descriptor allocations as numeric drops every mapped-host plane.
+        let numeric = [
+            (worker_descs.address, worker_descs.address + worker_descs.nbytes),
+            (
+                control_table.address,
+                control_table.address + control_table.nbytes,
+            ),
+        ];
+        let mut dropped_worker =
+            Reachability::new(&allocations, &numeric, &[], &["worker_descs".into()]).unwrap();
+        dropped_worker.contents(&worker_descs, 0, &desc_bytes).unwrap();
+        let mut dropped_serve =
+            Reachability::new(&allocations, &numeric, &[], &["control_table".into()]).unwrap();
+        dropped_serve.contents(&control_table, 0, &ctrl_bytes).unwrap();
+        for plane in &host_planes {
+            assert!(!dropped_worker.reached.contains(&plane.name));
+            assert!(!dropped_serve.reached.contains(&plane.name));
+        }
     }
 }

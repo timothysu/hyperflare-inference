@@ -128,11 +128,28 @@ remembered page-table lengths. Buffers remain alive through execution drain.
 A `StateView` describes a byte offset, row stride, and byte extent within a
 registered persistent buffer. Each graph lists read, write, or read/write
 accesses. Device-owned pending tokens name a readable state view. Initialization,
-restoration, prefill, scored prefill, resume, decode, speculative generation, and
-mixed generation declare writes when they produce that state. A host-owned
-pending token instead declares a value binding. Completion dependencies are
-derived for each selected graph from its actual inputs, rather than from the
-union of another operation's inputs.
+restoration, prefill, terminal prefill, scored prefill, resume, decode,
+speculative generation, and mixed generation declare writes when they produce
+that state. A host-owned pending token instead declares a value binding.
+Completion dependencies are derived for each selected graph from its actual
+inputs, rather than from the union of another operation's inputs.
+
+### Optional terminal prefill
+
+A prepared model under contract version 3 may optionally declare
+`TERMINAL_PREFILL` (`GraphOperation` 14, execution graph kind
+`terminal_prefill`) alongside `PREFILL` for a subset of aligned prefill token
+capacities. Models with asymmetric encoder and decoder prefill use `PREFILL`
+at those capacities to skip trailing continuation layers on intermediate chunks
+and use `TERMINAL_PREFILL` to rebuild complete continuation state at prompt
+ends, prefix-checkpoint boundaries, conditioned-window boundaries, and
+penultimate chunks leaving at most the tail-protection window.
+
+Helios derives the tail-protection window from the prepared catalog as the
+largest `PREFILL` capacity absent from the `TERMINAL_PREFILL` catalog; those
+smaller `PREFILL` graphs execute complete continuation state. When a model
+declares no `TERMINAL_PREFILL` graphs, or omits a capacity from the terminal
+catalog, Helios falls back to `PREFILL` with no contract version change.
 
 ### Complete speculative generation
 

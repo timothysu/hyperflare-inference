@@ -5,11 +5,17 @@
 """Serialize prepared Python forwards without tensor data or CUDA resources."""
 
 import ctypes
+import enum
+import importlib
+import importlib.util
+import inspect
 import io
 import pickle
 import socket
+import sys
 import types
 from contextvars import ContextVar
+from importlib.machinery import ExtensionFileLoader
 from threading import Lock, RLock, local
 
 import torch
@@ -19,6 +25,98 @@ from torch.utils.weak import WeakIdKeyDictionary
 _MODE = ContextVar('flare_forward_metadata_mode')
 _TENSOR_KINDS = ContextVar('flare_forward_tensor_kinds', default=None)
 _LOCK_TYPES = (type(Lock()), type(RLock()))
+_FAKE_TENSOR_ATTRS = (
+    frozenset(vars(FakeTensor(FakeTensorMode(), torch.empty(0, device='meta'), torch.device('cpu'))))
+    | frozenset(name for cls in FakeTensor.__mro__ for name in getattr(cls, '__annotations__', ()))
+    | {'_is_param', '_debug_context', '_debug_trace', 'item_memo', 'nested_int_memo', 'fake_device'}
+)
+_NON_OBJECT_NEW_TYPES = (
+    torch.Tensor, torch.nn.Module, enum.Enum,
+    int, float, str, bytes, dict, list, tuple, set, frozenset,
+)
+
+
+def _uses_custom_object_state(value):
+    return (
+        hasattr(value, '__dict__')
+        and type(value).__module__.startswith(('ignition.', 'b12x.'))
+        and not inspect.isclass(value)
+        and not isinstance(value, _NON_OBJECT_NEW_TYPES)
+    )
+
+
+def _tensor_user_attributes(tensor):
+    if not hasattr(tensor, '__dict__') or not vars(tensor):
+        return {}
+    if isinstance(tensor, FakeTensor):
+        return {key: value for key, value in vars(tensor).items() if key not in _FAKE_TENSOR_ATTRS}
+    return dict(vars(tensor))
+
+
+def _is_importable_module(name, parent_name=''):
+    search_path = None
+    if parent_name:
+        parent = sys.modules.get(parent_name)
+        search_path = getattr(parent, '__path__', None)
+        if search_path is None:
+            try:
+                parent_spec = importlib.util.find_spec(parent_name)
+            except (ImportError, ValueError):
+                return False
+            search_path = None if parent_spec is None else parent_spec.submodule_search_locations
+        if search_path is None:
+            return False
+    for finder in sys.meta_path:
+        find_spec = getattr(finder, 'find_spec', None)
+        if find_spec is not None and find_spec(name, search_path) is not None:
+            return True
+    return False
+
+
+def _op_registration(overload):
+    from torch._library.custom_ops import _maybe_get_opdef
+
+    definition = _maybe_get_opdef(overload)
+    if definition is None:
+        return None, False
+    init_fn = definition._init_fn
+    if '<locals>' in getattr(init_fn, '__qualname__', ''):
+        return None, True
+    module_name = getattr(init_fn, '__module__', None)
+    if module_name is None:
+        return None, False
+    module = sys.modules.get(module_name)
+    spec = None if module is None else getattr(module, '__spec__', None)
+    if spec is not None and isinstance(spec.loader, ExtensionFileLoader):
+        if not _is_importable_module(module.__name__, spec.parent):
+            return None, True
+    return module_name, False
+
+
+def _restore_torch_op(namespace, opname, overload, registration):
+    try:
+        if registration is not None:
+            importlib.import_module(registration)
+        packet = getattr(getattr(torch.ops, namespace), opname)
+        return getattr(packet, overload)
+    except Exception:
+        return _Unavailable(f'Torch operator binding {namespace}.{opname}.{overload}')
+
+
+def _restore_torch_op_packet(namespace, opname, registration):
+    try:
+        if registration is not None:
+            importlib.import_module(registration)
+        return getattr(getattr(torch.ops, namespace), opname)
+    except Exception:
+        return _Unavailable(f'Torch operator binding {namespace}.{opname}')
+
+
+def _restore_torch_op_namespace(name):
+    prefix = f'{name}::'
+    if name == 'higher_order' or any(op.startswith(prefix) for op in torch._C._dispatch_get_all_op_names()):
+        return getattr(torch.ops, name)
+    return _Unavailable(f'Torch operator binding {name}')
 
 
 class _Unavailable:
@@ -104,8 +202,12 @@ class _ForwardPickler(pickle.Pickler):
                 raise TypeError(f'unsupported forward tensor subclass: {type(value)}')
             storage = value.untyped_storage()
             owner = self.storages.setdefault(storage._cdata, _Storage(storage.nbytes()))
-            return _tensor, (owner, tuple(value.shape), value.stride(), value.storage_offset(),
-                             value.dtype, value.device, value.requires_grad, type(value))
+            args = (owner, tuple(value.shape), value.stride(), value.storage_offset(),
+                    value.dtype, value.device, value.requires_grad, type(value))
+            user_attrs = _tensor_user_attributes(value)
+            if user_attrs:
+                return _tensor, args, user_attrs, None, None, _set_state
+            return _tensor, args
         if isinstance(value, _PreparedSlot):
             # Tracing needs selected layouts; normal plan pickling clears prepared state.
             return _object, (type(value),), dict(vars(value)), None, None, _set_state
@@ -118,6 +220,26 @@ class _ForwardPickler(pickle.Pickler):
             return _deserialize_triton_kernel, (_serialize_triton_kernel(value),)
         if isinstance(value, types.MappingProxyType):
             return _mapping_proxy, (dict(value),)
+        if isinstance(value, torch._ops.OpOverload):
+            registration, local_only = _op_registration(value)
+            if local_only:
+                return _Unavailable, (f'Torch operator binding {value}',)
+            return _restore_torch_op, (value.namespace, value._opname, value._overloadname, registration)
+        if isinstance(value, torch._ops.OpOverloadPacket):
+            qualified = getattr(value, '_qualified_op_name', '')
+            if '::' not in qualified:
+                return _Unavailable, (f'Torch operator binding {value}',)
+            namespace, opname = qualified.split('::', 1)
+            registration, local_only = None, False
+            for overload_name in value.overloads():
+                registration, local_only = _op_registration(getattr(value, overload_name))
+                if registration is not None or local_only:
+                    break
+            if local_only:
+                return _Unavailable, (f'Torch operator binding {value}',)
+            return _restore_torch_op_packet, (namespace, opname, registration)
+        if isinstance(value, torch._ops._OpNamespace):
+            return _restore_torch_op_namespace, (value.name,)
         from tvm_ffi.core import CObject
 
         if isinstance(value, CObject) or (not isinstance(value, type) and '<locals>' in type(value).__qualname__):
@@ -136,16 +258,23 @@ class _ForwardPickler(pickle.Pickler):
         if not isinstance(value, type) and (hasattr(type(value), '__del__')
                 or type(value).__module__.startswith('cutlass._mlir.')):
             return _Unavailable, (f'{type(value).__module__}.{type(value).__qualname__}',)
-        if isinstance(value, types.BuiltinMethodType) and isinstance(value.__self__, (*_LOCK_TYPES, local)):
-            return _Unavailable, (f'{type(value.__self__).__qualname__}.{value.__name__}',)
+        if isinstance(value, types.BuiltinMethodType) and (
+                isinstance(value.__self__, (*_LOCK_TYPES, local))
+                or not value.__name__
+                or value.__name__ == '<lambda>'):
+            owner = type(value).__qualname__ if value.__self__ is None else type(value.__self__).__qualname__
+            return _Unavailable, (f'{owner}.{value.__name__ or "<anonymous>"}',)
         if isinstance(value, types.FunctionType) and (
                 '<locals>' in value.__qualname__ or value.__name__ == '<lambda>'):
             return _Unavailable, (value.__qualname__,)
         if isinstance(value, types.ModuleType):
-            import importlib
+            spec = value.__spec__
+            if spec is not None and isinstance(spec.loader, ExtensionFileLoader):
+                if not _is_importable_module(value.__name__, spec.parent):
+                    # Preparation-built extensions are owned by the rank, not compiler workers.
+                    return _Unavailable, (f'native extension {value.__name__}',)
             return importlib.import_module, (value.__name__,)
-        if (type(value).__module__.startswith(('b12x.', 'ignition.'))
-                and hasattr(type(value), '__getattr__') and hasattr(value, '__dict__')):
+        if _uses_custom_object_state(value) and hasattr(type(value), '__getattr__'):
             return _object, (type(value),), dict(vars(value)), None, None, _set_state
         return NotImplemented
 

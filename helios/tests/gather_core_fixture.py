@@ -1,4 +1,4 @@
-"""Export device-selected column gathers for native replay after Python exits."""
+"""Export prepared column gathers for native replay after Python exits."""
 
 from datetime import timedelta
 import json
@@ -22,7 +22,6 @@ def _rank(rank, directory):
     from ignition.preparation.capture import capture_forwards
     from ignition.preparation.collectives import (
         CollectivePreparation, create_all_gather_runtime, create_varlen_gather_runtime)
-    from ignition.preparation.collective_ladder import load
     from ignition.preparation.execution import GraphSignature
     from ignition.preparation.model import PreparedModel
     from ignition.preparation.module_images import ModuleImages
@@ -47,9 +46,7 @@ def _rank(rank, directory):
                     columns=columns, ipc=storage.peer_storage) for columns in (256, 2048, 256, 16384)]
                 session = RecordedPreparationSession(device=device, checkpoint="gather-core",
                     workload_schema="tp4-column-bits", numerical_policy="exact", coordinator=coordinator,
-                    collective_tuning="runtime", compile_workers=4, benchmark_storage=storage,
-                    collective_ladder=load(Path(__file__).resolve().parents[2] /
-                        "ignition/preparation/ladders/gb202_pcie_tp4.json"))
+                    compile_workers=4, benchmark_storage=storage)
                 shapes = {"init": (1, torch.bfloat16, 0, 128), "decode": (1, torch.float32, 0, 128),
                           "prefill64": (16, torch.float8_e4m3fn, 1, 512),
                           "prefill128": (4, torch.bfloat16, 3, 8192),
@@ -73,8 +70,6 @@ def _rank(rank, directory):
                 rank_tensor = torch.tensor([rank], dtype=torch.int64, device=device)
                 record_call = RecordForward(windows, rank_tensor, 4, cache, table, output, window)
                 session.tune(show_progress=False)
-                # BF16 and FP32 views share a producer; an independent channel has its own.
-                assert len(session._startup_collectives.groups) == 4
                 signatures = {name: GraphSignature("prefill" if name.startswith("prefill") else name, 1,
                     int(name.removeprefix("prefill")) if name.startswith("prefill") else 1) for name in shapes}
                 signatures["prefill256"] = GraphSignature("prefill", 1, 256)
@@ -106,17 +101,6 @@ def _rank(rank, directory):
                 prepared = PreparedModel(device=rank, graphs=graphs, buffers=buffers, signatures=signatures,
                     max_active=1, session=session, memory_report={}, server_config=configuration,
                     close_resources=runtimes, resources=(operations, sources, outputs, storage, stream, record_call))
-                assert prepared.tuned_bindings["init"][0].tuning_graph == prepared.tuned_bindings["decode"][0].tuning_graph
-                assert prepared.tuned_bindings["resume"][0].tuning_graph != prepared.tuned_bindings["init"][0].tuning_graph
-                profiles = []
-                for name, operation in operations.items():
-                    binding, = prepared.tuned_bindings[name]
-                    status = prepared.tuning_graphs[binding.tuning_graph].status_buffer
-                    allowed = [(int(mode == "word_exchange") << 16) | active
-                               for mode, active in operation.runtime_profiles]
-                    profiles.append(dict(buffer=binding.buffer, status=status, allowed=allowed))
-                    prepared.buffers[binding.buffer].fill_(-1)
-                    prepared.buffers[status].fill_(-1)
                 cases = []
                 for step in range(3):
                     for name, (rows, _, _, width) in shapes.items():
@@ -146,7 +130,7 @@ def _rank(rank, directory):
                 dist.barrier()
                 export_model(prepared, images, storage, directory / f"rank-{rank}.json",
                     options={}, bundle_only=rank != 0, sources=True)
-                (folder / "metadata.json").write_text(json.dumps(dict(cases=cases, profiles=profiles,
+                (folder / "metadata.json").write_text(json.dumps(dict(cases=cases,
                     process=_process(), owned=list(storage.peer_storage.owned.items()))))
                 dist.barrier()
             finally:

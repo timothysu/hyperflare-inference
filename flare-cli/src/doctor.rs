@@ -22,37 +22,36 @@ const NVIDIA_PARAMS_PATH: &str = "/proc/driver/nvidia/params";
 const CMDLINE_PATH: &str = "/proc/cmdline";
 const SYSFS_ROOT: &str = "/sys";
 
-const EXPECTED_REGISTRY_DWORDS: [(&str, &str, u64, &str); 5] = [
-    ("nvidia.registry_dwords.force_p2p", "ForceP2P", 0x11, "0x11"),
+const EXPECTED_REGISTRY_DWORDS: [(&str, &str, &[u64], &str); 4] = [
+    (
+        "nvidia.registry_dwords.force_p2p",
+        "ForceP2P",
+        &[0x11],
+        "0x11",
+    ),
     (
         "nvidia.registry_dwords.rm_force_p2p_type",
         "RMForceP2PType",
-        1,
+        &[1],
         "1",
     ),
     (
         "nvidia.registry_dwords.rm_pcie_p2p_type",
         "RMPcieP2PType",
-        2,
-        "2",
+        &[1, 2],
+        "1 or 2",
     ),
     (
         "nvidia.registry_dwords.grdma_pci_topo_check_override",
         "GrdmaPciTopoCheckOverride",
-        1,
-        "1",
-    ),
-    (
-        "nvidia.registry_dwords.enable_resizable_bar",
-        "EnableResizableBar",
-        1,
+        &[1],
         "1",
     ),
 ];
 
 const NVIDIA_MODPROBE_REMEDIATION: &str = "Configure /etc/modprobe.d/nvidia.conf with: \
 options nvidia NVreg_EnablePCIERelaxedOrderingMode=1 NVreg_EnableResizableBar=1 \
-NVreg_RegistryDwords=\"ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1;EnableResizableBar=1\" \
+NVreg_RegistryDwords=\"ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1\" \
 and reload the driver or reboot.";
 
 const IOMMU_REMEDIATION: &str =
@@ -678,12 +677,12 @@ pub(crate) fn check_nvidia_params(params_text: std::result::Result<&str, String>
 
     let dwords_raw = params.get("RegistryDwords").map(String::as_str).unwrap_or("");
     let dwords = parse_registry_dwords(dwords_raw);
-    for (id, key, expected_val, expected_display) in EXPECTED_REGISTRY_DWORDS {
+    for (id, key, expected_vals, expected_display) in EXPECTED_REGISTRY_DWORDS {
         let actual = dwords.get(key).cloned();
         let matches = actual
             .as_deref()
             .and_then(parse_u64_param)
-            .is_some_and(|v| v == expected_val);
+            .is_some_and(|v| expected_vals.contains(&v));
         checks.push(Check {
             id: id.into(),
             name: format!("RegistryDwords {key}"),
@@ -1502,23 +1501,25 @@ mod tests {
 ResmanDebugLevel: 4294967295
 EnablePCIERelaxedOrderingMode: 1
 EnableResizableBar: 1
-RegistryDwords: "ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1;EnableResizableBar=1"
+RegistryDwords: "ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1"
 "#;
 
     #[test]
     fn nvidia_params_parser_and_checks_validate_all_required_fields() {
         let checks = check_nvidia_params(Ok(HEALTHY_NVIDIA_PARAMS));
-        assert_eq!(checks.len(), 7);
+        assert_eq!(checks.len(), 6);
         assert!(
             checks.iter().all(|c| c.status == CheckStatus::Pass),
             "{checks:#?}"
         );
 
-        // Decimal ForceP2P=17 equals 0x11; extra whitespace and extra keys are accepted.
+        // Decimal ForceP2P=17 equals 0x11; RMPcieP2PType=1 (forced BAR1) and 2 (auto) are both
+        // accepted; extra whitespace and extra keys (including redundant EnableResizableBar=1 in
+        // RegistryDwords) are accepted.
         let variant = r#"
 EnablePCIERelaxedOrderingMode: 1
 EnableResizableBar: 1
-RegistryDwords: "OtherKey=42; ForceP2P = 17 ; RMForceP2PType=0x1; RMPcieP2PType=2; GrdmaPciTopoCheckOverride=1; EnableResizableBar=1;"
+RegistryDwords: "OtherKey=42; ForceP2P = 17 ; RMForceP2PType=0x1; RMPcieP2PType=1; GrdmaPciTopoCheckOverride=1; EnableResizableBar=1;"
 "#;
         let checks = check_nvidia_params(Ok(variant));
         assert!(
@@ -1526,10 +1527,30 @@ RegistryDwords: "OtherKey=42; ForceP2P = 17 ; RMForceP2PType=0x1; RMPcieP2PType=
             "{checks:#?}"
         );
 
+        // Out-of-range RMPcieP2PType=3 or omitted RMPcieP2PType fails.
+        for bad_val in [Some("3"), None] {
+            let dwords = match bad_val {
+                Some(v) => format!(
+                    "ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType={v};GrdmaPciTopoCheckOverride=1"
+                ),
+                None => "ForceP2P=0x11;RMForceP2PType=1;GrdmaPciTopoCheckOverride=1".to_owned(),
+            };
+            let text = format!(
+                "EnablePCIERelaxedOrderingMode: 1\nEnableResizableBar: 1\nRegistryDwords: \"{dwords}\"\n"
+            );
+            let checks = check_nvidia_params(Ok(&text));
+            let by_id: BTreeMap<&str, &Check> =
+                checks.iter().map(|c| (c.id.as_str(), c)).collect();
+            assert_eq!(
+                by_id["nvidia.registry_dwords.rm_pcie_p2p_type"].status,
+                CheckStatus::Fail
+            );
+        }
+
         // Missing or wrong values fail individually with expected/actual details.
         let broken = r#"
 EnablePCIERelaxedOrderingMode: 0
-EnableResizableBar: 1
+EnableResizableBar: 0
 RegistryDwords: "ForceP2P=0x01;RMForceP2PType=1;RMPcieP2PType=0"
 "#;
         let checks = check_nvidia_params(Ok(broken));
@@ -1538,7 +1559,10 @@ RegistryDwords: "ForceP2P=0x01;RMForceP2PType=1;RMPcieP2PType=0"
             by_id["nvidia.enable_pcie_relaxed_ordering_mode"].status,
             CheckStatus::Fail
         );
-        assert_eq!(by_id["nvidia.enable_resizable_bar"].status, CheckStatus::Pass);
+        assert_eq!(
+            by_id["nvidia.enable_resizable_bar"].status,
+            CheckStatus::Fail
+        );
         assert_eq!(
             by_id["nvidia.registry_dwords.force_p2p"].status,
             CheckStatus::Fail
@@ -1555,9 +1579,9 @@ RegistryDwords: "ForceP2P=0x01;RMForceP2PType=1;RMPcieP2PType=0"
             by_id["nvidia.registry_dwords.grdma_pci_topo_check_override"].status,
             CheckStatus::Fail
         );
-        assert_eq!(
-            by_id["nvidia.registry_dwords.enable_resizable_bar"].status,
-            CheckStatus::Fail
+        assert!(
+            !by_id.contains_key("nvidia.registry_dwords.enable_resizable_bar"),
+            "EnableResizableBar is verified via the top-level driver param, not duplicated in RegistryDwords"
         );
         assert!(
             by_id["nvidia.registry_dwords.force_p2p"]
@@ -1879,7 +1903,7 @@ RegistryDwords: "ForceP2P=0x01;RMForceP2PType=1;RMPcieP2PType=0"
         // Healthy params + IOMMU pass `evaluate_run_basic_checks` even when ACS config is absent/enabled.
         fs::write(
             &params,
-            "EnablePCIERelaxedOrderingMode: 1\nEnableResizableBar: 1\nRegistryDwords: \"ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1;EnableResizableBar=1\"\n",
+            "EnablePCIERelaxedOrderingMode: 1\nEnableResizableBar: 1\nRegistryDwords: \"ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1\"\n",
         )
         .unwrap();
         let healthy = evaluate_run_basic_checks(&bdfs, dir.path(), &params, &cmdline);

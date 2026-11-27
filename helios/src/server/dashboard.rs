@@ -8,8 +8,13 @@
 
 mod prefill;
 mod scheduler;
+mod worker;
 
 pub(super) use prefill::PrefillPlot;
+pub use worker::{
+    MoverTelemetry, WorkerRates, WorkerView, compute_rates as compute_worker_rates,
+    is_sm103_expert_mover,
+};
 
 use std::{
     collections::VecDeque,
@@ -59,9 +64,12 @@ static VISIBLE: AtomicBool = AtomicBool::new(false);
 /// re-exported so dependents render with the same versions.
 pub mod view {
     pub use super::{
-        BACKGROUND, CYAN, GOLD, GREEN, History, MUTED, PURPLE, Rates, Series, TEXT, gibibytes,
+        BACKGROUND, CYAN, GOLD, GREEN, History, MUTED, MoverTelemetry, PURPLE, Rates, Series, TEXT,
+        WorkerRates, WorkerView, compute_worker_rates, gibibytes, is_sm103_expert_mover,
         kv_cache_lines, plot, rate, weight_bandwidth,
     };
+    pub use crate::execution::{PersistentWorkerSnapshot, WorkerState};
+    pub use crate::server::WorkerTelemetryResponse;
     pub use crate::server::metrics::Snapshot;
     pub use {crossterm, ratatui};
 }
@@ -119,6 +127,8 @@ impl Dashboard {
                     let start = Instant::now();
                     let mut history = History::new(start, metrics.snapshot(learned_drafter));
                     let mut scheduler = scheduler::SchedulerView::default();
+                    let mut worker = worker::WorkerView::new(start);
+                    worker.sample(start, metrics.persistent_worker_snapshot());
                     let mut pane = Pane::Overview;
                     let _telemetry = Telemetry(&metrics);
                     metrics.prefill_plot.get_or_init(Box::default);
@@ -133,6 +143,10 @@ impl Dashboard {
                                 &metrics.scheduler_trace,
                                 super::observation::monotonic_ns(),
                             );
+                            worker.sample(now, metrics.persistent_worker_snapshot());
+                            if !worker.is_present() && pane == Pane::Worker {
+                                pane = Pane::Overview;
+                            }
                             sampled = now;
                             redraw = true;
                         }
@@ -144,7 +158,12 @@ impl Dashboard {
                                 }
                                 match event::read()? {
                                     Event::Key(key) => {
-                                        redraw |= navigate(&mut pane, &mut scheduler, key)
+                                        redraw |= navigate(
+                                            &mut pane,
+                                            &mut scheduler,
+                                            worker.is_present(),
+                                            key,
+                                        )
                                     }
                                     Event::Resize(..) => redraw = true,
                                     _ => {}
@@ -153,7 +172,15 @@ impl Dashboard {
                         }
                         if redraw {
                             terminal.draw(|frame| {
-                                render_pane(frame, &title, &history, &scheduler, &metrics, pane)
+                                render_pane(
+                                    frame,
+                                    &title,
+                                    &history,
+                                    &scheduler,
+                                    &worker,
+                                    &metrics,
+                                    pane,
+                                )
                             })?;
                             redraw = false;
                         }
@@ -257,17 +284,32 @@ impl Drop for InputMode {
 enum Pane {
     Overview,
     Scheduler,
+    Worker,
 }
 
-fn navigate(pane: &mut Pane, scheduler: &mut scheduler::SchedulerView, key: KeyEvent) -> bool {
+fn navigate(
+    pane: &mut Pane,
+    scheduler: &mut scheduler::SchedulerView,
+    has_worker: bool,
+    key: KeyEvent,
+) -> bool {
     if key.kind == KeyEventKind::Release {
         return false;
     }
     match key.code {
         KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-            *pane = match pane {
-                Pane::Overview => Pane::Scheduler,
-                Pane::Scheduler => Pane::Overview,
+            let backwards = matches!(key.code, KeyCode::Left | KeyCode::BackTab);
+            *pane = if has_worker {
+                match (*pane, backwards) {
+                    (Pane::Overview, false) | (Pane::Worker, true) => Pane::Scheduler,
+                    (Pane::Scheduler, false) | (Pane::Overview, true) => Pane::Worker,
+                    _ => Pane::Overview,
+                }
+            } else {
+                match *pane {
+                    Pane::Overview => Pane::Scheduler,
+                    Pane::Scheduler | Pane::Worker => Pane::Overview,
+                }
             };
             true
         }
@@ -288,6 +330,7 @@ fn render_pane(
     title: &str,
     history: &History,
     scheduler: &scheduler::SchedulerView,
+    worker: &worker::WorkerView,
     metrics: &Metrics,
     pane: Pane,
 ) {
@@ -316,20 +359,28 @@ fn render_pane(
             },
         )
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" ← → ", Style::default().fg(MUTED)),
-            tab(" Overview ", pane == Pane::Overview),
-            Span::raw(" "),
-            tab(" Scheduler ", pane == Pane::Scheduler),
-        ])),
-        rows[1],
-    );
-    match pane {
-        Pane::Overview => render_overview(frame, history, metrics, rows[2]),
+    let effective_pane = if pane == Pane::Worker && !worker.is_present() {
+        Pane::Overview
+    } else {
+        pane
+    };
+    let mut tabs = vec![
+        Span::styled(" ← → ", Style::default().fg(MUTED)),
+        tab(" Overview ", effective_pane == Pane::Overview),
+        Span::raw(" "),
+        tab(" Scheduler ", effective_pane == Pane::Scheduler),
+    ];
+    if worker.is_present() {
+        tabs.push(Span::raw(" "));
+        tabs.push(tab(worker.tab_label(), effective_pane == Pane::Worker));
+    }
+    frame.render_widget(Paragraph::new(Line::from(tabs)), rows[1]);
+    match effective_pane {
+        Pane::Overview => render_overview(frame, history, worker, metrics, rows[2]),
         Pane::Scheduler => {
             scheduler.render(frame, rows[2], history.snapshot, &metrics.scheduler_trace)
         }
+        Pane::Worker => worker.render_full(frame, rows[2]),
     }
 }
 
@@ -508,7 +559,13 @@ fn render_header(frame: &mut Frame, title: &str, history: &History, area: Rect) 
     );
 }
 
-fn render_overview(frame: &mut Frame, history: &History, metrics: &Metrics, area: Rect) {
+fn render_overview(
+    frame: &mut Frame,
+    history: &History,
+    worker: &worker::WorkerView,
+    metrics: &Metrics,
+    area: Rect,
+) {
     frame.render_widget(
         Block::default().style(Style::default().bg(BACKGROUND).fg(TEXT)),
         area,
@@ -521,29 +578,41 @@ fn render_overview(frame: &mut Frame, history: &History, metrics: &Metrics, area
     let depth = r.depth.map_or_else(|| "—".into(), |v| format!("{v:.2}"));
     let [kv_tokens] = kv_cache_lines(s);
     if area.width < 64 || area.height < 22 {
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(format!(" Prefill      {} tok/s", rate(r.prefill))),
-                Line::from(format!(" Generation   {} tok/s", rate(r.generated))),
-                Line::from(format!(" Verify       {} steps/s", rate(r.verify))),
-                Line::from(format!(" Acceptance   {acceptance} drafts/round")),
-                Line::from(format!(" Verify depth {depth} drafts/step")),
-                Line::from(format!(" Weights      {}", weight_bandwidth(s, r))),
-                Line::from(format!(" Active {}  Queued {}", s.active, s.pending)),
-                kv_tokens,
-                Line::from(" Enlarge terminal for history plots.")
-                    .style(Style::default().fg(MUTED)),
-            ]),
-            area,
+        let mut lines = vec![
+            Line::from(format!(" Prefill      {} tok/s", rate(r.prefill))),
+            Line::from(format!(" Generation   {} tok/s", rate(r.generated))),
+            Line::from(format!(" Verify       {} steps/s", rate(r.verify))),
+            Line::from(format!(" Acceptance   {acceptance} drafts/round")),
+            Line::from(format!(" Verify depth {depth} drafts/step")),
+            Line::from(format!(" Weights      {}", weight_bandwidth(s, r))),
+            Line::from(format!(" Active {}  Queued {}", s.active, s.pending)),
+            kv_tokens,
+        ];
+        if let Some(worker_line) = worker.compact_line() {
+            lines.push(worker_line);
+        }
+        lines.push(
+            Line::from(" Enlarge terminal for history plots.").style(Style::default().fg(MUTED)),
         );
+        frame.render_widget(Paragraph::new(lines), area);
         return;
     }
-    let rows = Layout::vertical([
-        Constraint::Min(8),
-        Constraint::Min(8),
-        Constraint::Length(4),
-    ])
-    .split(area);
+    let rows = if worker.is_present() {
+        Layout::vertical([
+            Constraint::Min(7),
+            Constraint::Min(7),
+            Constraint::Length(4),
+            Constraint::Length(4),
+        ])
+        .split(area)
+    } else {
+        Layout::vertical([
+            Constraint::Min(8),
+            Constraint::Min(8),
+            Constraint::Length(4),
+        ])
+        .split(area)
+    };
     let top =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[0]);
     let bottom =
@@ -606,6 +675,9 @@ fn render_overview(frame: &mut Frame, history: &History, metrics: &Metrics, area
         ]),
         rows[2],
     );
+    if worker.is_present() {
+        worker.render_overview_panel(frame, rows[3]);
+    }
 }
 
 /// Plot series: legend name (empty for none), line color, and rate selector.
@@ -694,12 +766,15 @@ mod tests {
         history.sample(start + Duration::from_secs(23), Snapshot::default());
         let metrics = Metrics::default();
         let scheduler = scheduler::SchedulerView::default();
+        let worker = worker::WorkerView::new(start);
         let title = "deepseek-ai/DeepSeek-V4.1-Flash · 127.0.0.1:8001";
         let mut headers = Vec::new();
         for pane in [Pane::Overview, Pane::Scheduler] {
             let mut terminal = Terminal::new(TestBackend::new(150, 35)).unwrap();
             terminal
-                .draw(|frame| render_pane(frame, title, &history, &scheduler, &metrics, pane))
+                .draw(|frame| {
+                    render_pane(frame, title, &history, &scheduler, &worker, &metrics, pane)
+                })
                 .unwrap();
             let buffer = terminal.backend().buffer();
             let lines: Vec<String> = buffer
@@ -710,6 +785,8 @@ mod tests {
             assert!(lines[0].contains("FLARE  / HELIOS  ● READY    00:00:23"));
             assert!(lines[0].contains(title));
             assert!(lines[1].contains("Overview") && lines[1].contains("Scheduler"));
+            assert!(!lines[1].contains("Worker") && !lines[1].contains("Parallax"));
+            assert!(!lines.join("\n").contains("WORKER ·") && !lines.join("\n").contains("PARALLAX ·"));
             assert_eq!(lines.join("\n").matches(title).count(), 1);
             headers.push(lines[0].clone());
         }
@@ -721,14 +798,108 @@ mod tests {
         let mut pane = Pane::Overview;
         let mut scheduler = scheduler::SchedulerView::default();
         let mut key = KeyEvent::new(KeyCode::Right, event::KeyModifiers::NONE);
-        assert!(navigate(&mut pane, &mut scheduler, key));
+        assert!(navigate(&mut pane, &mut scheduler, false, key));
         assert_eq!(pane, Pane::Scheduler);
         key.kind = KeyEventKind::Release;
-        assert!(!navigate(&mut pane, &mut scheduler, key));
+        assert!(!navigate(&mut pane, &mut scheduler, false, key));
         assert_eq!(pane, Pane::Scheduler);
         key = KeyEvent::new(KeyCode::Left, event::KeyModifiers::NONE);
-        assert!(navigate(&mut pane, &mut scheduler, key));
+        assert!(navigate(&mut pane, &mut scheduler, false, key));
         assert_eq!(pane, Pane::Overview);
+
+        // When a persistent worker is active, navigation cycles through Overview -> Scheduler -> Worker.
+        let right = KeyEvent::new(KeyCode::Right, event::KeyModifiers::NONE);
+        assert!(navigate(&mut pane, &mut scheduler, true, right));
+        assert_eq!(pane, Pane::Scheduler);
+        assert!(navigate(&mut pane, &mut scheduler, true, right));
+        assert_eq!(pane, Pane::Worker);
+        assert!(navigate(&mut pane, &mut scheduler, true, right));
+        assert_eq!(pane, Pane::Overview);
+        let left = KeyEvent::new(KeyCode::Left, event::KeyModifiers::NONE);
+        assert!(navigate(&mut pane, &mut scheduler, true, left));
+        assert_eq!(pane, Pane::Worker);
+    }
+
+    #[test]
+    fn dashboard_embeds_worker_panel_and_tab_when_persistent_worker_is_present() {
+        use crate::execution::{PersistentWorkerSnapshot, WorkerState};
+        let start = Instant::now();
+        let mut history = History::new(start, Snapshot::default());
+        history.sample(start + Duration::from_secs(2), Snapshot::default());
+        let metrics = Metrics::default();
+        let scheduler = scheduler::SchedulerView::default();
+        let mut worker = worker::WorkerView::new(start);
+        worker.sample(
+            start,
+            Some(PersistentWorkerSnapshot {
+                name: "sm103_expert_mover".into(),
+                worker_sm_count: 8,
+                state: WorkerState::Running,
+                counters: vec![10, 1_000_000_000, 1, 2, (3u64 << 32) | 9, 90, 10, 12],
+            }),
+        );
+        worker.sample(
+            start + Duration::from_secs(2),
+            Some(PersistentWorkerSnapshot {
+                name: "sm103_expert_mover".into(),
+                worker_sm_count: 8,
+                state: WorkerState::Running,
+                counters: vec![110, 5_000_000_000, 3, 5, (7u64 << 32) | 42, 286, 14, 132],
+            }),
+        );
+
+        let title = "deepseek-ai/DeepSeek-V4.1-Flash · 127.0.0.1:8001";
+        let mut overview = Terminal::new(TestBackend::new(140, 34)).unwrap();
+        overview
+            .draw(|frame| {
+                render_pane(
+                    frame,
+                    title,
+                    &history,
+                    &scheduler,
+                    &worker,
+                    &metrics,
+                    Pane::Overview,
+                )
+            })
+            .unwrap();
+        let overview_text: String = overview
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(overview_text.contains("Parallax"));
+        assert!(overview_text.contains("PARALLAX"));
+        assert!(overview_text.contains("8 SMs"));
+        assert!(overview_text.contains("L07:E42"));
+
+        let mut worker_pane = Terminal::new(TestBackend::new(140, 34)).unwrap();
+        worker_pane
+            .draw(|frame| {
+                render_pane(
+                    frame,
+                    title,
+                    &history,
+                    &scheduler,
+                    &worker,
+                    &metrics,
+                    Pane::Worker,
+                )
+            })
+            .unwrap();
+        let worker_text: String = worker_pane
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(worker_text.contains("HBM HIT RATE"));
+        assert!(worker_text.contains("MOVER BANDWIDTH"));
+        assert!(worker_text.contains("2.00 GB/s"));
+        assert!(worker_text.contains("L07:E42"));
     }
 
     #[test]
@@ -843,10 +1014,11 @@ mod tests {
                 },
             );
         }
+        let worker = worker::WorkerView::new(start);
         for (width, height) in [(120, 35), (80, 24), (80, 20), (40, 12), (1, 1), (0, 0)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|frame| render_overview(frame, &history, &metrics, frame.area()))
+                .draw(|frame| render_overview(frame, &history, &worker, &metrics, frame.area()))
                 .unwrap();
             let content: String = terminal
                 .backend()

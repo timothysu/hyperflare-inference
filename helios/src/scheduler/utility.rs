@@ -24,6 +24,27 @@ impl ServicePrice {
         coefficient.ln() + self.log_inverse_rate
     }
 
+    /// Rescales a stored physical price when a request's feasible rate changes
+    /// across prefill chunks, preserving its normalized GPU-time share `p * m`.
+    pub fn rebase(&mut self, previous_rate: f64, current_rate: f64) {
+        debug_assert!(previous_rate.is_finite() && previous_rate > 0.0);
+        debug_assert!(current_rate.is_finite() && current_rate > 0.0);
+        if current_rate != previous_rate {
+            self.log_inverse_rate += (previous_rate / current_rate).ln();
+        }
+    }
+
+    /// Caps a stored physical price when feasible rate increases across a phase
+    /// boundary (such as a short padded prefill tail entering decode), preventing
+    /// normalized GPU-time share `p * m` from inflating above its pre-transition value.
+    pub fn rebase_upward(&mut self, previous_rate: f64, current_rate: f64) {
+        debug_assert!(previous_rate.is_finite() && previous_rate > 0.0);
+        debug_assert!(current_rate.is_finite() && current_rate > 0.0);
+        if current_rate > previous_rate {
+            self.log_inverse_rate += (previous_rate / current_rate).ln();
+        }
+    }
+
     /// Integrate dp/dt = (f - p*y)/(m*tau) for physical service rate y.
     /// An unserved request's price grows linearly with occupied elapsed time.
     pub fn observe(
@@ -228,6 +249,30 @@ mod tests {
         rate.observe(30.0, 8.0, 10.0, 100.0);
         assert!(rate.log_inverse_rate.is_finite());
         assert!(rate.log_price(4.0) < 10.0);
+    }
+
+    #[test]
+    fn rebase_and_rebase_upward_preserve_and_cap_normalized_price() {
+        let mut price = ServicePrice::initial(50.0);
+        let normalized_before = price.log_price(2.0).exp() * 50.0;
+        price.rebase(50.0, 2.5);
+        assert!((price.log_price(2.0).exp() * 2.5 - normalized_before).abs() < 1e-12);
+        price.rebase(2.5, 10.0);
+        assert!((price.log_price(2.0).exp() * 10.0 - normalized_before).abs() < 1e-12);
+
+        let unchanged = price.log_inverse_rate;
+        price.rebase(10.0, 10.0);
+        assert_eq!(price.log_inverse_rate, unchanged);
+
+        // rebase_upward caps upward rate jumps without inflating normalized share,
+        // and leaves equal or downward rate transitions unchanged.
+        price.rebase_upward(10.0, 40.0);
+        assert!((price.log_price(2.0).exp() * 40.0 - normalized_before).abs() < 1e-12);
+        let after_cap = price.log_inverse_rate;
+        price.rebase_upward(40.0, 40.0);
+        assert_eq!(price.log_inverse_rate, after_cap);
+        price.rebase_upward(40.0, 5.0);
+        assert_eq!(price.log_inverse_rate, after_cap);
     }
 
     #[test]

@@ -30,6 +30,9 @@ const CHUNK: usize = 64 << 10;
 const DEPTH: usize = 128;
 const LOAD_CHUNK: usize = 4 << 20;
 const LOAD_READERS: usize = 4;
+const PARALLEL_GATHER_MIN_ROWS: usize = 2048;
+const MAX_GATHER_THREADS: usize = 16;
+const PREFETCH_DISTANCE: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Plane {
@@ -351,14 +354,150 @@ impl Drop for Aligned {
     }
 }
 
-pub(crate) struct DiskReader {
-    // Destroying the ring cancels and drains outstanding I/O before the buffers are freed.
-    #[cfg(unix)]
+#[cfg(unix)]
+struct UnixLane {
+    // Drop the ring before releasing the registered staging allocation.
     ring: IoUring,
+    staging: Aligned,
+    depth: usize,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct UnixOutput {
+    address: usize,
+    len: usize,
+}
+
+#[cfg(unix)]
+impl UnixOutput {
+    // SAFETY: The planner assigns each destination byte to exactly one fragment,
+    // and each read (with its fragments) belongs to one worker lane. The scoped
+    // join finishes every worker before the caller accesses or releases output.
+    unsafe fn copy(self, fragment: &Fragment, source: *const u8) {
+        assert!(fragment.destination <= self.len);
+        assert!(fragment.nbytes <= self.len - fragment.destination);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                source,
+                (self.address as *mut u8).add(fragment.destination),
+                fragment.nbytes,
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+impl UnixLane {
+    fn new(depth: usize) -> Result<Self> {
+        let staging = Aligned::new(depth * CHUNK)?;
+        let ring = IoUring::new(depth as u32).map_err(|e| format!("Engram io_uring: {e}"))?;
+        let buffers: Vec<_> = (0..depth)
+            .map(|i| libc::iovec {
+                iov_base: staging.at(i).cast(),
+                iov_len: CHUNK,
+            })
+            .collect();
+        unsafe { ring.submitter().register_buffers(&buffers) }
+            .map_err(|e| format!("register Engram staging: {e}"))?;
+        Ok(Self {
+            ring,
+            staging,
+            depth,
+        })
+    }
+
+    fn gather(
+        &mut self,
+        files: &[Arc<File>],
+        reads: &[Read],
+        fragments: &[Fragment],
+        output: UnixOutput,
+        stats: &Stats,
+    ) -> Result<()> {
+        let mut timing = DiskTimings {
+            stats,
+            plan: 0,
+            submit: 0,
+            wait: 0,
+            complete: 0,
+        };
+        for batch in reads.chunks(self.depth) {
+            let begin = Instant::now();
+            for (slot, read) in batch.iter().enumerate() {
+                let entry = opcode::ReadFixed::new(
+                    types::Fd(files[read.file].as_raw_fd()),
+                    self.staging.at(slot),
+                    read.nbytes as u32,
+                    slot as u16,
+                )
+                .offset(read.offset)
+                .build()
+                .user_data(slot as u64);
+                unsafe { self.ring.submission().push(&entry) }
+                    .map_err(|_| "Engram submission queue full")?;
+            }
+            stats
+                .disk_reads
+                .fetch_add(batch.len() as u64, Ordering::Relaxed);
+            stats.disk_bytes.fetch_add(
+                batch.iter().map(|read| read.nbytes as u64).sum(),
+                Ordering::Relaxed,
+            );
+            timing.submit += begin.elapsed().as_nanos() as u64;
+            let mut completed = 0;
+            let mut failure = None;
+            while completed < batch.len() {
+                let begin = Instant::now();
+                let result = self.ring.submit_and_wait(1);
+                timing.wait += begin.elapsed().as_nanos() as u64;
+                match result {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(format!("submit Engram reads: {error}").into()),
+                }
+                let begin = Instant::now();
+                for entry in self.ring.completion() {
+                    completed += 1;
+                    let slot = entry.user_data() as usize;
+                    let read = &batch[slot];
+                    let count = entry.result();
+                    if count < 0 || (count as usize) < read.required {
+                        failure = Some(format!(
+                            "Engram read at {} returned {count}, requires {} bytes",
+                            read.offset, read.required
+                        ));
+                        continue;
+                    }
+                    for fragment in &fragments[read.fragments.clone()] {
+                        // SAFETY: This lane exclusively owns each fragment; the
+                        // staging slot stays untouched until completion finishes.
+                        unsafe {
+                            output.copy(
+                                fragment,
+                                self.staging
+                                    .at(slot)
+                                    .add((fragment.source - read.offset) as usize),
+                            );
+                        }
+                    }
+                }
+                timing.complete += begin.elapsed().as_nanos() as u64;
+            }
+            if let Some(error) = failure {
+                return Err(error.into());
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct DiskReader {
+    // Destroying each lane drops its io_uring before its registered staging buffer.
+    #[cfg(unix)]
+    lanes: Vec<UnixLane>,
     #[cfg(windows)]
     windows: windows::Readers,
-    #[cfg(unix)]
-    staging: Aligned,
     #[cfg(unix)]
     files: Vec<Arc<File>>,
     fragments: Vec<Fragment>,
@@ -392,24 +531,17 @@ impl Drop for DiskTimings<'_> {
 
 impl DiskReader {
     fn from_files(files: &[Arc<File>], stats: Arc<Stats>, workers: usize) -> Result<Self> {
-        #[cfg(unix)]
-        if workers != 1 {
-            return Err("parallel embedding disk workers require Windows".into());
+        if !matches!(workers, 1 | 2 | 4 | 8) {
+            return Err("embedding table workers must be 1, 2, 4, or 8".into());
         }
         #[cfg(unix)]
-        let staging = Aligned::new(DEPTH * CHUNK)?;
-        #[cfg(unix)]
-        let ring = {
-            let ring = IoUring::new(DEPTH as u32).map_err(|e| format!("Engram io_uring: {e}"))?;
-            let buffers: Vec<_> = (0..DEPTH)
-                .map(|i| libc::iovec {
-                    iov_base: staging.at(i).cast(),
-                    iov_len: CHUNK,
-                })
-                .collect();
-            unsafe { ring.submitter().register_buffers(&buffers) }
-                .map_err(|e| format!("register Engram staging: {e}"))?;
-            ring
+        let lanes = {
+            let depth = DEPTH / workers;
+            let mut lanes = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                lanes.push(UnixLane::new(depth)?);
+            }
+            lanes
         };
         #[cfg(windows)]
         let windows = windows::Readers::new(files, workers)?;
@@ -417,9 +549,7 @@ impl DiskReader {
             #[cfg(windows)]
             windows,
             #[cfg(unix)]
-            ring,
-            #[cfg(unix)]
-            staging,
+            lanes,
             #[cfg(unix)]
             files: files.to_vec(),
             fragments: Vec::new(),
@@ -496,70 +626,44 @@ impl DiskReader {
         }
         timing.plan = begin.elapsed().as_nanos() as u64;
         #[cfg(unix)]
-        for batch in self.reads.chunks(DEPTH) {
-            let begin = Instant::now();
-            for (slot, read) in batch.iter().enumerate() {
-                let entry = opcode::ReadFixed::new(
-                    types::Fd(self.files[read.file].as_raw_fd()),
-                    self.staging.at(slot),
-                    read.nbytes as u32,
-                    slot as u16,
-                )
-                .offset(read.offset)
-                .build()
-                .user_data(slot as u64);
-                unsafe { self.ring.submission().push(&entry) }
-                    .map_err(|_| "Engram submission queue full")?;
-            }
-            self.stats
-                .disk_reads
-                .fetch_add(batch.len() as u64, Ordering::Relaxed);
-            self.stats.disk_bytes.fetch_add(
-                batch.iter().map(|read| read.nbytes as u64).sum(),
-                Ordering::Relaxed,
-            );
-            timing.submit += begin.elapsed().as_nanos() as u64;
-            let mut completed = 0;
-            let mut failure = None;
-            while completed < batch.len() {
-                let begin = Instant::now();
-                let result = self.ring.submit_and_wait(1);
-                timing.wait += begin.elapsed().as_nanos() as u64;
-                match result {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(format!("submit Engram reads: {error}").into()),
-                }
-                let begin = Instant::now();
-                for entry in self.ring.completion() {
-                    completed += 1;
-                    let slot = entry.user_data() as usize;
-                    let read = &batch[slot];
-                    let count = entry.result();
-                    if count < 0 || (count as usize) < read.required {
-                        failure = Some(format!(
-                            "Engram read at {} returned {count}, requires {} bytes",
-                            read.offset, read.required
-                        ));
-                        continue;
+        {
+            let output = UnixOutput {
+                address: output.as_mut_ptr() as usize,
+                len: output.len(),
+            };
+            if self.lanes.len() == 1 || self.reads.len() <= DEPTH {
+                self.lanes[0].gather(&self.files, &self.reads, &self.fragments, output, &self.stats)?;
+            } else {
+                let chunk = self.reads.len().div_ceil(self.lanes.len());
+                let files = &self.files;
+                let fragments = &self.fragments;
+                let stats = &self.stats;
+                std::thread::scope(|scope| {
+                    let (local, helpers) = self.lanes.split_first_mut().unwrap();
+                    let mut jobs = self.reads.chunks(chunk);
+                    let first = jobs.next().unwrap();
+                    let mut joins = Vec::with_capacity(helpers.len());
+                    for (index, (lane, reads)) in helpers.iter_mut().zip(jobs).enumerate() {
+                        joins.push(
+                            std::thread::Builder::new()
+                                .name(format!("flare-table-io-{}", index + 1))
+                                .spawn_scoped(scope, move || {
+                                    lane.gather(files, reads, fragments, output, stats)
+                                })
+                                .map_err(|e| format!("start embedding read worker: {e}"))?,
+                        );
                     }
-                    for fragment in &self.fragments[read.fragments.clone()] {
-                        let source = unsafe {
-                            std::slice::from_raw_parts(
-                                self.staging
-                                    .at(slot)
-                                    .add((fragment.source - read.offset) as usize),
-                                fragment.nbytes,
-                            )
-                        };
-                        output[fragment.destination..fragment.destination + fragment.nbytes]
-                            .copy_from_slice(source);
+                    let mut result = local.gather(files, first, fragments, output, stats);
+                    for worker in joins {
+                        let next = worker
+                            .join()
+                            .unwrap_or_else(|_| Err("embedding read worker panicked".into()));
+                        if result.is_ok() {
+                            result = next;
+                        }
                     }
-                }
-                timing.complete += begin.elapsed().as_nanos() as u64;
-            }
-            if let Some(error) = failure {
-                return Err(error.into());
+                    result
+                })?;
             }
         }
         #[cfg(windows)]
@@ -570,14 +674,106 @@ impl DiskReader {
     }
 }
 
+#[inline]
+fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(ptr.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = ptr;
+}
+
+fn gather_thread_count(work_items: usize) -> usize {
+    if work_items < PARALLEL_GATHER_MIN_ROWS {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, MAX_GATHER_THREADS)
+        .min(work_items.div_ceil(PARALLEL_GATHER_MIN_ROWS / 2))
+}
+
 struct CachedReader {
     disk: DiskReader,
     cache: RowCache,
     requests: Vec<(i64, usize)>,
     miss_ids: Vec<i64>,
     miss_groups: Vec<(usize, usize)>,
+    hit_groups: Vec<(usize, usize, usize)>,
     miss_output: Vec<u8>,
     max_rows: usize,
+}
+
+fn copy_cached_hits_slice(
+    hits: &[(usize, usize, usize)],
+    requests: &[(i64, usize)],
+    output_base: usize,
+    scale_base: usize,
+    weights: usize,
+    scales: usize,
+) {
+    for (index, &(source, begin, end)) in hits.iter().enumerate() {
+        if let Some(&(next_source, _, _)) = hits.get(index + PREFETCH_DISTANCE) {
+            prefetch_read(next_source as *const u8);
+        }
+        // SAFETY: `source` addresses one immutable cached row of `weights + scales`
+        // bytes while no thread mutates `RowCache`.
+        let row = unsafe { std::slice::from_raw_parts(source as *const u8, weights + scales) };
+        for &(_, target) in &requests[begin..end] {
+            // SAFETY: Request groups partition `requests` by unique row ID, so each
+            // `target` output row is written by at most one thread.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    row.as_ptr(),
+                    (output_base + target * weights) as *mut u8,
+                    weights,
+                );
+                std::ptr::copy_nonoverlapping(
+                    row.as_ptr().add(weights),
+                    (output_base + scale_base + target * scales) as *mut u8,
+                    scales,
+                );
+            }
+        }
+    }
+}
+
+fn copy_cached_hits(
+    hits: &[(usize, usize, usize)],
+    requests: &[(i64, usize)],
+    output: &mut [u8],
+    weights: usize,
+    scales: usize,
+    total_rows: usize,
+) {
+    let scale_base = total_rows * weights;
+    let output_base = output.as_mut_ptr() as usize;
+    let threads = gather_thread_count(hits.len());
+    if threads <= 1 {
+        copy_cached_hits_slice(hits, requests, output_base, scale_base, weights, scales);
+        return;
+    }
+    let chunk = hits.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut parts = hits.chunks(chunk);
+        let first = parts.next().unwrap_or(&[]);
+        for part in parts {
+            scope.spawn(move || {
+                copy_cached_hits_slice(part, requests, output_base, scale_base, weights, scales);
+            });
+        }
+        copy_cached_hits_slice(first, requests, output_base, scale_base, weights, scales);
+    });
 }
 
 impl CachedReader {
@@ -591,6 +787,7 @@ impl CachedReader {
                 size_of::<(i64, usize)>()
                     + size_of::<i64>()
                     + size_of::<(usize, usize)>()
+                    + size_of::<(usize, usize, usize)>()
                     + row_bytes,
             )
             .and_then(|n| n.checked_add(size_of::<Self>()))
@@ -613,9 +810,11 @@ impl CachedReader {
         let mut requests = allocated(max_rows, (0i64, 0usize))?;
         let mut miss_ids = allocated(max_rows, 0i64)?;
         let mut miss_groups = allocated(max_rows, (0usize, 0usize))?;
+        let mut hit_groups = allocated(max_rows, (0usize, 0usize, 0usize))?;
         requests.clear();
         miss_ids.clear();
         miss_groups.clear();
+        hit_groups.clear();
         let miss_output = allocated(max_rows * row_bytes, 0u8)?;
         let cache = RowCache::new(
             payload_budget,
@@ -635,6 +834,7 @@ impl CachedReader {
             requests,
             miss_ids,
             miss_groups,
+            hit_groups,
             miss_output,
             max_rows,
         })
@@ -649,6 +849,7 @@ impl CachedReader {
         self.requests.clear();
         self.miss_ids.clear();
         self.miss_groups.clear();
+        self.hit_groups.clear();
         for (row, &id) in ids.iter().enumerate() {
             if id < 0 {
                 output[row * weights..(row + 1) * weights].fill(0);
@@ -665,17 +866,22 @@ impl CachedReader {
             let end = begin + self.requests[begin..].partition_point(|&(next, _)| next == id);
             if let Some(payload) = self.cache.get(id) {
                 hits += 1;
-                for &(_, row) in &self.requests[begin..end] {
-                    output[row * weights..(row + 1) * weights].copy_from_slice(&payload[..weights]);
-                    output[scale_base + row * scales..scale_base + (row + 1) * scales]
-                        .copy_from_slice(&payload[weights..]);
-                }
+                self.hit_groups
+                    .push((payload.as_ptr() as usize, begin, end));
             } else {
                 self.miss_ids.push(id);
                 self.miss_groups.push((begin, end));
             }
             begin = end;
         }
+        copy_cached_hits(
+            &self.hit_groups,
+            &self.requests,
+            output,
+            weights,
+            scales,
+            ids.len(),
+        );
         self.disk.stats.hits.fetch_add(hits, Ordering::Relaxed);
         self.disk
             .stats
@@ -721,9 +927,15 @@ enum Data {
     Cached(Box<CachedReader>),
 }
 
-fn gather_resident(data: &Resident, row_bytes: usize, ids: &[i64], output: &mut [u8]) {
-    let data = data.bytes();
+fn gather_resident_slice(data: &[u8], row_bytes: usize, ids: &[i64], output: &mut [u8]) {
+    let base = data.as_ptr();
     for (row, &id) in ids.iter().enumerate() {
+        if let Some(&next_id) = ids.get(row + PREFETCH_DISTANCE) {
+            if next_id >= 0 {
+                // SAFETY: Every nonnegative ID in `ids` was validated against the plane extent.
+                prefetch_read(unsafe { base.add(next_id as usize * row_bytes) });
+            }
+        }
         let target = &mut output[row * row_bytes..(row + 1) * row_bytes];
         if id < 0 {
             target.fill(0);
@@ -732,6 +944,26 @@ fn gather_resident(data: &Resident, row_bytes: usize, ids: &[i64], output: &mut 
             target.copy_from_slice(&data[start..start + row_bytes]);
         }
     }
+}
+
+fn gather_resident(data: &Resident, row_bytes: usize, ids: &[i64], output: &mut [u8]) {
+    let data = data.bytes();
+    let threads = gather_thread_count(ids.len());
+    if threads <= 1 {
+        gather_resident_slice(data, row_bytes, ids, output);
+        return;
+    }
+    let chunk_rows = ids.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut id_chunks = ids.chunks(chunk_rows);
+        let mut out_chunks = output.chunks_mut(chunk_rows * row_bytes);
+        let first_ids = id_chunks.next().unwrap_or(&[]);
+        let first_out = out_chunks.next().unwrap_or(&mut []);
+        for (id_chunk, out_chunk) in id_chunks.zip(out_chunks) {
+            scope.spawn(move || gather_resident_slice(data, row_bytes, id_chunk, out_chunk));
+        }
+        gather_resident_slice(data, row_bytes, first_ids, first_out);
+    });
 }
 pub(crate) struct Reader {
     data: Data,
@@ -1339,5 +1571,212 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parallel_resident_gather_matches_sequential_with_padding_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "helios-engram-parallel-ram-{}.bin",
+            std::process::id()
+        ));
+        let rows = 8192;
+        let first = 123;
+        let second = first + rows * 256 + 17;
+        let bytes: Vec<u8> = (0..second + rows * 8)
+            .map(|i| (i * 31 + i / 127) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let planes = [
+            Plane {
+                file: 0,
+                offset: first as u64,
+                nbytes: rows * 256,
+                row_bytes: 256,
+            },
+            Plane {
+                file: 0,
+                offset: second as u64,
+                nbytes: rows * 8,
+                row_bytes: 8,
+            },
+        ];
+        let ids: Vec<i64> = (0..PARALLEL_GATHER_MIN_ROWS * 3 + 77)
+            .map(|i| {
+                if i % 23 == 0 {
+                    -1
+                } else {
+                    ((i * 197 + 13) % rows) as i64
+                }
+            })
+            .collect();
+        let mut expected = vec![0u8; ids.len() * 264];
+        let file = open_file(&path).unwrap();
+        let resident = planes.map(|plane| Arc::new(Resident::load(&file, plane).unwrap()));
+        gather_resident_slice(
+            resident[0].bytes(),
+            256,
+            &ids,
+            &mut expected[..ids.len() * 256],
+        );
+        gather_resident_slice(
+            resident[1].bytes(),
+            8,
+            &ids,
+            &mut expected[ids.len() * 256..],
+        );
+        let mut reader = Reader::open(&path, &planes, true, 0, ids.len(), Arc::default()).unwrap();
+        let mut actual = vec![0xA5u8; expected.len()];
+        reader.gather(&planes, &ids, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn parallel_cached_hit_gather_matches_disk_across_padding_and_duplicates() {
+        let path = std::env::temp_dir().join(format!(
+            "helios-engram-parallel-cache-{}.bin",
+            std::process::id()
+        ));
+        let rows = 4096;
+        let first = 4093;
+        let second = first + rows * 256 + 11;
+        let bytes: Vec<u8> = (0..second + rows * 8)
+            .map(|i| (i * 17 + i / 131) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let planes = [
+            Plane {
+                file: 0,
+                offset: first as u64,
+                nbytes: rows * 256,
+                row_bytes: 256,
+            },
+            Plane {
+                file: 0,
+                offset: second as u64,
+                nbytes: rows * 8,
+                row_bytes: 8,
+            },
+        ];
+        // Exceed PARALLEL_GATHER_MIN_ROWS unique cached hits with duplicates and -1 padding.
+        let ids: Vec<i64> = (0..PARALLEL_GATHER_MIN_ROWS * 2 + 113)
+            .map(|i| {
+                if i % 29 == 0 {
+                    -1
+                } else {
+                    ((i * 37) % 3072) as i64
+                }
+            })
+            .collect();
+        let mut expected = Vec::with_capacity(ids.len() * 264);
+        for plane in &planes {
+            for &id in &ids {
+                if id < 0 {
+                    expected.extend(std::iter::repeat_n(0, plane.row_bytes));
+                } else {
+                    let start = plane.offset as usize + id as usize * plane.row_bytes;
+                    expected.extend_from_slice(&bytes[start..start + plane.row_bytes]);
+                }
+            }
+        }
+        let stats = Arc::new(Stats::default());
+        let mut reader =
+            Reader::open(&path, &planes, false, 64 << 20, ids.len(), stats.clone()).unwrap();
+        // Warm cache on first pass so the follow-up gather exercises parallel copy_cached_hits.
+        let mut warm = vec![0u8; expected.len()];
+        reader.gather(&planes, &ids, &mut warm).unwrap();
+        assert_eq!(warm, expected);
+        let hits_before = stats.hits.load(Ordering::Relaxed);
+        let mut actual = vec![0x5Au8; expected.len()];
+        reader.gather(&planes, &ids, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            stats.hits.load(Ordering::Relaxed) - hits_before >= PARALLEL_GATHER_MIN_ROWS as u64
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parallel_unix_disk_workers_preserve_rows_and_propagate_truncation() {
+        let path = std::env::temp_dir().join(format!(
+            "helios-engram-unix-workers-{}.bin",
+            std::process::id()
+        ));
+        // Space rows more than CHUNK (64 KiB) apart so reads cannot coalesce below DEPTH (128).
+        let rows = 48000;
+        let first = 4093;
+        let second = first + rows * 256 + 7;
+        let bytes: Vec<u8> = (0..second + rows * 8)
+            .map(|i| (i * 19 + i / 257) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let planes = [
+            Plane {
+                file: 0,
+                offset: first as u64,
+                nbytes: rows * 256,
+                row_bytes: 256,
+            },
+            Plane {
+                file: 0,
+                offset: second as u64,
+                nbytes: rows * 8,
+                row_bytes: 8,
+            },
+        ];
+        // Stride 300 rows = 76.8 KiB (> 64 KiB CHUNK), producing 150+ distinct disk reads (> DEPTH).
+        let ids: Vec<i64> = (0..160)
+            .flat_map(|i| {
+                let row = (i * 300) as i64;
+                if i % 13 == 0 {
+                    vec![-1, row, row]
+                } else {
+                    vec![row]
+                }
+            })
+            .collect();
+        let mut expected = Vec::with_capacity(ids.len() * 264);
+        for plane in &planes {
+            for &id in &ids {
+                if id < 0 {
+                    expected.extend(std::iter::repeat_n(0, plane.row_bytes));
+                } else {
+                    let start = plane.offset as usize + id as usize * plane.row_bytes;
+                    expected.extend_from_slice(&bytes[start..start + plane.row_bytes]);
+                }
+            }
+        }
+        let files = [Arc::new(open_file(&path).unwrap())];
+        for workers in [1, 2, 4, 8] {
+            let stats = Arc::new(Stats::default());
+            let mut reader = Reader::from_files(
+                &files,
+                &planes,
+                false,
+                0,
+                ids.len(),
+                stats.clone(),
+                workers,
+                false,
+            )
+            .unwrap();
+            let mut actual = vec![0xA5u8; expected.len()];
+            reader.gather(&planes, &ids, &mut actual).unwrap();
+            assert_eq!(actual, expected, "worker count {workers} corrupted rows");
+            assert!(stats.disk_reads.load(Ordering::Relaxed) > DEPTH as u64);
+        }
+        assert!(Reader::from_files(&files, &planes, false, 0, ids.len(), Arc::default(), 3, false).is_err());
+        let mut reader =
+            Reader::from_files(&files, &planes, false, 0, ids.len(), Arc::default(), 4, false)
+                .unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(4096)
+            .unwrap();
+        assert!(reader.gather(&planes, &ids, &mut vec![0u8; expected.len()]).is_err());
+        std::fs::remove_file(&path).unwrap();
     }
 }

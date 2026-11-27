@@ -120,32 +120,74 @@ fn select_snapshots(
         return Some(selected.into_iter().collect());
     }
     // The union costs |A| + |B| - |A ∩ B|; the intersection is another range.
-    let mut best: Option<(usize, usize, usize)> = None;
-    for a in 0..candidates.len() {
+    // Any pair with empty intersection costs |A| + |B| and cannot beat the two
+    // lowest-(cost, id) candidates, so only that baseline and overlapping
+    // intervals need evaluation.
+    let pair_cost = |a: usize, b: usize| {
         let (_, range_a, cost_a) = &candidates[a];
-        // A pair costs at least its larger member, so a member at or above the best
-        // cost cannot improve on it (first-found ties are already the lowest ids).
-        if *cost_a > budget || best.is_some_and(|(cost, _, _)| *cost_a >= cost) {
+        let (_, range_b, cost_b) = &candidates[b];
+        let (lo, hi) = (
+            range_a.start.max(range_b.start),
+            range_a.end.min(range_b.end),
+        );
+        let shared = if lo < hi {
+            (free[hi as usize] - free[lo as usize]) as usize
+        } else {
+            0
+        };
+        cost_a + cost_b - shared
+    };
+    let mut best: Option<(usize, usize, usize)> = None;
+    let consider = |u: usize, v: usize, best: &mut Option<(usize, usize, usize)>| {
+        let (a, b) = (u.min(v), u.max(v));
+        let union = pair_cost(a, b);
+        if union <= budget && best.is_none_or(|(cost, ba, bb)| (union, a, b) < (cost, ba, bb)) {
+            *best = Some((union, a, b));
+        }
+    };
+    let (mut first, mut second) = (0usize, 1usize);
+    if (candidates[1].2, 1usize) < (candidates[0].2, 0usize) {
+        std::mem::swap(&mut first, &mut second);
+    }
+    for idx in 2..candidates.len() {
+        let key = (candidates[idx].2, idx);
+        if key < (candidates[first].2, first) {
+            second = first;
+            first = idx;
+        } else if key < (candidates[second].2, second) {
+            second = idx;
+        }
+    }
+    consider(first, second, &mut best);
+    if best.is_some_and(|(cost, _, _)| cost == 0) {
+        return best.map(|(_, a, b)| vec![candidates[a].0, candidates[b].0]);
+    }
+    let mut by_start: Vec<usize> = (0..candidates.len())
+        .filter(|&idx| candidates[idx].1.start < candidates[idx].1.end)
+        .collect();
+    by_start.sort_by_key(|&idx| (candidates[idx].1.start, idx));
+    for (pos, &u) in by_start.iter().enumerate() {
+        let (_, range_u, cost_u) = &candidates[u];
+        if *cost_u > budget
+            || best.is_some_and(|(cost, ba, bb)| {
+                *cost_u > cost || (*cost_u == cost && (ba, bb) == (0, 1))
+            })
+        {
             continue;
         }
-        for b in a + 1..candidates.len() {
-            let (_, range_b, cost_b) = &candidates[b];
-            if best.is_some_and(|(cost, _, _)| *cost_b >= cost) {
+        for &v in &by_start[pos + 1..] {
+            let (_, range_v, cost_v) = &candidates[v];
+            if range_v.start >= range_u.end {
+                break;
+            }
+            let (a, b) = (u.min(v), u.max(v));
+            let lower = (*cost_u).max(*cost_v);
+            if lower > budget
+                || best.is_some_and(|(cost, ba, bb)| (lower, a, b) >= (cost, ba, bb))
+            {
                 continue;
             }
-            let (lo, hi) = (
-                range_a.start.max(range_b.start),
-                range_a.end.min(range_b.end),
-            );
-            let shared = if lo < hi {
-                (free[hi as usize] - free[lo as usize]) as usize
-            } else {
-                0
-            };
-            let union = cost_a + cost_b - shared;
-            if union <= budget && best.is_none_or(|(cost, _, _)| union < cost) {
-                best = Some((union, a, b));
-            }
+            consider(a, b, &mut best);
         }
         if best.is_some_and(|(cost, _, _)| cost == 0) {
             break;
@@ -1322,6 +1364,113 @@ mod tests {
             select_snapshots(&backing, &refs, &ranges, &candidates, 0, 2),
             Some(vec![SnapshotId(0), SnapshotId(1)])
         );
+    }
+
+    #[test]
+    fn two_row_selection_scales_to_large_snapshot_pools() {
+        const SNAPSHOTS: u32 = 250_000;
+        const PAGES: u32 = SNAPSHOTS * 8;
+        let backing = vec![true; PAGES as usize];
+        let refs = vec![0u32; PAGES as usize];
+        let ranges: Vec<_> = (0..SNAPSHOTS)
+            .map(|row| {
+                let start = row * 8;
+                start..(start + 12).min(PAGES)
+            })
+            .collect();
+        let candidates: BTreeSet<_> = (0..SNAPSHOTS).map(SnapshotId).collect();
+        let selected = select_snapshots(&backing, &refs, &ranges, &candidates, 0, 2);
+        // The tail pair (249_998, 249_999) spans 16 pages (249_998*8..250_000*8),
+        // beating every interior 12-page adjacent pair (union 20).
+        assert_eq!(
+            selected,
+            Some(vec![SnapshotId(SNAPSHOTS - 2), SnapshotId(SNAPSHOTS - 1)])
+        );
+    }
+
+    #[test]
+    fn two_row_selection_matches_exhaustive_pair_search_on_large_pool() {
+        const SNAPSHOTS: usize = 1_024;
+        const PAGES: usize = 8_192;
+        let rng = &mut 0x9e37_79b9_7f4a_7c15u64;
+        for case in 0..4 {
+            let backing: Vec<bool> = (0..PAGES).map(|_| lcg(rng) % 5 != 0).collect();
+            let refs: Vec<u32> = (0..PAGES).map(|_| (lcg(rng) % 2) as u32).collect();
+            let ranges: Vec<std::ops::Range<u32>> = (0..SNAPSHOTS)
+                .map(|row| {
+                    if case == 1 && row == 512 {
+                        // Single empty (padding-backed) alias alongside non-empty intervals.
+                        return 0..0;
+                    }
+                    let start = (row as u32 * 8) % PAGES as u32;
+                    let width = match case {
+                        // Disjoint equal-stride intervals with cost ties.
+                        0 => 4,
+                        // Mixed widths with partial neighbor overlaps.
+                        1 => 4 + (lcg(rng) % 16) as u32,
+                        // Scattered intervals that create non-adjacent overlaps.
+                        _ => 2 + (lcg(rng) % 24) as u32,
+                    };
+                    let base = if case >= 2 {
+                        (lcg(rng) % PAGES as u64) as u32
+                    } else {
+                        start
+                    };
+                    base..(base + width).min(PAGES as u32)
+                })
+                .collect();
+            let candidates: BTreeSet<SnapshotId> = (0..SNAPSHOTS)
+                .filter(|_| lcg(rng) % 10 != 0)
+                .map(|id| SnapshotId(id as u32))
+                .collect();
+            let available = backing.iter().filter(|free| **free).count();
+            let mut free = vec![0u32; PAGES + 1];
+            let mut blocked = vec![0u32; PAGES + 1];
+            for page in 0..PAGES {
+                free[page + 1] = free[page] + u32::from(backing[page]);
+                blocked[page + 1] =
+                    blocked[page] + u32::from(!backing[page] && refs[page] == 0);
+            }
+            let eligible: Vec<(SnapshotId, std::ops::Range<u32>, usize)> = candidates
+                .iter()
+                .filter_map(|&id| {
+                    let r = ranges[id.0 as usize].clone();
+                    let blk = blocked[r.end as usize] - blocked[r.start as usize];
+                    (blk == 0).then(|| {
+                        let cost = (free[r.end as usize] - free[r.start as usize]) as usize;
+                        (id, r, cost)
+                    })
+                })
+                .collect();
+            for keep in [0usize, available.saturating_sub(12), available] {
+                let budget = available.saturating_sub(keep);
+                let mut expected: Option<(usize, SnapshotId, SnapshotId)> = None;
+                for a in 0..eligible.len() {
+                    let (id_a, range_a, cost_a) = &eligible[a];
+                    for b in a + 1..eligible.len() {
+                        let (id_b, range_b, cost_b) = &eligible[b];
+                        let (lo, hi) = (
+                            range_a.start.max(range_b.start),
+                            range_a.end.min(range_b.end),
+                        );
+                        let shared = if lo < hi {
+                            (free[hi as usize] - free[lo as usize]) as usize
+                        } else {
+                            0
+                        };
+                        let union = cost_a + cost_b - shared;
+                        if union <= budget
+                            && expected.is_none_or(|best| (union, *id_a, *id_b) < best)
+                        {
+                            expected = Some((union, *id_a, *id_b));
+                        }
+                    }
+                }
+                let expected = expected.map(|(_, a, b)| vec![a, b]);
+                let actual = select_snapshots(&backing, &refs, &ranges, &candidates, keep, 2);
+                assert_eq!(actual, expected, "case {case} keep {keep}");
+            }
+        }
     }
 
     /// Cache benchmark fixture: 202,183 pages of 128 KV tokens and 2,457 snapshot rows.

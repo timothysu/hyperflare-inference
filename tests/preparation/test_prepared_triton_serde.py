@@ -158,10 +158,11 @@ def test_real_storage_serde_preserves_launch_options_and_dynamic_leaf_positions(
         leaves, tree, operands, [])
     signature = (((32,), (1,), 0, torch.float32, torch.device("cuda:0"), 0),)
     owner = SimpleNamespace(artifact=SimpleNamespace(serialize=lambda: b"inner artifact"),
-        inputs=[], invocations=[call], signature=signature, _serialized_artifact=None, _tuning_frozen=False)
+        inputs=[], invocations=[call], signature=signature, _serialized_artifact=None,
+        _cuda_allocation_sizes=(), _tuning_frozen=False)
     payload = aot.StorageBackend.serialize_compile_artifacts(owner)
-    _, _, stored, _, frozen = pickle.loads(payload)
-    assert frozen is False
+    _, _, stored, _, frozen, sizes = pickle.loads(payload)
+    assert frozen is False and sizes == ()
     name, restored_leaves, restored_tree, restored_operands, restored_integers = stored[0]
     assert name[1] == (__name__, "_copy_launch")
     assert list(name[2].items()) == list(dict(constants, **traced.configs[0].all_kwargs()).items())

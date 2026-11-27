@@ -31,6 +31,7 @@ mod inspect;
 mod launch;
 #[cfg(unix)]
 mod orbit;
+mod parallax;
 mod trust;
 #[cfg(windows)]
 use flare::windows;
@@ -104,6 +105,10 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
         }
         cli::Command::Models(args) => {
             cache_commands::run(args)?;
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+        cli::Command::Parallax(args) => {
+            parallax::run(args)?;
             return Ok(std::process::ExitCode::SUCCESS);
         }
         cli::Command::HardwareRevision { gpu_count } => {

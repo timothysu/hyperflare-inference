@@ -149,6 +149,198 @@ def test_native_lock_methods_are_not_rebound_in_worker():
         restored.lock.acquire
 
 
+def _probe_worker_runtime():
+    import os
+    import torch
+    from ignition import runtime_patches
+
+    torch_root = os.path.dirname(os.path.dirname(os.path.abspath(torch.__file__)))
+    return (
+        runtime_patches._APPLIED,
+        os.environ.get("PYTHONPATH", "").split(os.pathsep),
+        torch_root,
+    )
+
+
+@pytest.mark.parametrize('operator', [torch.ops.aten, torch.ops.aten.add, torch.ops.aten.add.Tensor])
+def test_resolvable_torch_operator_bindings_survive_worker_roundtrip(operator):
+    restored = loads(dumps(SimpleNamespace(operator=operator)))
+    assert restored.operator is operator
+    if operator is torch.ops.aten:
+        result = restored.operator.add.Tensor(torch.ones(1), torch.ones(1))
+    else:
+        result = restored.operator(torch.ones(1), torch.ones(1))
+    assert torch.equal(result, torch.full((1,), 2.))
+
+
+def test_custom_resolvable_and_rank_local_torch_ops_roundtrip_accurately():
+    from ignition.preparation import compilation
+
+    assert compilation._snapshot is not None
+    restored_global = loads(dumps(SimpleNamespace(op=torch.ops.flare.snapshot.default)))
+    assert restored_global.op is torch.ops.flare.snapshot.default
+
+    @torch.library.custom_op("flare_test_local_ops::rank_only", mutates_args=())
+    def _rank_only(x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    restored_local = loads(dumps(SimpleNamespace(
+        overload=torch.ops.flare_test_local_ops.rank_only.default,
+        packet=torch.ops.flare_test_local_ops.rank_only,
+        missing_ns=torch.ops.flare_nonexistent_ns_474,
+    )))
+    with pytest.raises(RuntimeError, match='process-local resource Torch operator binding'):
+        restored_local.overload(torch.ones(1))
+    with pytest.raises(RuntimeError, match='process-local resource Torch operator binding'):
+        restored_local.packet(torch.ones(1))
+    with pytest.raises(RuntimeError, match='process-local resource Torch operator binding'):
+        restored_local.missing_ns.anything
+
+
+def test_anonymous_builtin_method_is_process_local():
+    import types
+
+    anonymous = torch.ops.aten.add.Tensor._op
+    assert isinstance(anonymous, types.BuiltinMethodType) and not anonymous.__name__
+    restored = loads(dumps(SimpleNamespace(method=anonymous)))
+    with pytest.raises(RuntimeError, match=r'process-local resource .*\.<anonymous>'):
+        restored.method()
+
+
+def test_importable_native_extensions_remain_available_to_workers(monkeypatch):
+    import sys
+    import types
+    from importlib.machinery import ExtensionFileLoader, ModuleSpec
+
+    import torch._C
+
+    assert isinstance(torch._C.__spec__.loader, ExtensionFileLoader)
+    restored = loads(dumps(SimpleNamespace(module=torch._C)))
+    assert restored.module is torch._C
+
+    editable_name = "flare_editable_ext_test"
+    editable = types.ModuleType(editable_name)
+    editable_spec = ModuleSpec(editable_name, ExtensionFileLoader(editable_name, "/virtual/editable_ext.so"))
+    editable.__spec__ = editable_spec
+
+    class EditableFinder:
+        @staticmethod
+        def find_spec(fullname, path=None, target=None):
+            return editable_spec if fullname == editable_name else None
+
+    monkeypatch.setitem(sys.modules, editable_name, editable)
+    monkeypatch.setattr(sys, "meta_path", [EditableFinder, *sys.meta_path])
+    restored_editable = loads(dumps(SimpleNamespace(module=editable)))
+    assert restored_editable.module is editable
+
+
+def test_unimportable_native_extension_module_is_process_local():
+    import types
+    from importlib.machinery import ExtensionFileLoader, ModuleSpec
+
+    extension = types.ModuleType("flare_nonexistent_jit_ext")
+    extension.__spec__ = ModuleSpec("flare_nonexistent_jit_ext",
+                                    ExtensionFileLoader("flare_nonexistent_jit_ext", "/nonexistent/ext.so"))
+    restored = loads(dumps(SimpleNamespace(module=extension)))
+    with pytest.raises(RuntimeError, match="process-local resource native extension flare_nonexistent_jit_ext"):
+        restored.module.launch
+
+
+def test_metadata_preserves_custom_tensor_attributes_and_ignores_lazy_fake_attrs():
+    from torch._subclasses import FakeTensorMode
+    from ignition.preparation.forward_metadata import _tensor_user_attributes
+
+    plain = torch.empty(16, dtype=torch.float32)
+    annotated = torch.empty((16, 32), dtype=torch.float8_e4m3fn)
+    annotated.sf = torch.empty((16, 1), dtype=torch.int32)
+    annotated.scale_mode = "block"
+    restored = loads(dumps(SimpleNamespace(plain=plain, annotated=annotated)))
+    assert isinstance(restored.plain, FakeTensor)
+    assert isinstance(restored.annotated, FakeTensor)
+    assert not hasattr(restored.plain, "sf")
+    assert isinstance(restored.annotated.sf, FakeTensor)
+    assert tuple(restored.annotated.sf.shape) == (16, 1)
+    assert restored.annotated.sf.dtype == torch.int32
+    assert restored.annotated.scale_mode == "block"
+
+    mode = FakeTensorMode(allow_non_fake_inputs=True)
+    fake = mode.from_tensor(torch.ones(4))
+    fake.constant = torch.ones(4)
+    fake.real_tensor = torch.ones(4)
+    fake.item_memo = 1.0
+    fake.pytype = torch.Tensor
+    fake._debug_trace = "trace"
+    fake.user_tag = "keep"
+    assert _tensor_user_attributes(fake) == {"user_tag": "keep"}
+
+
+import enum
+
+
+class _DynamicIgnitionEnum(enum.Enum):
+    __module__ = "ignition.test_enum_identity"
+    ALPHA = "alpha"
+
+    def __getattr__(self, name):
+        raise AttributeError(name)
+
+
+def test_metadata_preserves_ignition_enum_and_builtin_subclass_identity(monkeypatch):
+    import sys
+    import types
+    from ignition.preparation.frontend import PromptEncoder
+
+    member = PromptEncoder.PROMPT_JINJA
+    assert loads(dumps(member)) is member
+
+    mod = types.ModuleType("ignition.test_enum_identity")
+    mod._DynamicIgnitionEnum = _DynamicIgnitionEnum
+    monkeypatch.setitem(sys.modules, "ignition.test_enum_identity", mod)
+    assert loads(dumps(_DynamicIgnitionEnum.ALPHA)) is _DynamicIgnitionEnum.ALPHA
+
+
+def test_compile_pool_starts_real_worker_with_runtime_patches_and_sys_path_precedence(tmp_path):
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    if os.name == "nt":
+        pytest.skip("SubprocPool child runtime-patch test targets POSIX SubprocPool")
+
+    sentinel = str(tmp_path / "overlay-site-packages")
+    code = '''
+import os
+import sys
+from pathlib import Path
+
+sentinel = sys.argv[1]
+output = Path(sys.argv[2])
+sys.path.insert(0, sentinel)
+
+from ignition import runtime_patches
+from ignition.preparation import compile_pool
+from tests.preparation.test_compile_pool import _probe_worker_runtime
+
+assert runtime_patches._APPLIED is False
+with compile_pool.CompilePool("cuda:0", workers=1) as pool:
+    future = pool.submit_payload(b"invalid", output)
+    try:
+        future.result(timeout=30)
+    except Exception:
+        pass
+    assert runtime_patches._APPLIED is True
+    worker_applied, worker_pythonpath, torch_root = pool.pool.submit(_probe_worker_runtime).result(timeout=30)
+assert worker_applied is True
+assert worker_pythonpath[0] == sentinel
+assert worker_pythonpath[-1] == torch_root
+'''
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([str(Path(__file__).resolve().parents[2]), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+    subprocess.run([sys.executable, "-c", code, sentinel, str(tmp_path / "dummy.bin")],
+                   check=True, env=env, capture_output=True, text=True)
+
+
 def test_selected_plan_metadata_survives_without_registering_a_worker_plan():
     from b12x.preparation.types import Plan, plan_from_handle, require_prepared
 

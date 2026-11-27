@@ -1340,10 +1340,25 @@ fn persistent_worker_manifest_validation_enforces_handles_alignment_and_cardinal
         stop_flag_allocation: "worker_ctrl".into(),
         stop_flag_offset: 0,
         stop_flag_address: 0x2000_0000_0000,
+        metrics_allocation: None,
+        metrics_offset: 0,
+        metrics_address: 0,
+        metrics_count: 0,
         control: None,
     };
     value.persistent_workers = vec![worker.clone()];
     value.validate().unwrap();
+
+    // Optional mapped-host u64 counter range validates when aligned and nonzero.
+    let mut with_metrics = value.clone();
+    {
+        let w = &mut with_metrics.persistent_workers[0];
+        w.metrics_allocation = Some("worker_ctrl".into());
+        w.metrics_offset = 64;
+        w.metrics_address = 0x2000_0000_0040;
+        w.metrics_count = 8;
+    }
+    with_metrics.validate().unwrap();
 
     // More than one persistent worker is rejected explicitly.
     let mut two_workers = value.clone();
@@ -1357,8 +1372,12 @@ fn persistent_worker_manifest_validation_enforces_handles_alignment_and_cardinal
     assert!(unsafe { threaded::ThreadedExecutor::new(value.clone(), vec![value.clone()]) }.is_err());
     assert!(unsafe { threaded::ThreadedExecutor::new(manifest(), vec![value.clone()]) }.is_err());
 
-    for mutation in 0..7 {
-        let mut bad = value.clone();
+    for mutation in 0..14 {
+        let mut bad = if mutation < 8 {
+            value.clone()
+        } else {
+            with_metrics.clone()
+        };
         let w = &mut bad.persistent_workers[0];
         match mutation {
             0 => w.worker_sm_count = 0,
@@ -1367,7 +1386,14 @@ fn persistent_worker_manifest_validation_enforces_handles_alignment_and_cardinal
             3 => w.handle = 0,
             4 => w.stop_flag_allocation.clear(),
             5 => w.stop_flag_offset = 2,
-            _ => w.stop_flag_address = 0x2000_0000_0002,
+            6 => w.stop_flag_address = 0x2000_0000_0002,
+            7 => w.metrics_offset = 8,
+            8 => w.metrics_allocation = None,
+            9 => w.metrics_count = 0,
+            10 => w.metrics_allocation = Some(String::new()),
+            11 => w.metrics_offset = 68,
+            12 => w.metrics_address = 0,
+            _ => w.metrics_address = 0x2000_0000_0044,
         }
         assert!(
             bad.validate().is_err(),

@@ -32,6 +32,49 @@ pub use config::Bootstrap;
 pub use dashboard::view;
 pub use metrics::Snapshot;
 pub use runtime::{Generation, GenerationEvent, ModelRuntime, Prompt};
+pub use crate::execution::{PersistentWorkerSnapshot, WorkerState};
+
+/// Read-only JSON payload served by `GET /v1/worker`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerTelemetryResponse {
+    pub name: String,
+    pub worker_sm_count: u32,
+    pub state: WorkerState,
+    pub counters: Vec<u64>,
+    pub uptime_secs: f64,
+    pub timestamp_ms: u64,
+}
+
+impl WorkerTelemetryResponse {
+    pub fn from_snapshot(
+        snapshot: PersistentWorkerSnapshot,
+        uptime: Duration,
+        now: SystemTime,
+    ) -> Self {
+        let timestamp_ms = now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        Self {
+            name: snapshot.name,
+            worker_sm_count: snapshot.worker_sm_count,
+            state: snapshot.state,
+            counters: snapshot.counters,
+            uptime_secs: uptime.as_secs_f64(),
+            timestamp_ms,
+        }
+    }
+
+    pub fn snapshot(&self) -> PersistentWorkerSnapshot {
+        PersistentWorkerSnapshot {
+            name: self.name.clone(),
+            worker_sm_count: self.worker_sm_count,
+            state: self.state,
+            counters: self.counters.clone(),
+        }
+    }
+}
 
 pub fn restore_terminal_for_exit() {
     dashboard::restore_for_exit();
@@ -247,7 +290,10 @@ impl Server {
             .queue_capacity
             .checked_add(model.limits.max_active)
             .ok_or("HTTP request capacity overflows")?;
-        let frontend = Arc::new(frontend);
+        let max_encode_threads = config
+            .frontend_workers
+            .min(frontend.max_encode_threads());
+        let frontend = Arc::new(frontend.with_max_encode_threads(max_encode_threads));
         // SAFETY: The caller grants exclusive graph/storage access and retains
         // their owners until drain. This server propagates that obligation to the
         // model worker and reports uncertain drain through StartFailure or close.
@@ -406,6 +452,10 @@ impl Server {
     pub fn healthy(&self) -> bool {
         self.http_alive.load(Ordering::Acquire) && self.model.healthy()
     }
+    /// Lock-free telemetry snapshot from the core's persistent worker, when present.
+    pub fn persistent_worker_snapshot(&self) -> Option<PersistentWorkerSnapshot> {
+        self.model.persistent_worker_snapshot()
+    }
     pub fn snapshot(&self) -> ServerSnapshot {
         let accepting = *self.state.accepting.lock().unwrap_or_else(|e| e.into_inner());
         let healthy = self.healthy();
@@ -538,6 +588,7 @@ fn router(state: Arc<HttpState>, served_names: &[String], max_body_bytes: usize)
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .route("/v1/worker", get(worker_telemetry))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
@@ -550,6 +601,34 @@ async fn health(State(state): State<Arc<HttpState>>) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             "prepared model runtime is unavailable",
         )
+    }
+}
+async fn worker_telemetry(State(state): State<Arc<HttpState>>) -> Response {
+    worker_telemetry_response(
+        state.model.persistent_worker_snapshot(),
+        state.started.elapsed(),
+        SystemTime::now(),
+    )
+}
+fn worker_telemetry_response(
+    snapshot: Option<PersistentWorkerSnapshot>,
+    uptime: Duration,
+    now: SystemTime,
+) -> Response {
+    match snapshot {
+        Some(snapshot) => {
+            Json(WorkerTelemetryResponse::from_snapshot(snapshot, uptime, now)).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": {
+                    "message": "no persistent worker is configured for this model",
+                    "type": "not_found_error"
+                }
+            })),
+        )
+            .into_response(),
     }
 }
 async fn metrics(State(state): State<Arc<HttpState>>, uri: Uri, headers: HeaderMap) -> Response {
@@ -571,6 +650,9 @@ async fn metrics(State(state): State<Arc<HttpState>>, uri: Uri, headers: HeaderM
             object.insert("first_response".into(), serde_json::to_value(first_response).unwrap());
             for (name, _, _, count) in input_metrics {
                 object.insert(name.into(), count.into());
+            }
+            if let Some(worker) = state.model.persistent_worker_snapshot() {
+                object.insert("persistent_worker".into(), serde_json::to_value(worker).unwrap());
             }
         }
         return ([(header::VARY, "accept")], Json(value)).into_response();
@@ -938,5 +1020,44 @@ mod observation_tests {
         assert!(observed["usage"].is_null());
         let ids_only = observed_chunk("x", 1, "model", 7, None, false);
         assert!(ids_only["choices"][0].get("token_timestamps_ns").is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_telemetry_endpoint_serializes_snapshot_and_returns_not_found_when_absent() {
+        let missing = worker_telemetry_response(None, Duration::from_secs(5), UNIX_EPOCH);
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let missing_bytes = axum::body::to_bytes(missing.into_body(), 4096)
+            .await
+            .unwrap();
+        let missing_json: Value = serde_json::from_slice(&missing_bytes).unwrap();
+        assert_eq!(missing_json["error"]["type"], "not_found_error");
+
+        let snapshot = PersistentWorkerSnapshot {
+            name: "sm103_expert_mover".into(),
+            worker_sm_count: 8,
+            state: WorkerState::Running,
+            counters: vec![42, 8_000_000_000, 2, 10, (9u64 << 32) | 123, 980, 20, 55],
+        };
+        let now = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+        let present = worker_telemetry_response(
+            Some(snapshot.clone()),
+            Duration::from_millis(12_500),
+            now,
+        );
+        assert_eq!(present.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(present.into_body(), 4096)
+            .await
+            .unwrap();
+        let parsed: WorkerTelemetryResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.snapshot(), snapshot);
+        assert_eq!(parsed.state, WorkerState::Running);
+        assert_eq!(parsed.timestamp_ms, 1_700_000_000_123);
+        assert!((parsed.uptime_secs - 12.5).abs() < 1e-6);
+
+        let raw: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(raw["name"], "sm103_expert_mover");
+        assert_eq!(raw["worker_sm_count"], 8);
+        assert_eq!(raw["state"], "running");
+        assert_eq!(raw["counters"].as_array().unwrap().len(), 8);
     }
 }

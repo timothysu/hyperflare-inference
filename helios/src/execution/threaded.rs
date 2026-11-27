@@ -601,7 +601,11 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
         || a.persistent_workers
             .iter()
             .zip(&b.persistent_workers)
-            .any(|(a, b)| a.worker_sm_count != b.worker_sm_count || a.graph != b.graph)
+            .any(|(a, b)| {
+                a.worker_sm_count != b.worker_sm_count
+                    || a.graph != b.graph
+                    || a.metrics_count != b.metrics_count
+            })
     {
         return false;
     }

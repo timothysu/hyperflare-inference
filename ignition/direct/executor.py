@@ -23,13 +23,65 @@ hold the forwards' temporaries.
 """
 
 import math
+import os
 import struct
+import time
 
 import torch
 
 from ignition.preparation.host_ranks import receive_json, receive_object, send_json, send_object
 
 _RESERVED = ("frame_index", "submission_sequence")
+
+
+def replay_startup_tuning(model, stream):
+    """Initialize diagnostic graph bindings before requests on every rank."""
+    manifest = model.manifest()
+    referenced = {binding["tuning_graph"] for graph in manifest["graphs"]
+                  for binding in graph.get("tuned_bindings", ())}
+    names = tuple(graph["name"] for graph in manifest.get("tuning_graphs", ())
+                  if graph["name"] in referenced)
+    buffers = {buffer["name"]: buffer for buffer in manifest["buffers"]}
+    storage = {field for graph in manifest.get("tuning_graphs", ()) if graph["name"] in referenced
+               for field in (*graph["outputs"], graph["status_buffer"])}
+    signature = (
+        tuple((graph["name"], tuple(graph["outputs"]), graph["status_buffer"])
+              for graph in manifest.get("tuning_graphs", ()) if graph["name"] in referenced),
+        tuple((graph["name"], tuple((binding["buffer"], binding["tuning_graph"])
+                                   for binding in graph.get("tuned_bindings", ())))
+              for graph in manifest["graphs"]),
+        tuple((name, buffers[name]["dtype"], buffers[name]["nbytes"],
+               tuple(buffers[name]["shape"]), tuple(buffers[name]["strides"])) for name in sorted(storage)),
+    )
+    coordinator = getattr(model.session, "_coordinator", None)
+    if coordinator is not None and not coordinator.same_on_every_rank(signature):
+        raise RuntimeError("diagnostic startup tuning graph order or binding schema differs across ranks")
+    for name in names:
+        tuner = model.tuning_graphs[name]
+        status = model.buffers[tuner.status_buffer]
+        error = None
+        try:
+            with torch.cuda.stream(stream):
+                status.fill_(-1)
+                tuner.graph.replay()
+        except BaseException as failure:
+            error = failure
+        deadline = time.monotonic() + 120
+        try:
+            while not stream.query():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"diagnostic startup tuning graph {name!r} did not drain")
+                time.sleep(.001)
+        except BaseException:
+            # A rank may still access its peers' storage; process teardown must reclaim it.
+            os.abort()
+        if error is not None:
+            # A partial launch can leave a peer waiting inside its graph.
+            os.abort()
+        value = int(status.item())
+        agreed = coordinator is None or coordinator.same_on_every_rank(value)
+        if value != 0 or not agreed:
+            raise RuntimeError(f"diagnostic startup tuning graph {name!r} failed: local status {value}")
 
 
 class StepRunner:
@@ -55,7 +107,6 @@ class StepRunner:
         torch.cuda.set_device(self.device)
         torch.cuda.synchronize(self.device)
         self.stream = torch.cuda.Stream(self.device)
-        from ignition.preparation.startup_tuning import replay_startup_tuning
         replay_startup_tuning(model, self.stream)
         if eager:
             for graph in model.graphs.values():

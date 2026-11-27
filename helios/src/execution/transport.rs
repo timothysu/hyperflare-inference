@@ -23,6 +23,7 @@ use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQ
 /// write to the coherent mapped word clearing the monitor). `PARK_LIMIT_US` is the longest
 /// intentional wait per park; scheduling can add to it.
 struct CompletionWake {
+    #[cfg_attr(not(all(target_arch = "aarch64", target_os = "linux")), allow(dead_code))]
     word: PinnedHost,
     device: usize,
 }
@@ -649,6 +650,14 @@ impl GraphExecutor {
 
     pub fn manifest(&self) -> &ExecutionManifest {
         &self.manifest
+    }
+
+    /// Lock-free telemetry snapshot from the manifest's persistent worker, when present.
+    pub fn persistent_worker_snapshot(&self) -> Option<super::PersistentWorkerSnapshot> {
+        self.manifest
+            .persistent_workers
+            .first()
+            .and_then(super::PersistentWorkerDescriptor::snapshot)
     }
     pub fn completed_fence(&self) -> Fence {
         self.completed

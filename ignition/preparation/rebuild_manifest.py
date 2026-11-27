@@ -228,9 +228,11 @@ def _members(value):
     return [(f'.{field.name}', getattr(value, field.name)) for field in fields(value)]
 
 
-def reproduction_arguments(model, plan, *, compiled_forwards, multi_host=False):
+def reproduction_arguments(model, plan, *, compiled_forwards=None, multi_host=None):
     """Build canonical `ignition export` arguments reproducing `plan` without host-local paths."""
+    from dataclasses import replace
     from pathlib import Path
+    from ignition.parameters import ParameterContext
 
     if model.directory is not None:
         target = Path(model.directory).name
@@ -238,136 +240,99 @@ def reproduction_arguments(model, plan, *, compiled_forwards, multi_host=False):
         target = f'{plan.checkpoint.repository}@{plan.checkpoint.revision}'
     else:
         target = plan.checkpoint.repository
-    args = ['ignition', 'export', target]
-    if multi_host:
-        args.extend(['--ranks', str(plan.world_size)])
-        if plan.roce_ring:
-            args.append('--roce-ring')
-        if plan.roce_chain:
-            args.append('--roce-chain')
-    else:
-        gpus = '0' if plan.world_size == 1 else f'0-{plan.world_size - 1}'
-        args.extend(['--gpus', gpus])
-    supports_cp = any(costs.page_tokens for costs in plan.recipe.ranks.values())
-    if not plan.context_parallel:
-        if supports_cp:
-            args.append('--no-context-parallel')
-    elif plan.context_parallel_size is not None and plan.context_parallel_size != plan.world_size:
-        args.extend(['--dcp-size', str(plan.context_parallel_size)])
-    args.extend(['--max-concurrency', str(plan.concurrency)])
-    if plan.recipe.max_images:
-        if plan.language_model_only:
-            args.append('--language-model-only')
-        else:
-            args.extend(['--image-concurrency', str(plan.image_concurrency)])
-    args.extend(['--prefill-chunk-size', str(plan.prefill_chunk)])
-    if plan.expert_scale_compression is not None:
-        args.extend(['--expert-scale-compression', plan.expert_scale_compression])
-    if getattr(plan, 'prompt_logprobs', False):
-        args.append('--prompt-logprobs')
-    if plan.mixed_prefill:
-        args.append('--mixed-prefill')
-    if plan.recipe.speculation is not None:
-        if (s := plan.speculation) is None:
-            args.append('--no-mtp')
-        else:
-            if s.method is not None:
-                args.extend(['--speculative-method', s.method])
-            args.extend(['--mtp-draft-tokens', str(s.draft_tokens)])
-            if s.mtp_only:
-                args.append('--mtp-only')
-            if not s.adaptive:
-                args.append('--no-mtp-adaptive-verification')
-            if s.draft_tokens > 0:
-                if plan.speculative_token_capacity:
-                    args.extend(['--speculative-token-capacity', str(plan.speculative_token_capacity)])
-                if s.packed_verification and s.graph_budget is not None:
-                    args.extend(['--speculative-graph-budget', str(s.graph_budget)])
-                if s.draft_body_quantization is not None:
-                    args.extend(['--draft-body-quantization', s.draft_body_quantization])
-                if s.draft_head_quantization is not None:
-                    args.extend(['--draft-head-quantization', s.draft_head_quantization])
-                if s.markov_head_quantization is not None:
-                    args.extend(['--markov-head-quantization', s.markov_head_quantization])
-                if s.vocabulary_parallel_sampling:
-                    args.append('--vocabulary-parallel-sampling')
-    if plan.online_mxfp8:
-        args.append('--online-mxfp8')
-        if plan.online_mxfp8_scope:
-            args.extend(['--online-mxfp8-scope', plan.online_mxfp8_scope])
-    if plan.mla_compute_mode and plan.mla_compute_mode != 'auto':
-        args.extend(['--mla-compute-mode', plan.mla_compute_mode])
-    if plan.force_moe_decode_a16:
-        args.append('--force-moe-decode-a16')
-    if getattr(plan, 'native_dense_activations', False):
-        args.append('--native-dense-activations')
-    if plan.shard_hyperconnections:
-        args.append('--shard-hyperconnections')
-    if plan.joint_tuning:
-        args.append('--joint-tuning')
-    if not plan.stream_overlap and plan.recipe.stream_overlap:
-        args.append('--no-stream-overlap')
-    if plan.collective_tuning:
-        args.extend(['--collective-tuning', plan.collective_tuning])
-    if effort := getattr(plan, 'autotune_effort', ''):
-        args.extend(['--autotune-effort', effort])
-    if getattr(plan, 'lock_gpu_clocks', False):
-        args.append('--lock-gpu-clocks')
-    if not compiled_forwards:
-        args.append('--no-compile')
-    return args
+    params = plan.parameters
+    updates = {}
+    if compiled_forwards is not None:
+        updates['compiled_forwards'] = bool(compiled_forwards)
+    if multi_host is not None:
+        updates['multi_host'] = bool(multi_host)
+    if params.tensor_parallel is None:
+        updates['tensor_parallel'] = plan.world_size
+    if updates:
+        params = replace(params, **updates)
+    context = ParameterContext(
+        recipe=plan.recipe,
+        checkpoint=plan.checkpoint,
+        root=params,
+        defaults=plan.recipe.parameters,
+        gpus=plan.gpus,
+        world_size=plan.world_size,
+    )
+    return ['ignition', 'export', target, *params.reproduction_args(context)]
 
 
-def from_plan(model, plan, *, compiled_forwards, multi_host=False):
+SCOPE_DEPLOYMENT = 'PREPARATION_PARAMETER_SCOPE_DEPLOYMENT'
+SCOPE_COMBINE = 'PREPARATION_PARAMETER_SCOPE_COMBINE'
+SCOPE_TARGET_WEIGHT = 'PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT'
+SCOPE_DRAFT_WEIGHT = 'PREPARATION_PARAMETER_SCOPE_DRAFT_WEIGHT'
+
+
+def _preparation_value(value):
+    if isinstance(value, bool):
+        return {'bool_value': value}
+    if isinstance(value, int):
+        return {'uint_value': value} if value >= 0 else {'int_value': value}
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError('preparation parameter float value must be finite')
+        return {'float_value': value}
+    if isinstance(value, str):
+        return {'string_value': value}
+    if isinstance(value, (list, tuple)):
+        return {'list_value': {'values': [_preparation_value(item) for item in value]}}
+    raise TypeError(f'unsupported preparation parameter value type: {type(value).__name__}')
+
+
+def from_plan(model, plan, *, compiled_forwards=None, multi_host=None):
+    """Build a `PreparationManifest` exclusively from `plan.parameters` and checkpoint provenance."""
+    from dataclasses import replace
+    from ignition.parameters import ParameterContext, ParameterScope
     from .source_identity import source_identity
 
-    result = dict(version=1, recipe=plan.recipe.name, source_identity=source_identity(),
-        checkpoint_repository=plan.checkpoint.repository,
-        checkpoint_revision=plan.checkpoint.revision if model.directory is None else '',
-        local_checkpoint=model.directory is not None, tensor_parallel=plan.world_size,
-        max_concurrency=plan.concurrency, prefill_chunk=plan.prefill_chunk,
-        image_concurrency=plan.image_concurrency, context_parallel=plan.context_parallel,
-        context_parallel_size=(plan.context_parallel_size or plan.world_size) if plan.context_parallel else 0,
-        stream_overlap=plan.stream_overlap, mixed_prefill=plan.mixed_prefill,
-        prompt_logprobs=bool(getattr(plan, 'prompt_logprobs', False)),
-        mla_compute_mode=plan.mla_compute_mode, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
-        online_mxfp8=plan.online_mxfp8, online_mxfp8_scope=plan.online_mxfp8_scope, language_model_only=plan.language_model_only,
-        compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes,
-        collective_tuning=plan.collective_tuning,
-        autotune_effort=getattr(plan, 'autotune_effort', ''),
-        native_dense_activations=bool(getattr(plan, 'native_dense_activations', False)),
-        lock_gpu_clocks=bool(getattr(plan, 'lock_gpu_clocks', False)),
-        reproduction_args=reproduction_arguments(
-            model, plan, compiled_forwards=compiled_forwards, multi_host=multi_host))
-    if plan.collective_ladder is not None:
-        import json
+    params = plan.parameters
+    updates = {}
+    if compiled_forwards is not None:
+        updates['compiled_forwards'] = bool(compiled_forwards)
+    if multi_host is not None:
+        updates['multi_host'] = bool(multi_host)
+    if params.tensor_parallel is None:
+        updates['tensor_parallel'] = plan.world_size
+    if updates:
+        params = replace(params, **updates)
 
-        result["collective_ladder_json"] = json.dumps(plan.collective_ladder, separators=(",", ":"), sort_keys=True)
-    if plan.expert_scale_compression is not None:
-        result['expert_scale_compression'] = plan.expert_scale_compression
-    if plan.force_moe_decode_a16:
-        result['force_moe_decode_a16'] = True
-    if plan.shard_hyperconnections:
-        result['shard_hyperconnections'] = True
-    if plan.joint_tuning:
-        result['joint_tuning'] = True
-    if (s := plan.speculation) is not None:
-        result['speculation'] = dict(draft_tokens=s.draft_tokens,
-            mtp_only=s.mtp_only,
-            adaptive=s.adaptive,
-            token_capacity=plan.speculative_token_capacity, packed_verification=s.packed_verification,
-            draft_prefix_selection=s.draft_prefix_selection,
-            vocabulary_parallel_sampling=s.vocabulary_parallel_sampling)
-        if s.method is not None:
-            result['speculation']['method'] = s.method
-        if s.packed_verification and s.draft_tokens > 0 and s.graph_budget is None:
-            raise ValueError('packed speculative rebuild metadata requires an explicit graph budget')
-        if s.graph_budget is not None:
-            result['speculation']['graph_budget'] = s.graph_budget
-        for field in ('draft_body_quantization', 'draft_head_quantization', 'markov_head_quantization'):
-            if (value := getattr(s, field)) is not None:
-                result['speculation'][field] = value
-    return result
+    context = ParameterContext(
+        recipe=plan.recipe,
+        checkpoint=plan.checkpoint,
+        root=params,
+        defaults=plan.recipe.parameters,
+        gpus=plan.gpus,
+        world_size=plan.world_size,
+    )
+    entries: dict[str, tuple[str, object]] = {}
+    for key, scope, value in params.manifest_parameters(context):
+        if scope is ParameterScope.NONE or value is None:
+            continue
+        scope_name = scope.value if isinstance(scope, ParameterScope) else scope
+        if key in entries:
+            raise ValueError(f'duplicate preparation parameter key {key!r}')
+        entries[key] = (scope_name, value)
+
+    parameters = [
+        {'key': key, 'scope': scope, 'value': _preparation_value(value)}
+        for key, (scope, value) in sorted(entries.items())
+    ]
+    return {
+        'version': 1,
+        'recipe': plan.recipe.name,
+        'source_identity': source_identity(),
+        'checkpoint_repository': plan.checkpoint.repository,
+        'checkpoint_revision': plan.checkpoint.revision if model.directory is None else '',
+        'local_checkpoint': model.directory is not None,
+        'reproduction_args': reproduction_arguments(
+            model, plan, compiled_forwards=params.compiled_forwards, multi_host=params.multi_host
+        ),
+        'parameters': parameters,
+    }
 
 
 def weight_views(roots):

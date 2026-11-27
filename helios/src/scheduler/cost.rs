@@ -28,6 +28,16 @@ pub(crate) fn observed_duration_ns(timing: ExecutionTiming) -> Option<u64> {
         .map(|ns| if timing.queued { ns } else { ns.max(timing.wall_ns) })
 }
 
+/// Prefers the shortest positive measured duration, yielding `0` only when every
+/// aggregated shape is unmeasured.
+pub(super) fn min_measured_duration(current: Option<u64>, nanos: u64) -> Option<u64> {
+    Some(match current {
+        None | Some(0) => nanos,
+        Some(old) if nanos == 0 => old,
+        Some(old) => old.min(nanos),
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct Key {
     pub drafts: usize,
@@ -172,7 +182,7 @@ impl ActionCosts {
             let maximum = (key.drafts + 1).min(key.tokens).min(key.packed);
             let nanos = estimate.nanos;
             for duration in self.packed_round_durations[key.batch.trailing_zeros() as usize].iter_mut().take(maximum + 1).skip(1) {
-                *duration = Some(duration.map_or(nanos, |old| old.min(nanos)));
+                *duration = min_measured_duration(*duration, nanos);
             }
         }
     }
@@ -286,7 +296,8 @@ impl ActionCosts {
 
 #[cfg(test)]
 mod tests {
-    use super::ReplayTimes;
+    use super::{ActionCosts, ReplayTimes, ScheduledStep};
+    use crate::execution::{GraphDescriptor, GraphKind, SamplingMode};
 
     #[test]
     fn isolated_slow_replay_does_not_displace_the_steady_cost() {
@@ -319,5 +330,54 @@ mod tests {
         let mut replays = ReplayTimes::default();
         assert_eq!(replays.observe(u64::MAX, true), u64::MAX);
         assert_eq!(replays.observe(u64::MAX - 1, true), u64::MAX);
+    }
+
+    #[test]
+    fn unmeasured_packed_sibling_does_not_zero_measured_round_duration() {
+        let make = |name: &str, drafts, width, packed| GraphDescriptor {
+            name: name.into(),
+            kind: GraphKind::Speculative,
+            sampling_mode: SamplingMode::General,
+            confidence_width: drafts,
+            draft_tokens: drafts,
+            handle: 1,
+            batch_capacity: 16,
+            token_capacity: width,
+            packed_token_capacity: packed,
+            prefill_capacity: 0,
+            estimated_duration_ns: 0,
+            input_bindings: vec![],
+            tuned_bindings: vec![],
+        };
+        let step_for = |drafts, width, packed| ScheduledStep {
+            draft_tokens: drafts,
+            kind: GraphKind::Speculative,
+            batch_capacity: 16,
+            token_capacity: width,
+            packed_token_capacity: packed,
+            mixed: None,
+            lanes: vec![],
+            requires_feedback: false,
+        };
+        let graphs = vec![
+            make("b16w4p64", 3, 4, 64),
+            make("b16w6p39", 5, 6, 39),
+        ];
+        let mut costs = ActionCosts::prepared(&graphs, 8).unwrap();
+        assert_eq!(costs.packed_round_duration(16, 4), Some(0));
+        // Measured first entry must not be zeroed by trailing unmeasured sibling.
+        costs.set_measured(&step_for(3, 4, 64), 24_000_000);
+        assert_eq!(costs.packed_round_duration(16, 4), Some(24_000_000));
+        assert_eq!(costs.packed_round_duration(16, 6), Some(0));
+        // Measuring a faster second sibling replaces the positive minimum.
+        costs.set_measured(&step_for(5, 6, 39), 18_000_000);
+        assert_eq!(costs.packed_round_duration(16, 4), Some(18_000_000));
+        assert_eq!(costs.packed_round_duration(16, 6), Some(18_000_000));
+
+        // Reverse order: unmeasured first entry must not block a measured sibling.
+        let mut reversed = ActionCosts::prepared(&graphs, 8).unwrap();
+        reversed.set_measured(&step_for(5, 6, 39), 18_000_000);
+        assert_eq!(reversed.packed_round_duration(16, 4), Some(18_000_000));
+        assert_eq!(reversed.packed_round_duration(16, 6), Some(18_000_000));
     }
 }

@@ -141,7 +141,7 @@ def test_deserialization_shares_descriptors_and_preserves_serialized_schema(monk
     row = tuple([2, 3]), tuple([4, 1]), 0, torch.float32, torch.device("cuda:0"), 0
     signature = (row, tuple(list(row)))
     payload = b"opaque Inductor artifact"
-    wire = payload, inputs, calls, signature, True
+    wire = payload, inputs, calls, signature, True, (4096,)
     owner = SimpleNamespace(serialize=lambda: payload)
     loads = []
 
@@ -153,6 +153,7 @@ def test_deserialization_shares_descriptors_and_preserves_serialized_schema(monk
     backend = StorageBackend.deserialize_compile_artifacts(pickle.dumps(wire))
     assert loads == [(payload, torch.device("cuda:0"), True)]
     assert backend.artifact is owner and backend._bound is None
+    assert backend._cuda_allocation_sizes == (4096,)
     assert backend.inputs[0].view is backend.inputs[1].view
     assert backend.invocations[0].operands[0] is backend.invocations[1].operands[0]
     assert backend.invocations[0].leaves is not backend.invocations[1].leaves

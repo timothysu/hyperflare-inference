@@ -1,16 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compiled graph variants reuse the largest captured allocation after reload."""
+"""Compiled graph variants reuse the largest planned allocation across warmup and capture."""
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import os
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from ignition.preparation.aot import ForwardCache
 from ignition.preparation.capture import capture_forwards
+from ignition.preparation.core_storage import CoreStorage
 from ignition.preparation.execution import GraphSignature
 
 
@@ -79,3 +81,34 @@ def test_capture_pool_reuses_larger_compiled_request_on_fresh_and_cached_load(tm
                 graph.reset()
             graphs.clear()
             compiled.clear()
+
+
+@torch.no_grad()
+def test_compiled_warmup_orders_largest_allocation_first_under_retention(tmp_path):
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+    mib = 1 << 20
+    with CoreStorage(device=0) as storage:
+        source = torch.ones(1, dtype=torch.uint8, device=device)
+        functions = {name: Forward(size, source, torch.empty_like(source))
+                     for name, size in (("small", 32 * mib + 65), ("large", 35 * mib))}
+        signatures = {name: GraphSignature("decode", 1, 1) for name in functions}
+        cache = ForwardCache(namespace={"model": "warmup-order"}, device=device, root=tmp_path, compile_workers=1)
+        peak_bytes = []
+
+        @contextmanager
+        def warmup():
+            with storage.transient():
+                yield
+            pool = storage._retention_pool
+            assert pool is not None
+            segments = [segment for segment in torch.cuda.memory_snapshot(include_traces=False)
+                        if tuple(segment["segment_pool_id"]) == tuple(pool.id)]
+            peak_bytes.append(sum(segment["total_size"] for segment in segments))
+
+        with storage.retain_transient_backing():
+            compiled = cache.prepare_many(functions, signatures, materialize=lambda: None, warmup=warmup)
+        assert tuple(compiled) == ("large", "small")
+        assert max(peak_bytes) == 36 * mib
+        assert storage._snapshot()["retained_handles"] == 0
+        assert storage.error is None

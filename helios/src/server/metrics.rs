@@ -217,6 +217,7 @@ pub(super) struct Metrics {
     page_tokens: u64,
     decode_weight_bytes: u64,
     pub engram: Option<std::sync::Arc<crate::engram::Stats>>,
+    pub persistent_worker: Option<crate::execution::PersistentWorkerReader>,
     prefill_tokens: AtomicU64,
     generated_tokens: AtomicU64,
     accepted_drafts: AtomicU64,
@@ -293,6 +294,8 @@ pub(super) struct Metrics {
     host_deeper_link_pages: [AtomicU64; 2],
     host_slots: [AtomicU64; 3],
     host_dropped: [AtomicU64; 8],
+    decode: std::sync::Mutex<flare_selene::codec_copy::DecodeStats>,
+    codec_state: std::sync::OnceLock<crate::offload::KvCompression>,
     host_refusal_drops: [AtomicU64; 5],
     pub(super) host_reoffer_calls: AtomicU64,
     pub(super) host_reoffer_present: AtomicU64,
@@ -339,6 +342,12 @@ impl Metrics {
                 counter.fetch_add(value, Ordering::Relaxed);
             }
         }
+    }
+
+    pub fn persistent_worker_snapshot(&self) -> Option<crate::execution::PersistentWorkerSnapshot> {
+        self.persistent_worker
+            .as_ref()
+            .map(crate::execution::PersistentWorkerReader::snapshot)
     }
 
     pub fn snapshot(&self, learned_drafter: bool) -> Snapshot {
@@ -547,10 +556,17 @@ impl Metrics {
         }
     }
 
+    pub(super) fn codec_placement(&self, placement: crate::offload::KvCompression) {
+        let _ = self.codec_state.set(placement);
+    }
+
     /// Host prefix store counters and gauges, written from the model thread.
     /// Lookups, hits, and reused tokens come from the scheduler, which applies
     /// the fetch policy.
     pub fn store(&self, stats: StoreStats) {
+        if self.codec_state.get().is_some_and(|placement| *placement != crate::offload::KvCompression::Off) {
+            *self.decode.lock().unwrap() = stats.decode;
+        }
         for (gauge, value) in self
             .host_retirement_buckets
             .iter()
@@ -645,6 +661,48 @@ impl Metrics {
 
     pub fn render(&self) -> String {
         let mut text = String::with_capacity(4096);
+        use crate::offload::KvCompression;
+        let placement = self.codec_state.get().copied().unwrap_or_default();
+        if placement != KvCompression::Off {
+            let _ = writeln!(text, "# HELP flare_kv_codec_active Active lossless KV checkpoint codec placement.");
+            let _ = writeln!(text, "# TYPE flare_kv_codec_active gauge");
+            let _ = writeln!(text, "flare_kv_codec_active{{placement=\"{placement}\"}} 1");
+            let stats = *self.decode.lock().unwrap();
+            for (name, help, value) in [
+                (
+                    "original_bytes_total",
+                    "Logical uncompressed KV checkpoint bytes processed by the codec.",
+                    stats.original_bytes,
+                ),
+                (
+                    "stored_bytes_total",
+                    "Compressed or literal stored KV checkpoint bytes processed by the codec.",
+                    stats.stored_bytes,
+                ),
+                (
+                    "failed_windows_total",
+                    "KV checkpoint codec windows that failed encode or decode.",
+                    stats.failed_windows,
+                ),
+                (
+                    "transform_nanoseconds_total",
+                    "Cumulative time spent in KV checkpoint codec transforms and coding.",
+                    stats.transform_ns,
+                ),
+            ] {
+                let _ = writeln!(text, "# HELP flare_kv_codec_{name} {help}");
+                let _ = writeln!(text, "# TYPE flare_kv_codec_{name} counter");
+                let _ = writeln!(text, "flare_kv_codec_{name}{{placement=\"{placement}\"}} {value}");
+            }
+            let _ = writeln!(
+                text,
+                "# HELP flare_kv_codec_verification_failures_total CRC-32/IEEE verification failures during KV checkpoint decode."
+            );
+            let _ = writeln!(text, "# TYPE flare_kv_codec_verification_failures_total counter");
+            for (stage, value) in [("stored", stats.stored_failures), ("original", stats.original_failures)] {
+                let _ = writeln!(text, "flare_kv_codec_verification_failures_total{{stage=\"{stage}\"}} {value}");
+            }
+        }
         for (tier, count) in ["gpu", "dram", "nvme"]
             .iter()
             .zip(&self.host_restores_by_tier)
@@ -911,6 +969,9 @@ impl Metrics {
 
         if let Some(stats) = &self.engram {
             stats.render(&mut text);
+        }
+        if let Some(worker) = self.persistent_worker_snapshot() {
+            render_persistent_worker_metrics(&mut text, &worker);
         }
         text.push_str("# HELP flare_sampling_graph_launches_total Successful native submissions by captured sampler mode; includes consumption-only prefill.\n# TYPE flare_sampling_graph_launches_total counter\n");
         for (kind, count) in ["prefill", "decode", "resume", "speculative", "mixed"]
@@ -1369,6 +1430,49 @@ pub(super) fn metric(text: &mut String, name: &str, kind: &str, help: &str, valu
     );
 }
 
+fn escape_prometheus_label(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn render_persistent_worker_metrics(
+    text: &mut String,
+    worker: &crate::execution::PersistentWorkerSnapshot,
+) {
+    let label = escape_prometheus_label(&worker.name);
+    let active = u8::from(worker.state.is_active());
+    let _ = writeln!(
+        text,
+        "# HELP flare_persistent_worker_active Whether the core's persistent GPU worker is actively running (1) or not (0).\n\
+         # TYPE flare_persistent_worker_active gauge\n\
+         flare_persistent_worker_active{{worker=\"{label}\"}} {active}\n\
+         # HELP flare_persistent_worker_sm_count Streaming multiprocessors partitioned for the persistent GPU worker.\n\
+         # TYPE flare_persistent_worker_sm_count gauge\n\
+         flare_persistent_worker_sm_count{{worker=\"{label}\"}} {}",
+        worker.worker_sm_count
+    );
+    if !worker.counters.is_empty() {
+        text.push_str(
+            "# HELP flare_persistent_worker_counter Raw 64-bit counter values reported by the persistent worker in mapped-host memory.\n\
+             # TYPE flare_persistent_worker_counter gauge\n",
+        );
+        for (index, value) in worker.counters.iter().enumerate() {
+            let _ = writeln!(
+                text,
+                "flare_persistent_worker_counter{{worker=\"{label}\",index=\"{index}\"}} {value}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1808,6 +1912,52 @@ mod tests {
                 .count(),
             9
         );
+    }
+    #[test]
+    fn persistent_worker_prometheus_metrics_render_only_when_present() {
+        use crate::execution::{PersistentWorkerReader, PersistentWorkerSnapshot, WorkerState};
+        use std::sync::{Arc, Mutex};
+
+        let mut metrics = Metrics::new(0, 0, 0, 16);
+        let without_worker = metrics.render();
+        assert!(!without_worker.contains("flare_persistent_worker_"));
+
+        let state = Arc::new(Mutex::new(PersistentWorkerSnapshot {
+            name: "sm103_expert_mover".into(),
+            worker_sm_count: 8,
+            state: WorkerState::Running,
+            counters: vec![12, 4096, 1, 3, (2u64 << 32) | 19, 95, 5, 16],
+        }));
+        let state_ref = Arc::clone(&state);
+        metrics.persistent_worker = Some(PersistentWorkerReader::new(Arc::new(move || {
+            state_ref.lock().unwrap().clone()
+        })));
+
+        let text = metrics.render();
+        for expected in [
+            "# TYPE flare_persistent_worker_active gauge\n",
+            "flare_persistent_worker_active{worker=\"sm103_expert_mover\"} 1\n",
+            "# TYPE flare_persistent_worker_sm_count gauge\n",
+            "flare_persistent_worker_sm_count{worker=\"sm103_expert_mover\"} 8\n",
+            "# TYPE flare_persistent_worker_counter gauge\n",
+            "flare_persistent_worker_counter{worker=\"sm103_expert_mover\",index=\"0\"} 12\n",
+            "flare_persistent_worker_counter{worker=\"sm103_expert_mover\",index=\"1\"} 4096\n",
+            "flare_persistent_worker_counter{worker=\"sm103_expert_mover\",index=\"7\"} 16\n",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+
+        // Transitioning to Draining/Stopped flips active gauge to 0 and preserves label escaping.
+        {
+            let mut snap = state.lock().unwrap();
+            snap.state = WorkerState::Stopped;
+            snap.name = "custom\"worker".into();
+            snap.counters.clear();
+        }
+        let stopped = metrics.render();
+        assert!(stopped.contains("flare_persistent_worker_active{worker=\"custom\\\"worker\"} 0\n"));
+        assert!(stopped.contains("flare_persistent_worker_sm_count{worker=\"custom\\\"worker\"} 8\n"));
+        assert!(!stopped.contains("flare_persistent_worker_counter{"));
     }
 }
 

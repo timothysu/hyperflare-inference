@@ -14,8 +14,9 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use crate::execution::{
-    BufferDescriptor, TunedBinding, TuningGraphDescriptor, Dtype, ExecutionManifest, ExecutionWorker, GraphDescriptor, GraphKind,
-    InputBinding, OwnedUpload, SamplingMode,
+    BufferDescriptor, Dtype, ExecutionManifest, ExecutionWorker, GraphDescriptor, GraphKind,
+    InputBinding, OwnedUpload, PersistentWorkerDescriptor, SamplingMode, TunedBinding,
+    TuningGraphDescriptor,
 };
 use crate::lifetime::OwnerLease;
 #[cfg(feature = "qualification")]
@@ -248,6 +249,68 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
             status_buffer: field!(graph, "status_buffer", String),
         });
     }
+    let mut persistent_workers = Vec::new();
+    match value.get_item("persistent_workers") {
+        Ok(workers) if !workers.is_none() => {
+            for pw in workers.try_iter()? {
+                let pw = pw?;
+                let stop_flag = pw.get_item("stop_flag")?;
+                let stop_flag_allocation = field!(stop_flag, "allocation", String);
+                let stop_flag_offset = match stop_flag.get_item("offset") {
+                    Ok(v) if !v.is_none() => v.extract::<usize>()?,
+                    Ok(_) => 0,
+                    Err(error)
+                        if error.is_instance_of::<pyo3::exceptions::PyKeyError>(value.py()) =>
+                    {
+                        0
+                    }
+                    Err(error) => return Err(error),
+                };
+                let stop_buf = buffers
+                    .iter()
+                    .find(|b| b.name == stop_flag_allocation)
+                    .ok_or_else(|| {
+                        PyValueError::new_err(
+                            "persistent worker stop_flag allocation is not a registered buffer",
+                        )
+                    })?;
+                let stop_flag_end = stop_flag_offset.checked_add(4).ok_or_else(|| {
+                    PyValueError::new_err("persistent worker stop_flag offset overflow")
+                })?;
+                if stop_flag_end > stop_buf.nbytes {
+                    return Err(PyValueError::new_err(
+                        "persistent worker stop_flag exceeds its registered buffer",
+                    ));
+                }
+                let stop_flag_address = stop_buf
+                    .address
+                    .checked_add(stop_flag_offset)
+                    .ok_or_else(|| {
+                        PyValueError::new_err("persistent worker stop_flag address overflow")
+                    })?;
+                persistent_workers.push(PersistentWorkerDescriptor {
+                    worker_sm_count: field!(pw, "worker_sm_count", u32),
+                    graph: field!(pw, "graph", String),
+                    handle: pw
+                        .get_item("handle")
+                        .ok()
+                        .and_then(|v| v.extract::<usize>().ok())
+                        .unwrap_or(0),
+                    stop_flag_allocation,
+                    stop_flag_offset,
+                    stop_flag_address,
+                    metrics_allocation: None,
+                    metrics_offset: 0,
+                    metrics_address: 0,
+                    metrics_count: 0,
+                    control: None,
+                });
+            }
+        }
+        Ok(_) => {}
+        Err(error) if error.is_instance_of::<pyo3::exceptions::PyKeyError>(value.py()) => {}
+        Err(error) => return Err(error),
+    }
     Ok(ExecutionManifest {
         collectives: None,
         engram: crate::embedding_tables::binding(value)?,
@@ -266,7 +329,7 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
         buffers,
         graphs,
         tuning_graphs,
-        persistent_workers: vec![],
+        persistent_workers,
     })
 }
 
@@ -301,6 +364,15 @@ struct PreparedGraphExecutor {
     drained: std::sync::atomic::AtomicBool,
 }
 
+fn reject_in_process_persistent_worker(manifest: &ExecutionManifest) -> PyResult<()> {
+    if !manifest.persistent_workers.is_empty() {
+        return Err(PyValueError::new_err(
+            "persistent worker requires green-context runtime control (export a core and serve with flare run)",
+        ));
+    }
+    Ok(())
+}
+
 #[pymethods]
 impl PreparedGraphExecutor {
     #[new]
@@ -320,6 +392,7 @@ impl PreparedGraphExecutor {
         manifest
             .validate()
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        reject_in_process_persistent_worker(&manifest)?;
         let peers = peer_fds
             .map(|fds| {
                 fds.into_iter()
@@ -466,6 +539,7 @@ fn serve_tensor_parallel_rank(
     manifest
         .validate()
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    reject_in_process_persistent_worker(&manifest)?;
     let socket = rank_socket(socket_fd)?;
     let mut owner = OwnerLease(Some(owner));
     // SAFETY: The lease retains every graph and IPC mapping until the native
@@ -665,6 +739,160 @@ mod binding_tests {
             );
         });
     }
+
+    #[test]
+    fn in_process_loader_rejects_persistent_workers_manifest() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "flare_heliopause").unwrap();
+            flare_heliopause(&module).unwrap();
+            let locals = pyo3::types::PyDict::new(py);
+            locals.set_item("mod", &module).unwrap();
+            let manifest = py
+                .eval(
+                    c"dict(
+                        abi_version=6,
+                        completion_token_capacity=8,
+                        context=0x1234,
+                        device=0,
+                        max_active=4,
+                        input_frame_bytes=16,
+                        buffers=[
+                            dict(name='frame_index', address=0x10000, nbytes=4, dtype='int32', shape=[1], strides=[1]),
+                            dict(name='submission_sequence', address=0x20000, nbytes=8, dtype='int64', shape=[1], strides=[1]),
+                            dict(name='completion_records', address=0x30000, nbytes=2*4*24*8, dtype='int64', shape=[2, 4, 24], strides=[96, 24, 1]),
+                            dict(name='worker_ctrl', address=0x40000, nbytes=128, dtype='uint8', shape=[128], strides=[1]),
+                        ],
+                        graphs=[
+                            dict(
+                                name='decode',
+                                kind='decode',
+                                sampling_mode='general',
+                                handle=101,
+                                batch_capacity=4,
+                                token_capacity=1,
+                                prefill_capacity=0,
+                                confidence_width=0,
+                                estimated_duration_ns=0,
+                                input_bindings=[
+                                    dict(buffer_name='frame_index', host_offset=0, nbytes=4),
+                                    dict(buffer_name='submission_sequence', host_offset=8, nbytes=8),
+                                ],
+                                tuned_bindings=[],
+                            )
+                        ],
+                        tuning_graphs=[],
+                        persistent_workers=[dict(
+                            worker_sm_count=8,
+                            graph='worker_launch',
+                            handle=202,
+                            stop_flag=dict(allocation='worker_ctrl', offset=0),
+                        )],
+                    )",
+                    None,
+                    Some(&locals),
+                )
+                .unwrap();
+
+            // Native manifest parsing retains persistent_workers and passes structural validation.
+            let parsed = execution_manifest(&manifest).unwrap();
+            assert_eq!(parsed.persistent_workers.len(), 1);
+            assert_eq!(parsed.persistent_workers[0].worker_sm_count, 8);
+            assert_eq!(parsed.persistent_workers[0].graph, "worker_launch");
+            assert_eq!(
+                parsed.persistent_workers[0].stop_flag_allocation,
+                "worker_ctrl"
+            );
+            assert_eq!(parsed.persistent_workers[0].stop_flag_offset, 0);
+            assert_eq!(parsed.persistent_workers[0].stop_flag_address, 0x40000);
+            parsed.validate().unwrap();
+
+            // In-process GraphExecutor and serve_tensor_parallel_rank both reject persistent_workers explicitly.
+            let owner = py.eval(c"object()", None, None).unwrap();
+            let exec_err = module
+                .getattr("GraphExecutor")
+                .unwrap()
+                .call1((&owner, &manifest))
+                .unwrap_err();
+            assert!(exec_err.is_instance_of::<PyValueError>(py));
+            assert!(
+                exec_err.to_string().contains("green-context runtime control"),
+                "unexpected GraphExecutor error: {exec_err}"
+            );
+
+            let rank_err = module
+                .getattr("serve_tensor_parallel_rank")
+                .unwrap()
+                .call1((&owner, &manifest, 0, 0usize, 1usize))
+                .unwrap_err();
+            assert!(rank_err.is_instance_of::<PyValueError>(py));
+            assert!(
+                rank_err.to_string().contains("green-context runtime control"),
+                "unexpected serve_tensor_parallel_rank error: {rank_err}"
+            );
+
+            // More than one persistent worker fails manifest validation.
+            let multi_manifest = manifest
+                .cast::<pyo3::types::PyDict>()
+                .unwrap()
+                .copy()
+                .unwrap();
+            let workers = py
+                .eval(
+                    c"[
+                        dict(worker_sm_count=8, graph='worker_a', handle=202, stop_flag=dict(allocation='worker_ctrl', offset=0)),
+                        dict(worker_sm_count=8, graph='worker_b', handle=203, stop_flag=dict(allocation='worker_ctrl', offset=4)),
+                    ]",
+                    None,
+                    None,
+                )
+                .unwrap();
+            multi_manifest
+                .set_item("persistent_workers", workers)
+                .unwrap();
+            let multi_parsed = execution_manifest(multi_manifest.as_any()).unwrap();
+            let multi_err = multi_parsed.validate().unwrap_err().to_string();
+            assert!(multi_err.contains("at most one persistent worker"), "{multi_err}");
+
+            // Unregistered stop_flag allocation is rejected during manifest parsing.
+            let bad_manifest = manifest
+                .cast::<pyo3::types::PyDict>()
+                .unwrap()
+                .copy()
+                .unwrap();
+            let bad_workers = py
+                .eval(
+                    c"[dict(worker_sm_count=8, graph='worker_launch', handle=202, stop_flag=dict(allocation='missing_ctrl', offset=0))]",
+                    None,
+                    None,
+                )
+                .unwrap();
+            bad_manifest
+                .set_item("persistent_workers", bad_workers)
+                .unwrap();
+            let parse_err = execution_manifest(bad_manifest.as_any()).unwrap_err();
+            assert!(parse_err.is_instance_of::<PyValueError>(py));
+
+            // Out-of-bounds stop_flag offset is rejected during manifest parsing.
+            let oob_manifest = manifest
+                .cast::<pyo3::types::PyDict>()
+                .unwrap()
+                .copy()
+                .unwrap();
+            let oob_workers = py
+                .eval(
+                    c"[dict(worker_sm_count=8, graph='worker_launch', handle=202, stop_flag=dict(allocation='worker_ctrl', offset=128))]",
+                    None,
+                    None,
+                )
+                .unwrap();
+            oob_manifest
+                .set_item("persistent_workers", oob_workers)
+                .unwrap();
+            let oob_err = execution_manifest(oob_manifest.as_any()).unwrap_err();
+            assert!(oob_err.is_instance_of::<PyValueError>(py));
+        });
+    }
 }
 
 #[cfg(all(feature = "server", feature = "qualification"))]
@@ -692,6 +920,7 @@ impl NativeServer {
             ));
         }
         let manifest = execution_manifest(manifest)?;
+        reject_in_process_persistent_worker(&manifest)?;
         let peers = peer_fds
             .map(|fds| {
                 fds.into_iter()

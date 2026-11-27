@@ -145,10 +145,13 @@ message DeploymentBody {
   uint32 tensor_parallel = 3;
   flare.runtime.ServingContract contract = 4;
   flare.runtime.Cluster cluster = 5;
-  flare.runtime.RebuildManifest rebuild = 6;
+  // Deprecated preparation metadata retained to decode legacy cores.
+  flare.runtime.RebuildManifest rebuild = 6 [deprecated = true];
   Engram engram = 7;
   repeated PayloadDescriptor payloads = 8; // deployment-scoped payload lengths.
   repeated RankCommitment ranks = 9;
+  // Preparation provenance and Ignition-owned options. Serving ignores this field.
+  flare.runtime.PreparationManifest preparation = 10;
 }
 
 // One native rank of one deployment: placement, initialization, and execution geometry.

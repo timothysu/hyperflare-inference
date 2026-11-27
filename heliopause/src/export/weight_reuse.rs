@@ -22,6 +22,8 @@ pub(crate) struct Source {
     envelope: Vec<u8>,
     publishers: Vec<helios_core::runtime_core::Publisher>,
     #[serde(default)]
+    preparation_manifest: Option<serde_json::Value>,
+    #[serde(default)]
     rebuild_manifest: Option<serde_json::Value>,
 }
 
@@ -178,6 +180,7 @@ pub(crate) fn open_source(
         source: Source {
             envelope: metadata.envelope,
             publishers,
+            preparation_manifest: None,
             rebuild_manifest: None,
         },
         _entry: entry,
@@ -226,13 +229,29 @@ pub(crate) fn numeric_ranges(
     Ok(super::reachability::merge_ranges(ranges))
 }
 
-fn same_draft_body_quantization(
-    previous: &super::wire::RebuildManifest,
-    expected: &super::wire::RebuildManifest,
-) -> bool {
-    // An export without a draft only reuses target views, checked separately.
-    expected.speculation.is_none()
-        || previous.effective_draft_body_quantization() == expected.effective_draft_body_quantization()
+#[allow(deprecated)]
+fn expected_preparation(source: &Source) -> Result<super::wire::PreparationManifest> {
+    match (&source.preparation_manifest, &source.rebuild_manifest) {
+        (Some(_), Some(_)) => Err(invalid(
+            "--reuse-weights cannot specify both preparation_manifest and deprecated rebuild_manifest",
+        )),
+        (Some(value), None) => {
+            let manifest: super::wire::PreparationManifest =
+                super::binding::message("PreparationManifest", value)?;
+            helios_core::runtime_core::validate_preparation_manifest(&manifest)?;
+            Ok(manifest)
+        }
+        (None, Some(value)) => {
+            let legacy: super::wire::RebuildManifest =
+                super::binding::message("RebuildManifest", value)?;
+            Ok(helios_core::runtime_core::from_legacy_rebuild_manifest(
+                &legacy,
+            ))
+        }
+        (None, None) => Err(invalid(
+            "--reuse-weights requires preparation input metadata",
+        )),
+    }
 }
 
 impl Source {
@@ -285,17 +304,13 @@ impl Source {
         )
     }
 
+    #[allow(deprecated)]
     fn deployment(
         &self,
         request: &CaptureRequest,
         output: &RankOutput,
     ) -> Result<protection::VerifiedCore> {
-        let expected: super::wire::RebuildManifest = super::binding::message(
-            "RebuildManifest",
-            self.rebuild_manifest
-                .as_ref()
-                .ok_or_else(|| invalid("--reuse-weights requires preparation input metadata"))?,
-        )?;
+        let expected = expected_preparation(self)?;
         let shared = protection::verify(
             &self.envelope,
             &self.publishers,
@@ -308,22 +323,15 @@ impl Source {
             {
                 continue;
             }
-            let previous = body
-                .rebuild
-                .as_ref()
-                .ok_or_else(|| invalid("cached deployment has no preparation input metadata"))?;
-            if previous.recipe != expected.recipe
-                || previous.checkpoint_repository != expected.checkpoint_repository
-                || previous.checkpoint_revision != expected.checkpoint_revision
-                || previous.local_checkpoint != expected.local_checkpoint
-                || previous.tensor_parallel != expected.tensor_parallel
-                || previous.online_mxfp8 != expected.online_mxfp8
-                || (if previous.online_mxfp8_scope.is_empty() { "all" } else { &previous.online_mxfp8_scope })
-                    != (if expected.online_mxfp8_scope.is_empty() { "all" } else { &expected.online_mxfp8_scope })
-                || !same_draft_body_quantization(previous, &expected)
+            let previous = helios_core::runtime_core::resolve_preparation(
+                body.preparation.as_ref(),
+                body.rebuild.as_ref(),
+            )?
+            .ok_or_else(|| invalid("cached deployment has no preparation input metadata"))?;
+            if !helios_core::runtime_core::compatible_for_weight_reuse(previous.as_ref(), &expected)
             {
                 return Err(invalid(
-                    "--reuse-weights requires the same recipe, checkpoint revision, tensor-parallel size, and draft conversion settings",
+                    "--reuse-weights requires the same recipe, checkpoint revision, tensor-parallel size, and weight conversion settings",
                 ));
             }
             return Ok(protection::verify(
@@ -594,10 +602,22 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Source, same_draft_body_quantization};
-    use helios_core::runtime_core::wire::{RebuildManifest, RebuildSpeculation};
+    use super::Source;
+    use helios_core::runtime_core::{
+        compatible_for_weight_reuse, from_legacy_rebuild_manifest,
+        wire::{RebuildManifest, RebuildSpeculation},
+    };
+
+    #[allow(deprecated)]
+    fn legacy_compatible(previous: &RebuildManifest, expected: &RebuildManifest) -> bool {
+        compatible_for_weight_reuse(
+            &from_legacy_rebuild_manifest(previous),
+            &from_legacy_rebuild_manifest(expected),
+        )
+    }
 
     #[test]
+    #[allow(deprecated)]
     fn draft_body_quantization_must_match_for_weight_reuse() {
         let manifest = |value: Option<&str>| RebuildManifest {
             speculation: Some(RebuildSpeculation {
@@ -606,13 +626,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(same_draft_body_quantization(&manifest(None), &manifest(None)));
-        assert!(same_draft_body_quantization(
+        assert!(legacy_compatible(&manifest(None), &manifest(None)));
+        assert!(legacy_compatible(
             &manifest(Some("mxfp8")),
             &manifest(Some("mxfp8"))
         ));
         for (previous, expected) in [(None, Some("mxfp8")), (Some("mxfp8"), None)] {
-            assert!(!same_draft_body_quantization(
+            assert!(!legacy_compatible(
                 &manifest(previous),
                 &manifest(expected)
             ));
@@ -620,6 +640,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn weight_reuse_resolves_inherited_dflash_body_precision() {
         for (online, scope, equivalent) in [
             (true, "all", true),
@@ -643,21 +664,15 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .draft_body_quantization = Some("mxfp8".into());
-            assert_eq!(
-                same_draft_body_quantization(&implicit, &explicit),
-                equivalent
-            );
-            assert_eq!(
-                same_draft_body_quantization(&explicit, &implicit),
-                equivalent
-            );
+            assert_eq!(legacy_compatible(&implicit, &explicit), equivalent);
+            assert_eq!(legacy_compatible(&explicit, &implicit), equivalent);
             // Disabling drafts reuses only target views, whose compatibility is
             // validated independently of the unconsumed draft-body setting.
             let mut target_only = implicit.clone();
             target_only.speculation = None;
-            assert!(same_draft_body_quantization(&implicit, &target_only));
-            assert!(same_draft_body_quantization(&explicit, &target_only));
-            assert!(!same_draft_body_quantization(&target_only, &explicit));
+            assert!(legacy_compatible(&implicit, &target_only));
+            assert!(legacy_compatible(&explicit, &target_only));
+            assert!(!legacy_compatible(&target_only, &explicit));
         }
     }
 
@@ -668,7 +683,8 @@ mod tests {
             let source = Source {
                 envelope: bytes[..length].to_vec(),
                 publishers: Vec::new(),
-                rebuild_manifest: Some(serde_json::json!({"recipe":"fixture"})),
+                preparation_manifest: Some(serde_json::json!({"version":1,"recipe":"fixture"})),
+                rebuild_manifest: None,
             };
             let json = serde_json::to_string(&source).unwrap();
             let metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -678,7 +694,7 @@ mod tests {
             let from_value: Source = serde_json::from_value(metadata).unwrap();
             for restored in [from_json, from_value] {
                 assert_eq!(restored.envelope, source.envelope);
-                assert_eq!(restored.rebuild_manifest, source.rebuild_manifest);
+                assert_eq!(restored.preparation_manifest, source.preparation_manifest);
             }
         }
     }
@@ -688,6 +704,7 @@ mod tests {
         let source = Source {
             envelope: vec![0xfb, 0xff],
             publishers: Vec::new(),
+            preparation_manifest: None,
             rebuild_manifest: None,
         };
         let metadata = serde_json::to_value(&source).unwrap();

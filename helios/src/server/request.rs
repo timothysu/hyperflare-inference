@@ -174,8 +174,8 @@ pub(super) fn prepare_validated_inference(
     let structured = opts.constraint.is_some();
     let (normalized, raw, options) = template_inputs(frontend, request, index)?;
     let (rendered, echo) = if let Some(raw) = raw {
-        let (mut token_ids, echo) = match raw {
-            RawPrompt::Text(text) => (frontend.encode(text, true)?, text.clone()),
+        let (mut token_ids, echo, decoded_text) = match raw {
+            RawPrompt::Text(text) => (frontend.encode(text, true)?, text.clone(), None),
             RawPrompt::Tokens(ids) => {
                 if ids.is_empty()
                     || ids
@@ -184,7 +184,8 @@ pub(super) fn prepare_validated_inference(
                 {
                     return Err("token prompt must contain valid vocabulary IDs".into());
                 }
-                (ids.clone(), frontend.decode(ids, false)?)
+                let decoded = frontend.decode(ids, false)?;
+                (ids.clone(), decoded.clone(), Some(decoded))
             }
         };
         if token_ids.is_empty() {
@@ -194,10 +195,14 @@ pub(super) fn prepare_validated_inference(
                     .ok_or("empty prompt requires a BOS token declared by the core")?,
             );
         }
+        let text = match decoded_text {
+            Some(text) => text,
+            None => frontend.decode(&token_ids, false)?,
+        };
         (
             crate::frontend::RenderedPrompt {
                 message_boundaries: Vec::new(),
-                text: frontend.decode(&token_ids, false)?,
+                text,
                 token_ids,
                 image_sources: Vec::new(),
                 image_checkpoint_hints: Vec::new(),

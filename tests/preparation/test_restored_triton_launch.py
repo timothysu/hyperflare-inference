@@ -115,6 +115,7 @@ def test_storage_roundtrip_bypasses_imported_global_autotuner(
         artifact=SimpleNamespace(serialize=lambda: b"inner artifact"),
         inputs=[],
         _serialized_artifact=None,
+        _cuda_allocation_sizes=(),
         _tuning_frozen=False,
         invocations=[_Invocation(node.target, leaves, tree, operands)],
         signature=(((32,), (1,), 0, torch.float32, torch.device("cuda:0"), 0),),

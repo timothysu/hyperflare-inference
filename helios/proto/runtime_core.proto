@@ -72,14 +72,74 @@ message ModelIndex {
   // loads the one it serves.
   Cluster cluster = 9;
   ServingContract contract = 10;
-  // Preparation-only metadata. Absence means no rebuild description was recorded;
-  // serving uses contract and rank bundles regardless of this field's version.
-  RebuildManifest rebuild = 11;
+  // Deprecated preparation metadata retained to decode legacy cores.
+  RebuildManifest rebuild = 11 [deprecated = true];
+  // Preparation provenance and Ignition-owned options. Absence means no
+  // preparation description was recorded; serving uses contract and rank
+  // bundles regardless of this field's version.
+  PreparationManifest preparation = 12;
 }
 
-// Identifies the preparation inputs without embedding source code or checkpoint config files.
-// A compatible Ignition importer is required to prepare graphs from stored weight views.
+// Preparation provenance and Ignition-owned options. Serving ignores this
+// message regardless of its version.
+message PreparationManifest {
+  uint32 version = 1;
+  string recipe = 2;
+  string source_identity = 3;
+  string checkpoint_repository = 4;
+  string checkpoint_revision = 5;
+  // Local checkpoint overrides have no asserted upstream revision.
+  bool local_checkpoint = 6;
+  // Canonical `ignition export` arguments reproducing this deployment's
+  // preparation inputs, without host-local paths or secrets.
+  repeated string reproduction_args = 7;
+  // Ignition-owned preparation parameters, ordered strictly by unique key.
+  repeated PreparationParameter parameters = 8;
+}
+
+enum PreparationParameterScope {
+  PREPARATION_PARAMETER_SCOPE_UNSPECIFIED = 0;
+  // Deployment-local preparation option (capacities, transport, compiler,
+  // tuning). Preserved for inspection and reproduction; ignored by core
+  // combination and cached-weight reuse.
+  PREPARATION_PARAMETER_SCOPE_DEPLOYMENT = 1;
+  // Shared preparation semantics that must agree across combined deployments
+  // without constraining target-only cached-weight reuse.
+  PREPARATION_PARAMETER_SCOPE_COMBINE = 2;
+  // Target-model weight preparation semantics that must agree for both core
+  // combination and cached-weight reuse.
+  PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT = 3;
+  // Draft-model weight preparation semantics that must agree for core
+  // combination and for cached-weight reuse when the export prepares a draft
+  // model.
+  PREPARATION_PARAMETER_SCOPE_DRAFT_WEIGHT = 4;
+}
+
+message PreparationParameter {
+  string key = 1;
+  PreparationParameterScope scope = 2;
+  PreparationValue value = 3;
+}
+
+message PreparationValue {
+  oneof value {
+    bool bool_value = 1;
+    int64 int_value = 2;
+    uint64 uint_value = 3;
+    double float_value = 4;
+    string string_value = 5;
+    PreparationValueList list_value = 6;
+  }
+}
+
+message PreparationValueList {
+  repeated PreparationValue values = 1;
+}
+
+// Deprecated preparation input schema retained for compatibility with existing
+// cores. New exports write PreparationManifest instead.
 message RebuildManifest {
+  option deprecated = true;
   uint32 version = 1;
   string recipe = 2;
   string source_identity = 3;
@@ -104,16 +164,16 @@ message RebuildManifest {
   bool local_checkpoint = 21;
   // Neighbor relays over a chain in rank order; exclusive with roce_ring.
   bool roce_chain = 22;
-  // Preparation-only joint attention-plan selection across the captured text shapes.
-  bool joint_tuning = 23;
+  reserved 23;
+  reserved "joint_tuning";
   // Preparation-only lowrank hyperconnection partitioning with BF16 gate-logit reduction.
   bool shard_hyperconnections = 24;
-  // Preparation-time collective selection policy: static or runtime.
-  string collective_tuning = 25;
-  // Preparation-only offline geometry and runtime profile recommendations.
-  string collective_ladder_json = 26;
+  reserved 25, 26;
+  reserved "collective_tuning", "collective_ladder_json";
   // Preparation-only routed W4A16 decode/verification with calibrated A4 prefill.
   bool force_moe_decode_a16 = 27;
+  // Preparation-only row-sharded prefill collectives; requires RoCE proxy ABI 11+ or PCIe DMA row-shard surfaces.
+  bool row_shard_prefill = 28;
   // Preparation-only online conversion group; omitted means all eligible projections.
   string online_mxfp8_scope = 30;
   // Preparation context group size; zero/absent retains full-TP context sharding when enabled.
@@ -131,6 +191,7 @@ message RebuildManifest {
   repeated string reproduction_args = 36;
 }
 message RebuildSpeculation {
+  option deprecated = true;
   uint32 draft_tokens = 1;
   bool adaptive = 2;
   string proposal_source = 3;
@@ -230,6 +291,25 @@ message CacheContract {
   uint64 page_tokens = 1;
   repeated HistoryRegion regions = 2;
   repeated PageTableView page_tables = 3;
+  // Optional storage description used for lossless checkpoint write-back and restore.
+  CodecLayout codec_layout = 4;
+}
+message CodecLayout {
+  // Revision 1 describes fields within a rank's page or continuation row.
+  uint32 revision = 1;
+  repeated CodecField fields = 2;
+  // Optional compiled cubin module name in each rank's `modules` table for
+  // GPU checkpoint compression. Loaded lazily only when GPU compression is active.
+  optional string gpu_module = 3;
+}
+message CodecField {
+  // Execution buffer containing this field.
+  string buffer = 1;
+  // Byte interval in one cache unit, relative to the buffer's base.
+  uint64 offset = 2;
+  uint64 length = 3;
+  // Block storage format defined in the prepared model contract.
+  uint32 encoding = 4;
 }
 message HistoryRegion {
   HistoryKind kind = 1;
@@ -747,6 +827,9 @@ message PersistentWorker {
   uint32 worker_sm_count = 1;
   string graph = 2;
   Reference stop_flag = 3;
+  // Optional 8-byte-aligned mapped-host range of `metrics_count` u64 counters.
+  Reference metrics = 4;
+  uint32 metrics_count = 5;
 }
 message TuningGraph {
   string name = 1;

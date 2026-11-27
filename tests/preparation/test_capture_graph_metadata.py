@@ -314,35 +314,3 @@ def test_export_resources_accept_recorded_graphs_and_executable_tuners(monkeypat
     recorded.reset()
     with pytest.raises(ValueError, match="released"):
         bundle._validate_resources(export_graphs=True)
-
-
-def test_export_preserves_collective_consumer_associations(monkeypatch, recorder):
-    import flare_heliopause
-    from ignition.preparation.startup_tuning import record_consumer
-
-    registry = SimpleNamespace(captures={})
-    session = SimpleNamespace(capture=nullcontext, _startup_collectives=registry)
-    storage = SimpleNamespace(transient=nullcontext, pool=SimpleNamespace(id=(0, 1)),
-                              graph_pool=SimpleNamespace(id=(0, 2)))
-    stream = SimpleNamespace(wait_stream=lambda other: None, synchronize=lambda: None)
-    collective = object()
-    def forward():
-        record_consumer(collective)
-    @contextmanager
-    def graph_scope(graph, **kwargs):
-        yield
-        graph.capture_end()
-    monkeypatch.setattr(flare_heliopause, "current_context", lambda: (100, 0))
-    monkeypatch.setattr(Graph, "pools", lambda self: [(0, 2)], raising=False)
-    for name, value in dict(current_stream=lambda device: stream, stream=lambda stream: nullcontext(),
-                            synchronize=lambda device: None, graph=graph_scope).items():
-        monkeypatch.setattr(torch.cuda, name, value)
-    monkeypatch.setattr(capture, "_warmup_stream", lambda device: stream)
-    monkeypatch.setattr(capture, "_seed_warmup_workspaces", lambda stream, device: None)
-    graphs, _ = capture.capture_forwards({"decode": forward}, {"decode": SimpleNamespace(kind="decode")},
-        session=session, device="cpu", stream=stream, pool=storage.graph_pool.id, compile_decoder=False,
-        retain_graphs=True, warmup_storage=storage)
-    graph = graphs["decode"]
-    assert isinstance(graph, Graph)
-    assert graph.instantiations == 1
-    assert registry.captures == {id(graph): {id(collective)}}

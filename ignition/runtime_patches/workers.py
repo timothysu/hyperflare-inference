@@ -6,7 +6,7 @@
 from torch._inductor.compile_worker.subproc_pool import SubprocPickler
 from torch._inductor.compile_worker.utils import _async_compile_initializer
 
-from . import apply, apply_triton
+from . import _replace, apply, apply_triton
 
 
 class CompilerPickler(SubprocPickler):
@@ -25,14 +25,23 @@ def initialize_inductor_worker(orig_ppid, close_fds=()):
 
 def replacements():
     from b12x._lib import compile_pool
-    from torch._inductor import async_compile
+    from torch._inductor import async_compile, autotune_process, cpu_vec_isa, utils as inductor_utils
     from torch._inductor.compile_worker import subproc_pool, utils
 
     from .triton import initialize_b12x_worker
 
+    patched_env = _replace(
+        inductor_utils.python_subprocess_env,
+        (("os.pathsep.join((torch_package_root, *sys.path))",
+          "os.pathsep.join((*sys.path, torch_package_root))"),),
+    )
     return (
         (compile_pool, "_initialize_worker", initialize_b12x_worker),
         (subproc_pool, "SubprocPickler", CompilerPickler),
+        (inductor_utils, "python_subprocess_env", patched_env),
+        (subproc_pool, "python_subprocess_env", patched_env),
+        (autotune_process, "python_subprocess_env", patched_env),
+        (cpu_vec_isa, "python_subprocess_env", patched_env),
         (utils, "_async_compile_initializer", initialize_inductor_worker),
         (async_compile, "_async_compile_initializer", initialize_inductor_worker),
         (subproc_pool, "_async_compile_initializer", initialize_inductor_worker),

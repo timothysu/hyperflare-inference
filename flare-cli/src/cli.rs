@@ -15,7 +15,7 @@ use clap::{Args, Parser, Subcommand, builder::PossibleValuesParser, builder::Typ
 use flare_helios::{
     engram::Storage,
     offload::{
-        PoolOptions, PrefixCacheOffload, parse_drain_on_shutdown, parse_max_age,
+        KvCompression, PoolOptions, PrefixCacheOffload, parse_drain_on_shutdown, parse_max_age,
         parse_pool_address, parse_size,
     },
     runtime_core::{KvCacheLimit, LoadOptions, MemoryLimit},
@@ -71,6 +71,33 @@ pub enum Command {
     },
     /// List, inspect, and manage locally prepared models.
     Models(CacheArgs),
+    /// Monitor live Parallax expert-movement and persistent-worker telemetry.
+    #[command(alias = "worker")]
+    Parallax(ParallaxArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ParallaxArgs {
+    /// Serving base URL to poll.
+    #[arg(long, value_name = "URL", default_value = "http://127.0.0.1:8000")]
+    pub url: String,
+
+    /// Polling interval in milliseconds (100..=10000).
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 500,
+        value_parser = clap::value_parser!(u64).range(100..=10_000)
+    )]
+    pub interval_ms: u64,
+
+    /// Print one JSON telemetry snapshot to stdout instead of opening the live dashboard.
+    #[arg(long, conflicts_with = "plain")]
+    pub json: bool,
+
+    /// Print one plain-text telemetry summary instead of opening the live dashboard.
+    #[arg(long)]
+    pub plain: bool,
 }
 
 #[derive(Debug, Args)]
@@ -318,6 +345,7 @@ pub struct Download {
     pub gpus: Vec<i32>,
 
     /// Additional publisher verification profiles (JSON); repeatable.
+    /// Interactive acquisition can review and import a profile from the repository.
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
     pub publisher_keys: Vec<PathBuf>,
 
@@ -829,6 +857,7 @@ pub struct Run {
 pub struct ServingOptions {
     /// Additional publisher verification profiles (JSON); does not grant execution trust.
     /// Development cores default to ~/.config/flare/development-publisher.json.
+    /// Interactive acquisition can review and import a profile from the repository.
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
     pub publisher_keys: Vec<PathBuf>,
     /// Verify stored allocation and table ranges before loading model GPU resources.
@@ -983,6 +1012,14 @@ pub struct ServingOptions {
         help_heading = "Advanced speculation options")]
     pub mtp_adaptive_verification_alpha: Option<f64>,
 
+    /// Compress prefix checkpoints at the VRAM <-> DRAM boundary on CPU (`ZKV1`) or GPU (`GKV1`) [default: prefix_cache.compression, else off].
+    #[arg(
+        long,
+        value_name = "cpu|gpu|off",
+        help_heading = "Prefix cache options"
+    )]
+    pub lossless_kv_compression: Option<KvCompression>,
+
     /// Warm host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables warm retention.
     /// Automatic intake is additional when memory or disk is enabled [default: prefix_cache.memory, else 0].
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
@@ -1101,6 +1138,9 @@ impl ServingOptions {
         }
         if self.roce_switch_only {
             options.push(ROCE_SWITCH_ONLY.into());
+        }
+        if let Some(mode) = self.lossless_kv_compression {
+            options.extend(["--lossless-kv-compression".into(), mode.to_string()]);
         }
         if self.verify_weights {
             options.push("--verify-weights".into());
@@ -1234,6 +1274,7 @@ impl ServingOptions {
             },
             device_labels: (!self.gpus.is_empty()).then(|| self.gpus.clone()),
             prefix_cache: PrefixCacheOffload {
+                compression: self.lossless_kv_compression.unwrap_or_default(),
                 memory_bytes: self.prefix_cache_memory,
                 disk: self.prefix_cache_disk.clone(),
                 disk_limit: self.prefix_cache_disk_limit,
@@ -1714,6 +1755,7 @@ mod tests {
         assert_eq!(
             options.prefix_cache,
             PrefixCacheOffload {
+                compression: Default::default(),
                 memory_bytes: Some(3 << 29),
                 disk: Some(PathBuf::from("prefixes")),
                 disk_limit: Some(0),
@@ -2179,6 +2221,35 @@ mod tests {
     }
 
     #[test]
+    fn codec_placement_reaches_each_rank_and_defaults_to_off() {
+        let base = ["flare", "run", "model.safetensors"];
+        assert_eq!(
+            run(&base).load_options().prefix_cache.compression,
+            KvCompression::Off
+        );
+        for name in ["cpu", "gpu", "off"] {
+            let mut argv = base.to_vec();
+            argv.extend(["--lossless-kv-compression", name]);
+            let without_tier = run(&argv).load_options().prefix_cache;
+            if name != "off" {
+                assert!(without_tier.validate_compression().is_err());
+            } else {
+                assert!(without_tier.validate_compression().is_ok());
+            }
+            argv.extend(["--prefix-cache-pool", "unix:/run/selene.sock"]);
+            let args = run(&argv);
+            assert!(args.load_options().prefix_cache.validate_compression().is_ok());
+            assert_eq!(args.rank_options(), [
+                "--lossless-kv-compression", name, "--prefix-cache-pool", "unix:/run/selene.sock",
+            ]);
+            assert_eq!(
+                args.load_options().prefix_cache.compression.to_string(),
+                name
+            );
+        }
+    }
+
+    #[test]
     fn prefix_cache_settings_reach_every_rank() {
         let args = run(&[
             "flare",
@@ -2429,6 +2500,66 @@ mod cache_cli_tests {
         assert!(
             Cli::try_parse_from(["flare", "models", "gc", "--cache-dir", "/downloads"]).is_err(),
             "download cache selection requires --downloads"
+        );
+    }
+
+    #[test]
+    fn parallax_command_parses_flags_and_worker_alias() {
+        let default_cmd = Cli::try_parse_from(["flare", "parallax"]).unwrap();
+        match default_cmd.command {
+            Command::Parallax(args) => {
+                assert_eq!(args.url, "http://127.0.0.1:8000");
+                assert_eq!(args.interval_ms, 500);
+                assert!(!args.json);
+                assert!(!args.plain);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let explicit = Cli::try_parse_from([
+            "flare",
+            "parallax",
+            "--url",
+            "http://127.0.0.1:9001",
+            "--interval-ms",
+            "250",
+            "--json",
+        ])
+        .unwrap();
+        match explicit.command {
+            Command::Parallax(args) => {
+                assert_eq!(args.url, "http://127.0.0.1:9001");
+                assert_eq!(args.interval_ms, 250);
+                assert!(args.json);
+                assert!(!args.plain);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let alias = Cli::try_parse_from([
+            "flare",
+            "worker",
+            "--url",
+            "http://10.0.0.2:8000",
+            "--plain",
+        ])
+        .unwrap();
+        match alias.command {
+            Command::Parallax(args) => {
+                assert_eq!(args.url, "http://10.0.0.2:8000");
+                assert!(args.plain);
+                assert!(!args.json);
+            }
+            other => panic!("unexpected alias command: {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["flare", "parallax", "--interval-ms", "50"]).is_err(),
+            "interval below 100ms must be rejected"
+        );
+        assert!(
+            Cli::try_parse_from(["flare", "parallax", "--json", "--plain"]).is_err(),
+            "--json and --plain must conflict"
         );
     }
 }

@@ -8,6 +8,40 @@ For running preparation, use [model preparation and serving](model-preparation.m
 Recipe and execution-component changes also require
 [model development](model-development.md).
 
+## Recipe parameters and preparation manifests
+
+Each recipe declares its preparation contract by binding a frozen
+`RecipeParameters` instance (`ignition/parameters.py`) on `Recipe.parameters`.
+`RecipeParameters` is both compositional and subclassable:
+
+- Core `ignition` defines the universal preparation fields (`max_concurrency`,
+  `prefill_chunk`, `autotune_effort`, `compile_workers`, `lock_gpu_clocks`,
+  `compiled_forwards`, `roce_ring`, `roce_chain`) and four optional Helios
+  `GraphOperation` ABI groups (`SpeculationParameters`, `VisionParameters`,
+  `PromptLogprobsParameters`, `MixedPrefillParameters`).
+- External recipe packages define shared `ParameterGroup` components and
+  recipe-specific `RecipeParameters` subclasses without adding model names or
+  model flags to core `ignition`.
+- Each parameter field declares its CLI spelling, bounds or choices, help
+  metadata, `ParameterScope` (`DEPLOYMENT`, `COMBINE`, `TARGET_WEIGHT`,
+  `DRAFT_WEIGHT`), manifest key, and status summary label via `param(...)`.
+- `ignition.cli.parse_args` resolves the selected recipe offline (without
+  importing PyTorch or touching the network) and registers only that recipe's
+  flags for parsing and `MODEL --help`. Bare `ignition export --help` prints
+  universal core flags and the declared recipe table.
+- `planning.Plan` carries the resolved `parameters` instance directly and
+  invokes its `validate`, `filter_world_sizes`, `adjust_weights_bytes`,
+  `adjust_rank_costs`, `adjust_page_tokens`, `shortfall_options`,
+  `status_parts`, `to_dict`, `manifest_parameters`, and `reproduction_args`
+  hooks.
+- `ignition.preparation.rebuild_manifest.from_plan` constructs
+  `PreparationManifest` (`parameters` and `reproduction_args`) exclusively by
+  serializing `plan.parameters` alongside checkpoint provenance, emitting only
+  parameters declared by the selected recipe.
+- `BasePreparationConfig` (`ignition/preparation/bootstrap.py`) embeds
+  `parameters` directly so recipe `PreparationConfig` classes forward universal
+  and ABI properties from `plan.parameters` through `common_preparation_kwargs`.
+
 ## Operator declaration, tuning, and binding
 
 - Use b12x's autotuning and warmup facilities during preparation. Do not pin
@@ -56,7 +90,12 @@ before the session's capture guard forbids further kernel resolution.
   from its transient pools and release them before capture, so
   their workspaces do not coexist with retained graph intermediates. Ranks
   synchronize before each warmup and each capture. Retain compiled kernel owners
-  until native replay has drained.
+  until native replay has drained. Compiled forwards retain Inductor memory-pool
+  planning, storage reuse, and default peak-memory operation reordering; callers
+  with asymmetric auxiliary-stream forks can pass an explicit `compile_options`
+  override mapping (for example, `{'reorder_for_peak_memory': False}`) through
+  `capture_forwards` to `ForwardCache`, where it merges over the module defaults
+  without mutating them.
 
 `ignition.runtime_patches.apply()` installs process-local Dynamo, Inductor, and
 Triton fixes after dependency environment setup and before compilation or artifact
@@ -64,8 +103,10 @@ loading. It requires Torch 2.14.1+cu132 and Triton 3.8.0, checks replacement sou
 contexts, and leaves dependency files unchanged. Spawned preparation ranks and
 tuning replicas install the fixes before GPU setup. Dependency worker hooks cover
 b12x's offline compiler initializer, Inductor's subprocess sidecar and job workers,
-and direct spawned Inductor workers. The lightweight Triton bootstrap does not
-import Torch or initialize CUDA.
+and direct spawned Inductor workers, and place `sys.path` ahead of
+`torch_package_root` in Inductor subprocess `PYTHONPATH` so workspace and
+virtual-environment packages are not shadowed. The lightweight Triton bootstrap
+does not import Torch or initialize CUDA.
 
 The runtime patches defer mutation-region recomputation during single-node
 auto-functionalization decomposition, directly construct eligible no-clone
@@ -177,6 +218,13 @@ inside an opaque operator cannot participate in that planning.
 Tensors retained by constructors appear as external storage inputs to compilation.
 Their owners keep those allocations alive across graph variants.
 
+Cloned temporaries mutated by opaque operations retain an explicit materialization
+boundary during compilation whenever their source is offset, non-contiguous, sliced,
+shared, or persistent. Their views address the clone's zero-based storage instead of
+folding into a source whose offset or layout would invalidate mutable operands.
+Clones of single-use, contiguous, zero-offset full-storage temporaries and clones
+mutated only by deferred copies omit the extra boundary.
+
 Constructors use example tensors to declare layouts and prepare kernels.
 The [declaration tensor helper](../ignition/preparation/examples.py) shares examples
 by semantic role, dtype, and device. Declare capacities from largest to smallest
@@ -216,14 +264,14 @@ pool, compiled kernels, graph executables, and native resources until replay
 drains. CUDA libraries can retain allocations referenced by captured kernel
 arguments without Python tensor owners. Preserve those resources through drain.
 
-After warmup, capture compiled forwards in descending order of their largest
+Warm and capture compiled forwards in descending order of their largest
 compiler-planned allocation, with total planned bytes breaking ties. This lets
-smaller requests reuse backing retained by larger captures. Tensor-parallel ranks
-agree on one order using the maximum request sizes across ranks. Uncompiled
-forwards follow in catalog order. Compiler metadata does not include allocations
-inside opaque operators, and the ordering does not guarantee optimal packing for
-forwards with multiple allocations. Keep temporary destinations explicit so the
-compiler can plan them.
+smaller requests reuse transient and graph backing retained by larger variants.
+Tensor-parallel ranks agree on one order using the maximum request sizes across
+ranks. Uncompiled forwards follow in catalog order. Compiler metadata does not
+include allocations inside opaque operators, and the ordering does not guarantee
+optimal packing for forwards with multiple allocations. Keep temporary
+destinations explicit so the compiler can plan them.
 
 Recipes that retain graph-buffer pools keep their caller-owned scratch until
 their serving forwards expose the required reads, writes, and dependencies.
@@ -298,14 +346,7 @@ requests run in a follow-up collective or independent remainder batch where
 ranks without local remainders still join completion and failure relays.
 `ReplicaPreparation` keeps these exchanges within each serving TP replica;
 independent kernel candidates retain corresponding-rank sharding across replicas.
-Preparation-time search ends before graph handoff. With `--collective-tuning
-runtime`, the required `--collective-ladder PATH` file supplies final compiled
-geometries for eligible plain BF16 PCIe reductions and column gathers. Gather
-buckets depend on total per-rank input bytes, independently of row width. These pinned plans do not
-race geometries during preparation, including with `--autotune-effort off`.
-Captured tuning graphs select among the supplied submode/active-CTA profiles
-before serving begins; native rank coordination only launches those graphs and
-waits for their completion. See the [ladder format](../ignition/preparation/ladders/README.md).
+Preparation-time search ends before graph handoff.
 
 - **Compile tensor-parallel forwards once, sharded across ranks.** Pass the
   preparation coordinator to `capture_forwards`. Each forward variant compiles
@@ -328,7 +369,9 @@ waits for their completion. See the [ladder format](../ignition/preparation/ladd
   select a variant key through `compilation_variant` on each rank. Every
   selected variant must compile before collective warmup; ranks must not retrace
   or compile on a binding mismatch.
-  Load, warm, freeze, and save one forward at a time in catalog order. Release
+  Load, warm, freeze, and save one forward at a time in descending order of
+  largest compiler-planned CUDA allocation (breaking ties by total planned bytes,
+  then catalog order, using the maximum request sizes across ranks). Release
   its portable compiler state, generated source, bundled tuning metadata, and
   tuning registration after the cache write;
   retain canonical kernel selections, execution guards, live kernel owners, and
@@ -342,8 +385,7 @@ waits for their completion. See the [ladder format](../ignition/preparation/ladd
   Complete warmup for the entire catalog before capturing any graph.
   After successful capture and any required instantiation, release the compiled
   Python wrapper and guards while retaining graph, kernel, and storage owners
-  through drain. Grouped forwards release shared guards after their final capture;
-  recipes exposing eager forwards retain guarded callables.
+  through drain. Recipes exposing eager forwards retain guarded callables.
 
 ## Shape and graph-transition validation
 

@@ -241,9 +241,12 @@ fn unverified_payload(
         } else {
             Value::Null
         };
+        #[allow(deprecated)]
+        let rebuild = &body.rebuild;
         deployment_values.push(json!({
             "id": body.deployment_id,
-            "rebuild": body.rebuild,
+            "preparation": body.preparation.as_ref().map(super::preparation::preparation_json),
+            "rebuild": rebuild,
             "frontend": frontend_detail,
             "vision": vision_detail,
             "tensor_parallel": body.tensor_parallel,
@@ -378,6 +381,7 @@ fn unverified_payload(
                 "development": publisher.development,
             })),
         },
+        "preparation": capacity("preparation"),
         "rebuild": capacity("rebuild"),
         "model": {
             "model_id": core.model_identity,

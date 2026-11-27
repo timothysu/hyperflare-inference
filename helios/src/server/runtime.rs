@@ -555,6 +555,10 @@ impl ModelRuntime {
             .engram
             .as_ref()
             .map(|binding| binding.shared.stats());
+        metrics.persistent_worker = manifest
+            .persistent_workers
+            .first()
+            .and_then(crate::execution::PersistentWorkerDescriptor::reader);
         let metrics = Arc::new(metrics);
         metrics.scheduler_trace.configure(&manifest.graphs);
         let worker_metrics = metrics.clone();
@@ -681,13 +685,16 @@ impl ModelRuntime {
                     .offload
                     .as_ref()
                     .and_then(|binding| binding.take())
-                    .map(|prepared| {
+                    .map(|(prepared, gpu_cubins)| {
+                        if let Some(rank) = prepared.geometry.first() {
+                            worker_metrics.codec_placement(rank.placement);
+                        }
                         if let Some(warning) =
                             prepared.intake_warning(worker_config.limits.max_active)
                         {
                             if log_to_stderr { eprintln!("warning: {warning}"); }
                         }
-                        crate::offload::open(prepared)
+                        crate::offload::open(prepared, gpu_cubins)
                     })
                     .transpose()
                 {
@@ -802,6 +809,9 @@ impl ModelRuntime {
     }
     pub(super) fn metrics_handle(&self) -> Arc<super::metrics::Metrics> {
         self.metrics.clone()
+    }
+    pub fn persistent_worker_snapshot(&self) -> Option<crate::execution::PersistentWorkerSnapshot> {
+        self.metrics.persistent_worker_snapshot()
     }
     pub fn wait(&self, timeout: std::time::Duration) -> bool {
         let finished = self.finished.0.lock().unwrap_or_else(|e| e.into_inner());
