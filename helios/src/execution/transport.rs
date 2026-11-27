@@ -14,8 +14,9 @@ use crate::{
 
 use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQUEST_LANES, COMPLETION_METADATA_FIELDS, ReadinessIntervals};
 
-/// Frame-completion wake for threads that would otherwise poll a running frame in a
-/// `sched_yield` loop. On Linux aarch64 cores with FEAT_WFxT (HWCAP2_WFXT, e.g. the Cortex-X925/A725
+/// On Linux x86-64 the mapped word suppresses repeated driver queries between periodic
+/// event checks. On Linux aarch64 it can wake threads that would otherwise poll in a
+/// `sched_yield` loop. On cores with FEAT_WFxT (HWCAP2_WFXT, e.g. the Cortex-X925/A725
 /// cores of GB10), the copy stream writes each frame's fence to a mapped host word right after
 /// the frame's `transferred` event, and [`GraphExecutor::park`] waits in WFET with the exclusive
 /// monitor armed on that word. The event query in [`GraphExecutor::poll`] stays the only
@@ -23,9 +24,68 @@ use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQ
 /// write to the coherent mapped word clearing the monitor). `PARK_LIMIT_US` is the longest
 /// intentional wait per park; scheduling can add to it.
 struct CompletionWake {
-    #[cfg_attr(not(all(target_arch = "aarch64", target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_arch = "aarch64", target_arch = "x86_64"), target_os = "linux")), allow(dead_code))]
     word: PinnedHost,
     device: usize,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    last_event_query: Instant,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl CompletionWake {
+    fn open(copy: &Stream) -> Result<Option<Self>> {
+        match Self::probe(copy) {
+            Err(error) if Self::unavailable(&error) => Ok(None),
+            other => other,
+        }
+    }
+
+    fn probe(copy: &Stream) -> Result<Option<Self>> {
+        let word = copy.mapped_host_buffer(64)?;
+        let device = copy.mapped_address(&word)?;
+        // Probe this mapping before submitting model work. An accepted stream
+        // write must drain before construction can release the host allocation.
+        unsafe { copy.write_value(device, u32::MAX)?; }
+        if let Err(error) = copy.synchronize() {
+            std::mem::forget(word);
+            return Err(error);
+        }
+        let wake = Self { word, device, last_event_query: Instant::now() };
+        Ok((wake.seen() == u32::MAX).then_some(wake))
+    }
+
+    fn unavailable(error: &Error) -> bool {
+        let Error::Execution(ExecutionError::Driver(e)) = error else { return false };
+        // CUDA_ERROR_OUT_OF_MEMORY, INVALID_VALUE and NOT_SUPPORTED on the
+        // optional allocation, alias, or write probe. Drain and device errors propagate.
+        matches!((e.operation.as_str(), e.code),
+            ("cuMemHostAlloc", 2 | 801) | ("cuMemHostGetDevicePointer", 1 | 801)
+            | ("cuStreamWriteValue32_v2", 1 | 801))
+    }
+
+    fn seen(&self) -> u32 {
+        // The pinned allocation is aligned, retained through stream drain, and
+        // only written by aligned 32-bit stream operations after initialization.
+        let word = unsafe { std::sync::atomic::AtomicU32::from_ptr(self.word.address() as *mut u32) };
+        word.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn should_query(&mut self, target: u32) -> bool {
+        // A stale PCIe observation only postpones one event query. The event
+        // remains authoritative for errors, DMA visibility, and frame retirement.
+        wake_query_due(self.seen(), target, &mut self.last_event_query, Instant::now())
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn wake_query_due(seen: u32, target: u32, last_query: &mut Instant, now: Instant) -> bool {
+    if (seen.wrapping_sub(target) as i32) < 0
+        && now.duration_since(*last_query) < std::time::Duration::from_micros(100)
+    {
+        return false;
+    }
+    *last_query = now;
+    true
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -548,7 +608,9 @@ impl GraphExecutor {
         } else {
             None
         };
-        #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        let wake = CompletionWake::open(&copy)?;
+        #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_os = "linux")))]
         let wake = None;
         let engram = manifest
             .engram
@@ -968,6 +1030,12 @@ impl GraphExecutor {
         let Some(frame) = frame else {
             return Ok(None);
         };
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Some(wake) = &mut resources.wake
+            && !wake.should_query(frame.pending.as_ref().unwrap().fence.0 as u32)
+        {
+            return Ok(None);
+        }
         match frame.transferred.completed() {
             Ok(false) => return Ok(None),
             Err(error) => {
@@ -1596,6 +1664,68 @@ pub(super) fn decode_prompt_logprobs(bytes: &[u8], rows: usize) -> Result<Vec<Op
         }
         Ok(Some(PromptLogprobs { value, rank: int(2) as u32 }))
     }).collect()
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn unsupported_wake_probe_allows_event_polling_but_device_errors_propagate() {
+    let unavailable = |operation: &str, code| CompletionWake::unavailable(
+        &ExecutionError::Driver(crate::CudaError {
+            operation: operation.into(), code, name: String::new(), description: String::new(),
+        }).into()
+    );
+    assert!(unavailable("cuStreamWriteValue32_v2", 801));
+    assert!(unavailable("cuMemHostGetDevicePointer", 1));
+    assert!(unavailable("cuMemHostAlloc", 2));
+    assert!(!unavailable("cuStreamWriteValue32_v2", 700));
+    assert!(!unavailable("cuStreamSynchronize", 801));
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn wake_hint_checks_reached_fences_and_periodically_queries_a_stale_word() {
+    use std::time::Duration;
+    let start = Instant::now();
+    let mut last = start;
+    assert!(!wake_query_due(u32::MAX, 0, &mut last, start));
+    let deadline = start + Duration::from_micros(100);
+    assert!(wake_query_due(u32::MAX, 0, &mut last, deadline));
+    assert!(!wake_query_due(u32::MAX, 0, &mut last, deadline));
+    assert!(wake_query_due(0, 0, &mut last, deadline));
+    assert!(wake_query_due(0, u32::MAX, &mut last, deadline));
+}
+
+#[cfg(all(test, feature = "runtime-core", target_arch = "x86_64", target_os = "linux"))]
+#[test]
+#[ignore = "requires a CUDA device with mapped-host stream writes"]
+fn mapped_wake_observes_copy_stream_fences() {
+    use crate::runtime_core::driver::Driver;
+    let driver = Driver::load().unwrap();
+    let mut context = std::ptr::null_mut();
+    let mut device = 0;
+    unsafe {
+        driver.check("cuInit", (driver.init)(0)).unwrap();
+        driver.check("cuDeviceGet", (driver.device)(&mut device, 0)).unwrap();
+        driver.check("cuCtxCreate_v2", (driver.context_create)(&mut context, 0, device)).unwrap();
+    }
+    {
+        let copy = Stream::open(context as usize, device).unwrap();
+        let mut wake = CompletionWake::open(&copy).unwrap().expect("mapped-host wake unavailable");
+        let event = copy.event().unwrap();
+        for target in [u32::MAX - 1, u32::MAX, 0, 1] {
+            copy.record(&event).unwrap();
+            unsafe { copy.write_value(wake.device, target).unwrap(); }
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while wake.seen() != target {
+                assert!(Instant::now() < deadline, "CUDA wake word stayed stale");
+                std::hint::spin_loop();
+            }
+            assert!(wake.should_query(target));
+            event.synchronize().unwrap();
+        }
+        copy.synchronize().unwrap();
+    }
+    unsafe { driver.check("cuCtxDestroy_v2", (driver.context_destroy)(context)).unwrap(); }
 }
 
 #[cfg(test)]

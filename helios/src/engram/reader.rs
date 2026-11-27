@@ -91,8 +91,6 @@ pub(crate) struct Resident {
     storage: ResidentMapping,
     #[cfg(windows)]
     storage: Aligned,
-    #[cfg(unix)]
-    file: File,
     skip: usize,
     nbytes: usize,
 }
@@ -105,15 +103,15 @@ struct ResidentMapping {
 
 #[cfg(unix)]
 impl ResidentMapping {
-    fn new(file: &File, nbytes: usize, writable: bool) -> Result<Self> {
+    fn new(file: Option<&File>, nbytes: usize, writable: bool) -> Result<Self> {
         let protection = libc::PROT_READ | if writable { libc::PROT_WRITE } else { 0 };
         let address = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 nbytes,
                 protection,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
+                if file.is_some() { libc::MAP_SHARED } else { libc::MAP_PRIVATE | libc::MAP_ANONYMOUS },
+                file.map_or(-1, AsRawFd::as_raw_fd),
                 0,
             )
         };
@@ -169,100 +167,72 @@ fn seal_resident(file: &File) -> Result<()> {
 
 impl Resident {
     pub(super) fn load(file: &File, plane: Plane) -> Result<Self> {
-        Self::initialize(plane, |address, extent, required| {
-            let skip = (plane.offset % BLOCK as u64) as usize;
-            let offset = plane.offset - skip as u64;
-            std::thread::scope(|scope| -> Result<()> {
-                let mut workers = Vec::new();
-                for reader in 0..LOAD_READERS.min(extent.div_ceil(LOAD_CHUNK)) {
-                    workers.push(
-                        std::thread::Builder::new()
-                            .name(format!("flare-table-loader-{reader}"))
-                            .spawn_scoped(scope, move || -> Result<()> {
-                                for begin in (reader * LOAD_CHUNK..extent)
-                                    .step_by(LOAD_READERS * LOAD_CHUNK)
-                                {
-                                    let nbytes = LOAD_CHUNK.min(extent - begin);
-                                    let source = offset
-                                        .checked_add(begin as u64)
-                                        .ok_or("resident Engram file offset exceeds range")?;
-                                    // SAFETY: Each reader initializes a disjoint aligned allocation range.
-                                    let count = unsafe { crate::os::read_at_raw(file, (address + begin) as *mut u8, nbytes, source) }
-                                        .map_err(|e| format!("resident Engram read at {source}: {e}"))?;
-                                    let needed = nbytes.min(required - begin);
-                                    if count < needed {
-                                        return Err(format!(
-                                            "resident Engram read at {source} returned {count}, requires {needed} bytes"
-                                        ).into());
-                                    }
+        let skip = (plane.offset % BLOCK as u64) as usize;
+        let extent = plane.resident_bytes()?;
+        let required = skip + plane.nbytes; // resident_bytes checked this sum.
+        #[cfg(unix)]
+        let storage = ResidentMapping::new(None, extent, true)?;
+        #[cfg(unix)]
+        let address = storage.address;
+        #[cfg(unix)]
+        unsafe {
+            // Huge pages are optional. Advise before direct I/O first touches the mapping.
+            libc::madvise(address as *mut _, extent, libc::MADV_HUGEPAGE);
+        }
+        #[cfg(windows)]
+        let storage = Aligned::new(extent)?;
+        #[cfg(windows)]
+        let address = storage.0;
+        let offset = plane.offset - skip as u64;
+        std::thread::scope(|scope| -> Result<()> {
+            let mut workers = Vec::new();
+            for reader in 0..LOAD_READERS.min(extent.div_ceil(LOAD_CHUNK)) {
+                workers.push(
+                    std::thread::Builder::new()
+                        .name(format!("flare-table-loader-{reader}"))
+                        .spawn_scoped(scope, move || -> Result<()> {
+                            for begin in (reader * LOAD_CHUNK..extent)
+                                .step_by(LOAD_READERS * LOAD_CHUNK)
+                            {
+                                let nbytes = LOAD_CHUNK.min(extent - begin);
+                                let source = offset
+                                    .checked_add(begin as u64)
+                                    .ok_or("resident Engram file offset exceeds range")?;
+                                // SAFETY: Each reader initializes a disjoint aligned allocation range.
+                                let count = unsafe { crate::os::read_at_raw(file, (address + begin) as *mut u8, nbytes, source) }
+                                    .map_err(|e| format!("resident Engram read at {source}: {e}"))?;
+                                let needed = nbytes.min(required - begin);
+                                if count < needed {
+                                    return Err(format!(
+                                        "resident Engram read at {source} returned {count}, requires {needed} bytes"
+                                    ).into());
                                 }
-                                Ok(())
-                            })
-                            .map_err(|e| format!("start resident Engram loader: {e}"))?,
-                    );
-                }
-                for worker in workers {
-                    worker
-                        .join()
-                        .map_err(|_| "resident Engram loader panicked")??;
-                }
-                Ok(())
-            })
-        })
+                            }
+                            Ok(())
+                        })
+                        .map_err(|e| format!("start resident Engram loader: {e}"))?,
+                );
+            }
+            for worker in workers {
+                worker
+                    .join()
+                    .map_err(|_| "resident Engram loader panicked")??;
+            }
+            Ok(())
+        })?;
+        #[cfg(unix)]
+        if unsafe { libc::mprotect(address as *mut _, extent, libc::PROT_READ) } != 0 {
+            return Err(format!("protect resident embedding table: {}", std::io::Error::last_os_error()).into());
+        }
+        Ok(Self { storage, skip, nbytes: plane.nbytes })
     }
 
     #[cfg(unix)]
-    pub(super) fn load_segments(plane: Plane, segments: &[(File, u64, usize)]) -> Result<Self> {
+    pub(super) fn load_segments(plane: Plane, segments: &[(File, u64, usize)]) -> Result<(Self, File)> {
         if plane.offset != 0 {
             return Err("assembled embedding planes must start at offset zero".into());
         }
-        Self::initialize(plane, |address, _, _| {
-            let mut destination = 0usize;
-            for (file, offset, nbytes) in segments {
-                let end = destination
-                    .checked_add(*nbytes)
-                    .filter(|end| *end <= plane.nbytes)
-                    .ok_or("embedding source segments exceed their plane")?;
-                let mut copied = 0;
-                while copied < *nbytes {
-                    let count = (*nbytes - copied).min(LOAD_CHUNK);
-                    // SAFETY: Source segments initialize consecutive, disjoint ranges
-                    // inside the resident allocation before it becomes immutable.
-                    let read = unsafe {
-                        crate::os::read_at_raw(
-                            file,
-                            (address + destination + copied) as *mut u8,
-                            count,
-                            offset + copied as u64,
-                        )
-                    }
-                    .map_err(|error| format!("read embedding source segment: {error}"))?;
-                    if read == 0 {
-                        return Err(
-                            "embedding source segment ended before its declared size".into()
-                        );
-                    }
-                    copied += read;
-                }
-                destination = end;
-            }
-            if destination != plane.nbytes {
-                return Err("embedding source segments do not fill their plane".into());
-            }
-            Ok(())
-        })
-    }
-
-    fn initialize(
-        plane: Plane,
-        fill: impl FnOnce(usize, usize, usize) -> Result<()>,
-    ) -> Result<Self> {
-        let skip = (plane.offset % BLOCK as u64) as usize;
-        let required = skip
-            .checked_add(plane.nbytes)
-            .ok_or("resident Engram plane exceeds host range")?;
         let extent = plane.resident_bytes()?;
-        #[cfg(unix)]
         let backing = {
             let descriptor = unsafe {
                 libc::memfd_create(
@@ -284,33 +254,47 @@ impl Resident {
                 .map_err(|e| format!("size resident embedding table: {e}"))?;
             backing
         };
-        #[cfg(unix)]
-        let storage = ResidentMapping::new(&backing, extent, true)?;
-        #[cfg(unix)]
+        let storage = ResidentMapping::new(Some(&backing), extent, true)?;
         let address = storage.address;
-        #[cfg(windows)]
-        let storage = Aligned::new(extent)?;
-        #[cfg(windows)]
-        let address = storage.0;
-        fill(address, extent, required)?;
-        #[cfg(unix)]
-        {
-            drop(storage);
-            seal_resident(&backing)?;
-            Self::from_shared(backing, plane)
+        let mut destination = 0usize;
+        for (file, offset, nbytes) in segments {
+            let end = destination
+                .checked_add(*nbytes)
+                .filter(|end| *end <= plane.nbytes)
+                .ok_or("embedding source segments exceed their plane")?;
+            let mut copied = 0;
+            while copied < *nbytes {
+                let count = (*nbytes - copied).min(LOAD_CHUNK);
+                // SAFETY: Source segments initialize consecutive, disjoint ranges
+                // inside the resident allocation before it becomes immutable.
+                let read = unsafe {
+                    crate::os::read_at_raw(
+                        file,
+                        (address + destination + copied) as *mut u8,
+                        count,
+                        offset + copied as u64,
+                    )
+                }
+                .map_err(|error| format!("read embedding source segment: {error}"))?;
+                if read == 0 {
+                    return Err(
+                        "embedding source segment ended before its declared size".into()
+                    );
+                }
+                copied += read;
+            }
+            destination = end;
         }
-        #[cfg(windows)]
-        {
-            Ok(Self {
-                storage,
-                skip,
-                nbytes: plane.nbytes,
-            })
+        if destination != plane.nbytes {
+            return Err("embedding source segments do not fill their plane".into());
         }
+        drop(storage);
+        seal_resident(&backing)?;
+        Ok((Self::from_shared(&backing, plane)?, backing))
     }
 
     #[cfg(unix)]
-    pub(super) fn from_shared(file: File, plane: Plane) -> Result<Self> {
+    pub(super) fn from_shared(file: &File, plane: Plane) -> Result<Self> {
         let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
         if seals < 0 || seals & RESIDENT_SEALS != RESIDENT_SEALS {
             return Err("resident embedding table must have immutable size and contents".into());
@@ -326,16 +310,10 @@ impl Resident {
             return Err("shared resident embedding table extent differs from its plane".into());
         }
         Ok(Self {
-            storage: ResidentMapping::new(&file, extent, false)?,
-            file,
+            storage: ResidentMapping::new(Some(file), extent, false)?,
             skip,
             nbytes: plane.nbytes,
         })
-    }
-
-    #[cfg(unix)]
-    pub(super) fn descriptor(&self) -> i32 {
-        self.file.as_raw_fd()
     }
 
     fn bytes(&self) -> &[u8] {
@@ -1158,7 +1136,7 @@ mod tests {
         use std::time::Duration;
 
         let file = unsealed_resident_file();
-        let mapping = ResidentMapping::new(&file, BLOCK, true).unwrap();
+        let mapping = ResidentMapping::new(Some(&file), BLOCK, true).unwrap();
         unsafe { std::ptr::write_bytes(mapping.address as *mut u8, 0x39, BLOCK) };
         let mut descriptors = [-1; 2];
         assert_eq!(
@@ -1220,7 +1198,7 @@ mod tests {
     fn resident_sealing_rejects_a_retained_writable_mapping() {
         let file = unsealed_resident_file();
         let initial_seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
-        let mapping = ResidentMapping::new(&file, BLOCK, true).unwrap();
+        let mapping = ResidentMapping::new(Some(&file), BLOCK, true).unwrap();
         assert!(seal_resident(&file).is_err());
         assert_eq!(
             unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) },
@@ -1258,12 +1236,12 @@ mod tests {
             },
         ];
         let file = open_file(&path).unwrap();
-        let original = planes.map(|plane| Arc::new(Resident::load(&file, plane).unwrap()));
-        let shared = std::array::from_fn(|i| {
-            Arc::new(
-                Resident::from_shared(original[i].file.try_clone().unwrap(), planes[i]).unwrap(),
-            )
+        let shared = planes.map(|plane| {
+            let (_, backing) = Resident::load_segments(Plane { offset: 0, ..plane },
+                &[(file.try_clone().unwrap(), plane.offset, plane.nbytes)]).unwrap();
+            Arc::new(Resident::from_shared(&backing, Plane { offset: 0, ..plane }).unwrap())
         });
+        let original = planes.map(|plane| Arc::new(Resident::load(&file, plane).unwrap()));
         std::fs::remove_file(path).unwrap();
         let ids: Vec<_> = (0..128).map(|i| ((i * 509 + 17) % rows) as i64).collect();
         let mut output = vec![0; ids.len() * 264];
@@ -1312,27 +1290,48 @@ mod tests {
             nbytes: 8192,
             row_bytes: 128,
         };
-        let original = Resident::load(&open_file(&path).unwrap(), plane).unwrap();
-        let peer = Resident::from_shared(original.file.try_clone().unwrap(), plane).unwrap();
-        use std::os::unix::fs::MetadataExt;
-        assert_eq!(
-            original.file.metadata().unwrap().ino(),
-            peer.file.metadata().unwrap().ino()
-        );
-        assert!(original.file.set_len(1).is_err());
+        let input = File::open(&path).unwrap();
+        let (original, backing) = Resident::load_segments(Plane { offset: 0, ..plane },
+            &[(input, plane.offset, plane.nbytes)]).unwrap();
+        let peer = Resident::from_shared(&backing, Plane { offset: 0, ..plane }).unwrap();
+        assert!(backing.set_len(1).is_err());
         let value = 255u8;
         assert_eq!(
-            unsafe { libc::pwrite(original.descriptor(), (&value as *const u8).cast(), 1, 97) },
+            unsafe { libc::pwrite(backing.as_raw_fd(), (&value as *const u8).cast(), 1, 97) },
             -1
         );
         let wrong = Plane {
             nbytes: plane.nbytes + BLOCK,
             ..plane
         };
-        assert!(Resident::from_shared(original.file.try_clone().unwrap(), wrong).is_err());
+        assert!(Resident::from_shared(&backing, wrong).is_err());
         std::fs::remove_file(path).unwrap();
         drop(original);
+        drop(backing);
         assert_eq!(peer.bytes(), &bytes[97..97 + 8192]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_resident_plane_retains_read_only_bytes_after_source_close() {
+        use std::os::unix::fs::FileExt;
+        let file = unsealed_resident_file();
+        file.write_all_at(b"private table", 97).unwrap();
+        let plane = Plane { file: 0, offset: 97, nbytes: 13, row_bytes: 1 };
+        let resident = Arc::new(Resident::load(&file, plane).unwrap());
+        file.write_all_at(b"other content", 97).unwrap();
+        drop(file);
+        let retained = resident.clone();
+        drop(resident);
+        assert_eq!(retained.bytes(), b"private table");
+
+        // Ask the kernel to copy into the mapping. A read-only destination yields
+        // EFAULT without writing through a Rust reference or faulting the test process.
+        let input = unsealed_resident_file();
+        assert_eq!(unsafe {
+            libc::pread(input.as_raw_fd(), retained.storage.address as *mut _, 1, 0)
+        }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EFAULT));
     }
 
     #[test]

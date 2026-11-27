@@ -14,7 +14,7 @@ use crate::{
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    os::fd::FromRawFd,
+    os::fd::{AsRawFd, FromRawFd},
     path::PathBuf,
     sync::Arc,
 };
@@ -50,7 +50,7 @@ pub struct TableSource {
 /// delivery staging and CUDA events belong to each rank's native binding.
 pub struct PreparedTables {
     index: Arc<Index>,
-    data: Vec<[Arc<reader::Resident>; 2]>,
+    data: Vec<[(Arc<reader::Resident>, File); 2]>,
 }
 
 impl PreparedTables {
@@ -145,7 +145,8 @@ impl PreparedTables {
                         Ok((file, segment.offset, segment.nbytes))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                planes.push(Arc::new(reader::Resident::load_segments(plane, &segments)?));
+                let (resident, file) = reader::Resident::load_segments(plane, &segments)?;
+                planes.push((Arc::new(resident), file));
             }
             data.push([planes.remove(0), planes.remove(0)]);
         }
@@ -176,7 +177,7 @@ impl PreparedTables {
                     .into());
                 }
                 let file = unsafe { File::from_raw_fd(owned) };
-                planes.push(Arc::new(reader::Resident::from_shared(file, plane)?));
+                planes.push((Arc::new(reader::Resident::from_shared(&file, plane)?), file));
             }
             data.push([planes.remove(0), planes.remove(0)]);
         }
@@ -187,7 +188,7 @@ impl PreparedTables {
     pub fn descriptors(&self) -> Vec<i32> {
         self.data
             .iter()
-            .flat_map(|planes| planes.iter().map(|plane| plane.descriptor()))
+            .flat_map(|planes| planes.iter().map(|(_, file)| file.as_raw_fd()))
             .collect()
     }
 
@@ -277,7 +278,7 @@ impl PreparedTables {
         let readers = self
             .data
             .iter()
-            .map(|data| reader::Reader::resident(data.clone(), stats.clone()))
+            .map(|data| reader::Reader::resident(data.each_ref().map(|(plane, _)| plane.clone()), stats.clone()))
             .collect();
         Ok(Binding {
             shared: Shared::with_readers(
@@ -357,7 +358,7 @@ mod tests {
         assert!(PreparedTables::from_shared(129280, &sources, &owner.descriptors()[..1]).is_err());
         std::fs::remove_dir_all(root).unwrap();
         drop(owner);
-        let mut reader = reader::Reader::resident(peer.data[0].clone(), Arc::default());
+        let mut reader = reader::Reader::resident(peer.data[0].each_ref().map(|(plane, _)| plane.clone()), Arc::default());
         let mut output = vec![0; 3 * (256 + 8)];
         reader
             .gather(&peer.index.tables[0].planes, &[31, -1, 0], &mut output)
