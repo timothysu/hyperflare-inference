@@ -2315,7 +2315,7 @@ impl RequestScheduler {
             origin => origin,
         };
         self.refresh.validate(origin)?;
-        if origin == PlanOrigin::AcceptanceStart
+        if origin.is_acceptance()
             && (self.speculative_fixed_width.is_some() || step.token_capacity <= 1
                 || !matches!(step.kind, GraphKind::Speculative | GraphKind::Mixed)) {
             return Err("acceptance learning requires an adaptive speculative choice".into());
@@ -2382,13 +2382,13 @@ impl RequestScheduler {
             origin: match origin {
                 PlanOrigin::Ordinary => TimingOrigin::Ordinary,
                 PlanOrigin::Discovery => TimingOrigin::Discovery,
-                PlanOrigin::AcceptanceStart => TimingOrigin::Acceptance,
+                PlanOrigin::AcceptanceStart { .. } => TimingOrigin::Acceptance,
                 _ => TimingOrigin::Refresh,
             },
             credit_ns: if origin.is_acceptance() { self.refresh.acceptance_credit_ns } else { self.refresh.credit_ns }, commit_ns: self.now_ns,
             selected_at_ns: plan.selected_cost.selected_at_ns,
             refresh_episode: match origin {
-                PlanOrigin::RefreshStart(_) | PlanOrigin::AcceptanceStart => Some(fence.0),
+                PlanOrigin::RefreshStart(_) | PlanOrigin::AcceptanceStart { .. } => Some(fence.0),
                 _ => None,
             },
         };
@@ -2652,6 +2652,8 @@ impl RequestScheduler {
         let host_population = proposal_source == speculation::ProposalSource::Mtp && !gpu_confidence;
         let collect_calibration = confidence.is_some() && gpu_confidence;
         let mut population = Vec::new();
+        // The end of each speculative lane's observations in `population`.
+        let mut population_lanes = Vec::new();
         let mut calibration = Vec::new();
         let mut useful_tokens = [0u64; REQUEST_LANES];
         let mut generated = Vec::new();
@@ -2733,6 +2735,9 @@ impl RequestScheduler {
                             calibration.push((row, depth, realized));
                         }
                     }
+                }
+                if host_population {
+                    population_lanes.push(population.len());
                 }
             }
             if record.status == 3 {
@@ -2822,8 +2827,15 @@ impl RequestScheduler {
                 request.scheduled_consumed = request.consumed_tokens;
             }
         }
-        for (depth, value) in population {
-            self.forecasts.observe_population(depth, value as f32);
+        // Each lane-round ages the population before its own observations fold in, so a
+        // depth that every lane observes keeps a constant weight.
+        let mut observed = 0;
+        for end in population_lanes {
+            self.forecasts.age_population();
+            for &(depth, value) in &population[observed..end] {
+                self.forecasts.observe_population(depth, value as f32);
+            }
+            observed = end;
         }
         if let Some(confidence) = confidence {
             self.observe_packed_forecasts(&step, records, confidence, &calibration);

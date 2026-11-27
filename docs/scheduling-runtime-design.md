@@ -100,26 +100,42 @@ narrows after rejections widens again without a funded probe once those
 rejections have aged.
 
 The prior is a population mean per position across all requests. It begins at
-`0.5^d` for the `d`-th draft position. Each observation moves it by
-`max(1/64, 1/(n + 1))` of the distance to the observed value, where `n` counts
-the observations the position already has: the first observation replaces the
-starting guess, the mean is a plain average of its first 64 observations, and
-it then follows whichever traffic ran most recently. A model whose graphs
-allocate prefix lengths on the GPU takes the observed value from the completed
-prefix probability of each lane in the round's confidence sidecar; a model with
-any such graph is treated this way for all its rounds. Every other model takes
-it from the verification outcome: for each position a completed MTP round
-determined, the value is the reported survival, or one for an accepted position
-and zero for a rejected one. On this path only lanes whose request is live and
-whose status is not an error count, which are the rounds the request's own
-acceptance evidence learns from. Each round updates the population from one of
-the two sources.
+`0.5^d` for the `d`-th draft position. Each position has an observation weight
+`w` that starts at zero and never exceeds 64. An observation adds one to `w`
+and moves the mean by `1/w` of the distance to the observed value, so the first
+observation replaces the starting guess.
 
-Until a position has 16 observations, selection uses its population mean plus
-the confidence radius `sqrt(ln(20) / (2 * (n + 1)))`, capped at one. A scheduler
-that has verified nothing therefore offers every prepared depth and observes
-it. Without the radius, a depth whose starting guess lies below the survival
-that its cost requires would never be offered, and its guess never corrected.
+A model whose graphs allocate prefix lengths on the GPU takes the observed
+value from the completed prefix probability of each lane in the round's
+confidence sidecar; a model with any such graph is treated this way for all its
+rounds. Every round reports every produced position, and `w` only grows: the
+mean is a plain average of a position's first 64 observations and then moves by
+1/64 per observation.
+
+Every other model takes the observed value from the verification outcome: for
+each position a completed MTP round determined, the value is the reported
+survival, or one for an accepted position and zero for a rejected one. On this
+path only lanes whose request is live and whose status is not an error count,
+which are the rounds the request's own acceptance evidence learns from. Each
+such lane-round multiplies the weight of every position by `63/64` before its
+observations are added, whether or not the lane was offered that position. A
+position that every lane-round observes keeps `w = 64` and moves by 1/64 per
+observation. A position that rounds offer less often keeps a smaller `w` and
+moves further per observation, so every mean follows about the last 64
+lane-rounds of serving. Selection stops offering a position whose mean falls
+below the survival its cost requires; after that only
+[funded probes](#funded-acceptance-learning) observe the position, and the
+smaller `w` lets those few observations correct its mean. Each round updates
+the population from one of the two sources.
+
+Let `n` count every observation a position has received. Until `n` reaches 16,
+selection uses the population mean plus the confidence radius
+`sqrt(ln(20) / (2 * (n + 1)))`, capped at one. A scheduler that has verified
+nothing therefore offers every prepared depth and observes it. Without the
+radius, a depth whose starting guess lies below the survival that its cost
+requires would never be offered, and its guess never corrected. The weight
+discount does not reduce `n`: a position past its 16 observations regains no
+radius, which bounds the cost of a position whose drafts do not survive.
 
 The strength of the population in a request's estimate is `min(16, n + 1)`
 observations for verified acceptance on a model without GPU confidence: one
@@ -537,24 +553,39 @@ Ordinary completions also earn a separate `0.01 / 0.99` share of raw execution
 time, capped at 5 ms. Full credit permits an acceptance probe that offers a
 request at least one depth beyond the ordinary choice, can beat the ordinary
 choice under its optimistic yield estimate, and leaves future output in which
-to use the observation. Candidates rank by optimistic score improvement per
-physical execution time. Timing refresh takes precedence; only one probe
-episode can be active. Equal gains prefer the least-informed added prefix,
-then the shorter execution and smaller physical geometry.
-Fixed-width execution does not probe acceptance.
+to use the observation.
 
-An acceptance episode pays one complete graph interval, including readiness
-stalls. Forecast observations stop at each lane's frozen `min(D + 1, W)`
-ceiling. Timing and acceptance ledgers never charge the same execution. An
-already-started episode can incur debt; another episode waits for full credit.
-Idle clears positive credit and preserves debt. For ordinary duration `O`,
-acceptance-probe duration `P`, and one episode's actual duration `D`, the bound is
-`P <= 0.01 / 0.99 * O + D`. Initial cost discovery is accounted separately.
+A probe replaces the ordinary choice when that choice is a speculative decode
+round, the probe serves every lane of the round with at least as many
+positions, and the probe's estimated duration is longer. Where the GPU
+allocates prefix lengths, the comparison uses the host's estimate of that
+allocation. Such a probe produces every token the ordinary round would, so the
+time it adds is its duration less the ordinary round's estimated duration.
+Every other probe adds its whole duration. Candidates rank by optimistic score
+improvement per added time. Timing refresh takes precedence; only one probe
+episode can be active. Equal gains prefer the least-informed added prefix, then
+the shorter execution and smaller physical geometry. Fixed-width execution does
+not probe acceptance.
+
+An acceptance episode pays the time it adds: its measured graph interval,
+including readiness stalls, less the estimated duration of the ordinary round
+it replaces, and never less than zero. The budget therefore funds a probe that
+adds a fraction `f` of the ordinary round's duration about once in `99 f`
+ordinary rounds, which is the rate at which a position that ordinary rounds do
+not offer is observed. A probe is submitted alone behind the feedback barrier,
+and the ledger does not charge the queued submission that this forgoes. Forecast
+observations stop at each lane's frozen `min(D + 1, W)` ceiling. Timing and
+acceptance ledgers never charge the same execution. An already-started episode
+can incur debt; another episode waits for full credit. Idle clears positive
+credit and preserves debt. For ordinary duration `O`, time `A` added by
+acceptance probes, and the time `D` one episode adds, the bound is
+`A <= 0.01 / 0.99 * O + D`. Initial cost discovery is accounted separately.
 Cost-model estimates are median replay durations corrected for measured
 readiness stalls; exploration budgets use raw physical time.
 `flare_scheduler_execution_nanoseconds_total` and
 `flare_scheduler_executions_total` expose ordinary, discovery, timing-refresh,
-and acceptance-learning execution separately.
+and acceptance-learning execution separately. The acceptance-learning counters
+report whole probe rounds, which exceed the added time the ledger charges.
 
 ## Service accounting and publication
 
@@ -793,7 +824,10 @@ padded tails; high- and low-acceptance speculation; heterogeneous cohorts;
 padded batch capacities; long decode pairs; prefill/decode contention; graph
 expiry and recovery; and output gaps. Width selection is also replayed against
 round durations and prefix survival measured on Hy4-flash at batch one, with
-recovery after rejected rounds and the bounded cost of a failed drafter. Prefill
+recovery after rejected rounds and the bounded cost of a failed drafter. With
+the same durations, a request whose drafts all survive starts from a population
+that holds the fourth and fifth drafts rejected, and must reach width six
+within 150 rounds while its probes add no more than their budget. Prefill
 tests cover tails that a padded graph or a measured split finishes soonest and
 capacity stability while cost grows with context. Mixed tests compare every legal cohort
 against exhaustive useful-work/time enumeration, exercise fitting prompt tails,

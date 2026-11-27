@@ -16,7 +16,9 @@ pub(super) enum PlanOrigin {
     Ordinary,
     Discovery,
     RefreshStart(cost::Key),
-    AcceptanceStart,
+    /// An acceptance probe. `replaced_ns` is the estimated duration of the ordinary round
+    /// the probe stands in for, or zero when it stands in for none.
+    AcceptanceStart { replaced_ns: u64 },
 }
 
 impl PlanOrigin {
@@ -25,7 +27,7 @@ impl PlanOrigin {
     }
 
     pub fn is_acceptance(self) -> bool {
-        matches!(self, Self::AcceptanceStart)
+        matches!(self, Self::AcceptanceStart { .. })
     }
 }
 
@@ -51,7 +53,7 @@ impl RefreshState {
     pub fn validate(&self, origin: PlanOrigin) -> Result<()> {
         match origin {
             PlanOrigin::RefreshStart(_) if !self.ready() => Err("refresh requires full credit and no active episode".into()),
-            PlanOrigin::AcceptanceStart if !self.acceptance_ready() => Err("acceptance learning requires full credit and no active episode".into()),
+            PlanOrigin::AcceptanceStart { .. } if !self.acceptance_ready() => Err("acceptance learning requires full credit and no active episode".into()),
             _ => Ok(()),
         }
     }
@@ -79,8 +81,13 @@ impl RefreshState {
             PlanOrigin::Discovery => {}
             _ => {
                 let duration = cost::observed_duration_ns(timing).unwrap_or(timing.wall_ns);
-                if origin.is_acceptance() { self.acceptance_credit_ns -= duration as f64; }
-                else { self.credit_ns -= duration as f64; }
+                // An acceptance probe produces the output of the round it replaces, so it
+                // costs the time it adds to that round. A timing refresh costs its whole round.
+                if let PlanOrigin::AcceptanceStart { replaced_ns } = origin {
+                    self.acceptance_credit_ns -= duration.saturating_sub(replaced_ns) as f64;
+                } else {
+                    self.credit_ns -= duration as f64;
+                }
                 self.active = false;
             }
         }

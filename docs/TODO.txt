@@ -125,9 +125,24 @@
     tests replay measured Hy4-flash batch-one costs only. See
     scheduling-runtime-design.md#completed-confidence-and-acceptance.
 
-[ ] Run verification/helios-lifecycle/check.py with TLC against the scheduler
-    after RequestScheduler admission stopped seeding acceptance profiles; the
-    Rust conformance test passes and the model check has not been run.
+[ ] Measure in live Helios what acceptance probes cost beyond the time the
+    acceptance ledger charges (helios/src/scheduler/{learning,refresh}.rs).
+    Each probe is submitted alone, so the round before it and the probe itself
+    run without a queued successor. Record acceptance-learning executions per
+    ordinary execution and decode tokens per second at concurrency 1, 4, and 8
+    on a host-allocated core, for a workload whose ordinary width is already
+    the best fixed width, against fixed-width execution at that width, which
+    runs no probes. See scheduling-runtime-design.md#funded-acceptance-learning.
+
+[ ] Keep draft positions that no prepared width offers out of the monotone
+    projection of verified acceptance (AcceptanceProfile::curve in
+    helios/src/scheduler/speculation.rs). Such a position is never observed,
+    so its population prior keeps the unobserved radius, and pooling raises
+    the estimates of the deepest offered positions: with widths up to six
+    under a 16-token completion capacity, 64 observed rejections at positions
+    three to five yield an estimate of 0.04 instead of zero. Remove this entry
+    when the estimate of an offered position no longer depends on positions
+    beyond the widest prepared round.
 
 [ ] Extend shortest-completion prefill scoring (prefill_tail in
     helios/src/scheduler/policy.rs) to catalogs with TERMINAL_PREFILL graphs

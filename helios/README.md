@@ -452,7 +452,8 @@ dedicated depth-1 ring for `W=2`—with conservative `eff_depth <= depth`
 fallback, excess scaled by `(1 - 1/b) * min(alpha, 1)` and capped at 100% draft
 survival) to capture the GPU allocator's per-step cherry-picking gain.
 Ordinary selection uses calibrated historical means, while a separate 1%
-raw-time budget funds optimistic acceptance probes. Observational weight ages
+raw-time budget funds optimistic acceptance probes and is charged the time each
+probe adds to the ordinary round it replaces. Observational weight ages
 without changing unobserved means; width-one rounds still measure cost. See
 [funded acceptance learning](../docs/scheduling-runtime-design.md#funded-acceptance-learning).
 

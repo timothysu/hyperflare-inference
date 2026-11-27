@@ -12,8 +12,15 @@ impl RequestScheduler {
         f64::from(width != 0) + self.speculative_curve(request, true)[..width.saturating_sub(1)].iter().sum::<f64>()
     }
 
+    /// The funded probe to run in place of `ordinary`, with the ordinary duration it replaces.
+    ///
+    /// A probe replaces the ordinary round when that round only decodes and the probe
+    /// serves each of its lanes at least as long: it then produces every token the
+    /// ordinary round would, and adds only the time by which it is longer. Any other
+    /// probe replaces nothing and adds its whole duration. Probes are ranked by
+    /// optimistic gain per added time, which is the time the acceptance ledger is charged.
     pub(super) fn acceptance_probe(&self, ordinary: Candidate,
-        values: &[LaneValue; REQUEST_LANES], age_price: f64) -> Option<Candidate> {
+        values: &[LaneValue; REQUEST_LANES], age_price: f64) -> Option<(Candidate, u64)> {
         let mut candidates = Vec::new();
         self.packed_round_candidates(&mut candidates, values, age_price, true);
         self.mixed_candidates(&mut candidates, values, age_price, true);
@@ -46,16 +53,23 @@ impl RequestScheduler {
                 width > ordinary_widths[slot]
                     && request.max_new_tokens - request.generated_tokens > width as u32
                     && self.limits.max_sequence_tokens - request.scheduled_consumed as usize > width
-            })).max_by(|(a, a_widths), (b, b_widths)| {
-            let gain = |candidate: &Candidate| (candidate.rate.score - ordinary.rate.score) / candidate.rate.duration_ns as f64;
+            })).map(|(candidate, widths)| {
+                let replaces = ordinary.kind == GraphKind::Speculative
+                    && candidate.rate.duration_ns > ordinary.rate.duration_ns
+                    && bits(ordinary.mask).all(|slot| candidate.mask & (1 << slot) != 0
+                        && widths[slot] >= ordinary_widths[slot]);
+                (candidate, widths, if replaces { ordinary.rate.duration_ns } else { 0 })
+            }).max_by(|(a, a_widths, a_replaced), (b, b_widths, b_replaced)| {
+            let gain = |candidate: &Candidate, replaced: u64| (candidate.rate.score - ordinary.rate.score)
+                / (candidate.rate.duration_ns - replaced) as f64;
             let information = |candidate: &Candidate, widths: &[usize; REQUEST_LANES]| bits(candidate.mask).flat_map(|slot| {
                 (ordinary_widths[slot] - 1..widths[slot] - 1)
                     .map(move |depth| self.speculative_information(self.slots[slot].request.as_ref().unwrap(), depth))
             }).fold(f64::INFINITY, f64::min);
-            gain(a).total_cmp(&gain(b))
+            gain(a, *a_replaced).total_cmp(&gain(b, *b_replaced))
                 .then_with(|| information(b, b_widths).total_cmp(&information(a, a_widths)))
                 .then(b.rate.duration_ns.cmp(&a.rate.duration_ns))
                 .then(b.batch.cmp(&a.batch)).then(b.capacity.cmp(&a.capacity)).then(b.mask.cmp(&a.mask))
-        }).map(|(candidate, _)| candidate)
+        }).map(|(candidate, _, replaced)| (candidate, replaced))
     }
 }

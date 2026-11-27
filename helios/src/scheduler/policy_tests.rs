@@ -2607,7 +2607,7 @@ fn refresh_funding_requires_earned_credit_and_accounts_for_repeated_attempts_and
 }
 
 #[test]
-fn acceptance_learning_escapes_width_one_and_pays_for_complete_rounds() {
+fn acceptance_learning_escapes_width_one_and_pays_for_the_time_its_probes_add() {
     let mut s = engine(1, true);
     let handle = add(&mut s, 1, 64, 4096);
     ready(&mut s, &[handle]);
@@ -2620,23 +2620,29 @@ fn acceptance_learning_escapes_width_one_and_pays_for_complete_rounds() {
     s.refresh.acceptance_credit_ns = 0.0;
     assert_eq!(s.plan().unwrap().token_capacity, 1);
     let mut ordinary_ns = 0;
-    let mut probe_ns = 0;
+    let mut added_ns = 0;
     let mut recovered = false;
     for _ in 0..1800 {
         let plan = s.plan().unwrap();
         let duration = plan.estimated_duration_ns();
-        if plan.origin.is_acceptance() { probe_ns += duration; }
-        else { ordinary_ns += duration; }
+        if let PlanOrigin::AcceptanceStart { replaced_ns } = plan.origin {
+            // One lane: every probe serves the lane of the ordinary round and is longer than it.
+            assert!(replaced_ns >= 10 * MS && replaced_ns < duration);
+            added_ns += duration - replaced_ns;
+        } else {
+            ordinary_ns += duration;
+        }
         let accepted = if s.request(handle).unwrap().generated_tokens < generated + 512 { 0 } else { 7 };
         if accepted == 7 && plan.origin == PlanOrigin::Ordinary && plan.token_capacity >= 6 {
             recovered = true;
         }
         step(&mut s, accepted);
-        assert!(probe_ns as f64 <= ordinary_ns as f64 * 0.01 / 0.99 + 17.0 * MS as f64 + 1.0);
+        // A probe starts at full credit and adds at most the 7 ms between widths one and eight.
+        assert!(added_ns as f64 <= ordinary_ns as f64 * 0.01 / 0.99 + 2.0 * MS as f64 + 1.0);
         if recovered { break; }
     }
     assert!(recovered, "an improved request must escape width one");
-    assert!(probe_ns > 0);
+    assert!(added_ns > 0);
 }
 
 #[test]
@@ -2679,9 +2685,15 @@ fn host_round(s: &mut RequestScheduler, accepted: usize, survival: Option<(Reque
     for token in output { s.published_output(token.request, fence).unwrap(); }
 }
 
-/// The population mean after one more observation, `seen` observations having preceded it.
+/// The population mean after one more confidence forecast, `seen` forecasts having preceded it.
 fn moved(population: f32, observed: f32, seen: u32) -> f32 {
     population + (1.0f32 / 64.0).max(1.0 / (seen as f32 + 1.0)) * (observed - population)
+}
+
+/// The population mean after one more verified outcome, resting on `weight` observations
+/// before the outcome's lane-round ages them.
+fn verified(population: f32, observed: f32, weight: f32) -> f32 {
+    population + (1.0 / (weight * (1.0 - 1.0 / 64.0) + 1.0)) * (observed - population)
 }
 
 
@@ -2695,7 +2707,7 @@ fn rejected_and_survival_rounds_move_the_population_by_the_observed_values() {
     // Three drafts offered, one accepted, then rejected: depth 0 observed true, depths 1 and 2 observed false.
     host_round(&mut s, 1, None);
     let rejected = s.forecasts.population.clone();
-    assert_eq!(rejected[..3], [moved(start[0], 1.0, 0), moved(start[1], 0.0, 0), moved(start[2], 0.0, 0)]);
+    assert_eq!(rejected[..3], [verified(start[0], 1.0, 0.0), verified(start[1], 0.0, 0.0), verified(start[2], 0.0, 0.0)]);
     // The first observation of a depth replaces the geometric guess.
     assert_eq!(rejected[..3], [1.0, 0.0, 0.0]);
     assert_eq!(rejected[3..], start[3..]);
@@ -2704,7 +2716,7 @@ fn rejected_and_survival_rounds_move_the_population_by_the_observed_values() {
     row[..3].copy_from_slice(&[0.9, 0.6, 0.2]);
     host_round(&mut s, 1, Some((handle, &row)));
     let soft = s.forecasts.population.clone();
-    assert_eq!(soft[..3], [moved(rejected[0], 0.9, 1), moved(rejected[1], 0.6, 1), moved(rejected[2], 0.2, 1)]);
+    assert_eq!(soft[..3], [verified(rejected[0], 0.9, 1.0), verified(rejected[1], 0.6, 1.0), verified(rejected[2], 0.2, 1.0)]);
     assert_eq!(soft[3..], start[3..]);
     // The request's own profile saw the same two rounds.
     assert_eq!(s.request(handle).unwrap().acceptance.rounds(), 2);
@@ -3559,7 +3571,7 @@ fn host_prefix_allocator_honors_budget_and_gpu_allocator_preserves_lane_ceilings
 }
 
 #[test]
-fn acceptance_probe_charges_one_round_preserves_timing_credit_and_carries_debt() {
+fn acceptance_probe_charges_the_time_it_adds_preserves_timing_credit_and_carries_debt() {
     let mut state = refresh::RefreshState::default();
     state.complete(PlanOrigin::Ordinary, gpu_time(495 * MS));
     assert!(state.acceptance_ready());
@@ -3568,17 +3580,31 @@ fn acceptance_probe_charges_one_round_preserves_timing_credit_and_carries_debt()
         batch_capacity: 1, token_capacity: 8, packed_token_capacity: 8,
         mixed: None, requires_feedback: true,
         lanes: vec![ScheduledLane { request: RequestHandle { slot: 0, generation: 1 }, start_position: 65, tokens: 8 }] };
-    state.validate(PlanOrigin::AcceptanceStart).unwrap();
-    state.commit(PlanOrigin::AcceptanceStart, Fence(7), &round);
+    // A probe that replaces no ordinary round costs its whole duration.
+    let alone = PlanOrigin::AcceptanceStart { replaced_ns: 0 };
+    state.validate(alone).unwrap();
+    state.commit(alone, Fence(7), &round);
     assert!(!state.acceptance_ready());
-    assert!(state.validate_completion(PlanOrigin::AcceptanceStart,
+    assert!(state.validate_completion(alone,
         ExecutionTiming { queued: true, ..gpu_time(10 * MS) }).is_err());
-    state.complete(PlanOrigin::AcceptanceStart, gpu_time(10 * MS));
+    state.complete(alone, gpu_time(10 * MS));
     assert_eq!(state.acceptance_credit_ns, -5.0 * MS as f64);
     assert_eq!(state.credit_ns, timing_credit);
     assert!(!state.active());
     state.idle();
     assert_eq!(state.acceptance_credit_ns, -5.0 * MS as f64);
+    assert_eq!(state.credit_ns, 0.0);
+    // A probe that replaces a 7 ms ordinary round costs the 3 ms it adds to that round,
+    // and nothing when it finishes within the round's estimate.
+    let replacing = PlanOrigin::AcceptanceStart { replaced_ns: 7 * MS };
+    state.acceptance_credit_ns = refresh::CREDIT_CAP_NS;
+    state.validate(replacing).unwrap();
+    state.commit(replacing, Fence(8), &round);
+    state.complete(replacing, gpu_time(10 * MS));
+    assert_eq!(state.acceptance_credit_ns, 2.0 * MS as f64);
+    state.commit(replacing, Fence(9), &round);
+    state.complete(replacing, gpu_time(6 * MS));
+    assert_eq!(state.acceptance_credit_ns, 2.0 * MS as f64);
     assert_eq!(state.credit_ns, 0.0);
 }
 
@@ -3757,9 +3783,145 @@ fn funded_acceptance_probe_compares_offered_prefixes_across_equal_width_budgets(
     }
     scheduler.complete(fence, &records, gpu_time(MS)).unwrap();
     let probe = scheduler.plan().unwrap();
-    assert_eq!(probe.origin, PlanOrigin::AcceptanceStart);
+    // The probe serves both lanes at least as long as the 1 ms ordinary round it replaces.
+    assert_eq!(probe.origin, PlanOrigin::AcceptanceStart { replaced_ns: MS });
     assert_eq!((probe.token_capacity, probe.packed_token_capacity), (8, 7));
     assert_eq!(probe.lanes.iter().map(|lane| lane.tokens).sum::<usize>(), 7);
+}
+
+#[test]
+fn a_funded_probe_is_ranked_by_gain_per_added_time_and_charged_that_time() {
+    let mut s = engine(1, false);
+    s.configure_policy(PolicyConfig::throughput()).unwrap();
+    s.enable_speculation(&[1, 2, 3, 4]).unwrap();
+    for width in 1..=4 { set_cost(&mut s, GraphKind::Speculative, 1, width, (9 + width as u64) * MS); }
+    // The first draft survives half the time and deeper drafts one time in twenty, so
+    // width two yields the most expected tokens per millisecond: 1.5 in 11 ms.
+    let mut population = vec![0.05f32; 15];
+    population[0] = 0.5;
+    s.forecasts.set_population(population);
+    let handle = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[handle]);
+    s.refresh.credit_ns = 0.0;
+    s.refresh.acceptance_credit_ns = 0.0;
+    let ordinary = s.plan().unwrap();
+    assert_eq!((ordinary.origin, ordinary.token_capacity), (PlanOrigin::Ordinary, 2));
+    s.refresh.acceptance_credit_ns = refresh::CREDIT_CAP_NS;
+    // Optimistic survival is 0.806, 0.356, 0.356. Width four gains more than width three,
+    // 0.057 against 0.044 tokens per millisecond, but adds 2 ms to the ordinary round
+    // where width three adds 1 ms.
+    let probe = s.plan().unwrap();
+    assert_eq!(probe.origin, PlanOrigin::AcceptanceStart { replaced_ns: 11 * MS });
+    assert_eq!(probe.token_capacity, 3);
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&probe, fence).unwrap();
+    s.advance_to(s.now_ns + 12 * MS).unwrap();
+    let records = completion_records(&s, &probe, fence, 0);
+    s.complete(fence, &records, gpu_time(12 * MS)).unwrap();
+    assert_eq!(s.refresh.acceptance_credit_ns, refresh::CREDIT_CAP_NS - MS as f64);
+}
+
+#[test]
+fn a_probe_that_drops_a_lane_of_the_ordinary_round_is_charged_its_whole_duration() {
+    let mut s = engine(2, false);
+    s.configure_policy(PolicyConfig::throughput()).unwrap();
+    s.enable_speculation(&[1, 2, 4, 8]).unwrap();
+    // Two lanes decode together only at width one: wider batch-two rounds cost a second.
+    for (width, batch_one, batch_two) in [(1, 10 * MS, 10 * MS), (2, 21 * MS / 2, 1000 * MS),
+        (4, 11 * MS, 1000 * MS), (8, 23 * MS / 2, 1000 * MS)] {
+        set_cost(&mut s, GraphKind::Speculative, 1, width, batch_one);
+        set_cost(&mut s, GraphKind::Speculative, 2, width, batch_two);
+    }
+    s.settle_population();
+    let handles = [add(&mut s, 1, 64, 4096), add(&mut s, 2, 64, 4096)];
+    ready(&mut s, &handles);
+    s.refresh.credit_ns = 0.0;
+    s.refresh.acceptance_credit_ns = 0.0;
+    let ordinary = s.plan().unwrap();
+    assert_eq!((ordinary.batch_capacity, ordinary.token_capacity, ordinary.lanes.len()), (2, 1, 2));
+    s.refresh.acceptance_credit_ns = refresh::CREDIT_CAP_NS;
+    // The only wider rounds serve one lane. Such a probe does not produce the other
+    // lane's token, so it replaces no round.
+    let probe = s.plan().unwrap();
+    assert_eq!(probe.origin, PlanOrigin::AcceptanceStart { replaced_ns: 0 });
+    assert_eq!((probe.batch_capacity, probe.lanes.len()), (1, 1));
+    assert!(probe.token_capacity > 1);
+    let duration = probe.estimated_duration_ns();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&probe, fence).unwrap();
+    s.advance_to(s.now_ns + duration).unwrap();
+    let records = completion_records(&s, &probe, fence, 0);
+    s.complete(fence, &records, gpu_time(duration)).unwrap();
+    assert_eq!(s.refresh.acceptance_credit_ns, refresh::CREDIT_CAP_NS - duration as f64);
+}
+
+#[test]
+fn a_request_whose_drafts_survive_escapes_a_population_that_stopped_offering_them() {
+    let mut s = engine(1, false);
+    s.enable_speculation(&[1, 2, 3, 4, 5, 6]).unwrap();
+    for (index, micros) in [13_300u64, 15_930, 17_700, 18_730, 20_240, 21_200].into_iter().enumerate() {
+        set_cost(&mut s, GraphKind::Speculative, 1, index + 1, micros * 1000);
+    }
+    // Earlier requests rejected the fourth and fifth drafts, so the ordinary choice is width four.
+    let mut population = vec![0.0f32; 15];
+    population[..5].copy_from_slice(&[0.9, 0.8, 0.7, 0.05, 0.02]);
+    s.forecasts.set_population(population);
+    let handle = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[handle]);
+    s.refresh.credit_ns = 0.0;
+    s.refresh.acceptance_credit_ns = 0.0;
+    assert_eq!(s.plan().unwrap().token_capacity, 4);
+    // Every draft of this request survives. A probe one width beyond the ordinary choice
+    // adds 1.5 ms to it, so the 1% budget funds a probe about every ninth round and the
+    // ordinary choice reaches width six after 103 rounds. Charged for whole rounds, the
+    // budget funds a probe about every 110th round and width four outlasts 1200 rounds.
+    let (mut ordinary_ns, mut added_ns, mut rounds) = (0u64, 0u64, 0);
+    loop {
+        let plan = s.plan().unwrap();
+        let duration = plan.estimated_duration_ns();
+        match plan.origin {
+            PlanOrigin::AcceptanceStart { replaced_ns } => added_ns += duration - replaced_ns,
+            _ if plan.token_capacity == 6 => break,
+            _ => ordinary_ns += duration,
+        }
+        step(&mut s, 5);
+        rounds += 1;
+        assert!(rounds < 150, "the ordinary choice stayed below width six");
+        assert!(added_ns as f64 <= ordinary_ns as f64 * 0.01 / 0.99 + 3.0 * MS as f64);
+    }
+    assert!(added_ns > 0);
+    // Rounds that offer the deeper drafts move the population that later requests start from.
+    for _ in 0..128 { step(&mut s, 5); }
+    assert!(s.forecasts.population[3] > 0.9 && s.forecasts.population[4] > 0.9);
+}
+
+#[test]
+fn a_population_depth_that_rounds_stop_offering_relearns_from_few_observations() {
+    let mut s = engine(1, true);
+    s.forecasts.set_population(vec![0.2; 15]);
+    // 128 lane-rounds observe depths 0 and 2 and never depth 1.
+    for _ in 0..128 {
+        s.forecasts.age_population();
+        s.forecasts.observe_population(0, 0.2);
+        s.forecasts.observe_population(2, 0.2);
+    }
+    assert_eq!(s.forecasts.population[..3], [0.2; 3]);
+    // Depths 1 and 2 then survive in each of 16 lane-rounds. Depth 2 was observed
+    // throughout and moves by 1/64 of the remaining distance per observation, 22% in all.
+    // Depth 1 kept the weight of 8.5 observations out of 64 and moves 68% of the distance.
+    let mut steady = 0.2f32;
+    for _ in 0..16 {
+        s.forecasts.age_population();
+        s.forecasts.observe_population(1, 1.0);
+        s.forecasts.observe_population(2, 1.0);
+        steady += (1.0 - steady) / 64.0;
+    }
+    assert_eq!(s.forecasts.population[2], steady);
+    assert!((s.forecasts.population[2] - 0.378).abs() < 1e-3);
+    assert!((s.forecasts.population[1] - 0.746).abs() < 1e-3);
+    // The depth is past its warm-up, so its prior keeps full strength and no optimism.
+    let prior = s.forecasts.prior(1);
+    assert_eq!((prior.mean, prior.strength), (f64::from(s.forecasts.population[1]), 16.0));
 }
 
 #[test]

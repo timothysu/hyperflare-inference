@@ -7,7 +7,8 @@
 
 use super::{policy::{Candidate, bits}, utility::{LaneValue, ValueRate, best_cohort}, *};
 
-/// Smallest step of the population mean toward one observation.
+/// Smallest step of the population mean toward one observation, and the share of a
+/// depth's observation weight that one lane-round of verified acceptance removes.
 const POPULATION_STEP: f32 = 1.0 / 64.0;
 /// Observations the population is worth against a request's confidence forecasts.
 /// Every round reports confidence at every produced depth, so the forecasts need
@@ -327,6 +328,9 @@ pub(super) struct Forecasts {
     pub(super) population: Vec<f32>,
     /// Observations folded into each depth's population mean.
     observations: Vec<u32>,
+    /// Observations each depth's mean presently rests on, at most `1 / POPULATION_STEP`.
+    /// `age_population` discounts it, so a depth that rounds stop offering keeps less.
+    weight: Vec<f32>,
     calibration: Vec<DepthCalibration>,
     surplus: SurplusHistory,
 }
@@ -339,20 +343,32 @@ impl Forecasts {
         Self {
             requests: std::array::from_fn(|_| None),
             observations: vec![0; population.len()],
+            weight: vec![0.0; population.len()],
             population,
             calibration,
             surplus: SurplusHistory::new(),
         }
     }
 
-    /// Folds one observed value into the mean survival of the prefix at `depth`. The
-    /// mean is the plain average of its first observations, which replaces the initial
-    /// geometric guess at once, and moves by `POPULATION_STEP` afterwards.
+    /// Folds one observed value into the mean survival of the prefix at `depth`, at the
+    /// reciprocal of the depth's observation weight. The first observation replaces the
+    /// initial geometric guess, and a depth observed in every lane-round moves by
+    /// `POPULATION_STEP`. A depth observed less often moves further per observation, so
+    /// its mean follows the same span of lane-rounds as every other depth's.
     pub(super) fn observe_population(&mut self, depth: usize, prefix: f32) {
         debug_assert!(prefix.is_finite() && (0.0..=1.0).contains(&prefix));
-        let step = POPULATION_STEP.max(1.0 / (self.observations[depth] as f32 + 1.0));
-        self.population[depth] += step * (prefix - self.population[depth]);
+        self.weight[depth] = (self.weight[depth] + 1.0).min(1.0 / POPULATION_STEP);
+        self.population[depth] += (1.0 / self.weight[depth]) * (prefix - self.population[depth]);
         self.observations[depth] = self.observations[depth].saturating_add(1);
+    }
+
+    /// Discounts every depth's observation weight for one lane-round of verified
+    /// acceptance, whichever depths that lane was offered. Confidence forecasts report
+    /// every produced depth in every round and are not discounted.
+    pub(super) fn age_population(&mut self) {
+        for weight in &mut self.weight {
+            *weight *= 1.0 - POPULATION_STEP;
+        }
     }
 
     /// The population prior at `depth`. Until a depth has `POPULATION_WARMUP`
@@ -385,11 +401,12 @@ impl Forecasts {
         (0..self.population.len()).map(|depth| self.forecast_prior(depth)).collect()
     }
 
-    /// Replaces the population means and marks every depth as long observed: past its
-    /// warm-up and moving by `POPULATION_STEP`.
+    /// Replaces the population means and marks every depth as observed in each recent
+    /// lane-round: past its warm-up and moving by `POPULATION_STEP`.
     #[cfg(test)]
     pub(super) fn set_population(&mut self, population: Vec<f32>) {
         self.observations = vec![(1.0 / POPULATION_STEP) as u32; population.len()];
+        self.weight = vec![1.0 / POPULATION_STEP; population.len()];
         self.population = population;
     }
 

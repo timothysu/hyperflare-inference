@@ -1384,8 +1384,9 @@ impl RequestScheduler {
             }
         }
         if self.refresh.acceptance_ready() && self.speculative_fixed_width.is_none() {
-            if let Some(candidate) = self.acceptance_probe(ordinary, &values, age_price) {
-                return self.available_plan(candidate, &values, age_price, log_scale, PlanOrigin::AcceptanceStart);
+            if let Some((candidate, replaced_ns)) = self.acceptance_probe(ordinary, &values, age_price) {
+                return self.available_plan(candidate, &values, age_price, log_scale,
+                    PlanOrigin::AcceptanceStart { replaced_ns });
             }
         }
         self.available_plan(ordinary, &values, age_price, log_scale, PlanOrigin::Ordinary)
