@@ -249,10 +249,7 @@ impl RequestScheduler {
                     let tokens = self.speculative_tokens(request, width);
                     if tokens > 0 {
                         token_rate = token_rate.max(
-                            request
-                                .acceptance
-                                .expected_tokens(self.proposal_source, tokens)
-                                * per_ms,
+                            self.acceptance_tokens(request, tokens) * per_ms,
                         );
                         delivery_rate = delivery_rate.max(per_ms);
                     }

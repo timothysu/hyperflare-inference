@@ -59,6 +59,13 @@ impl RequestScheduler {
             .advance_to(self.now_ns, self.policy.estimate_ttl_ns);
         Ok(())
     }
+
+    /// Marks the speculative population as long observed at its present means, so that
+    /// requests start from those means without the optimism of an unobserved depth.
+    pub(crate) fn settle_population(&mut self) {
+        let population = self.forecasts.population.clone();
+        self.forecasts.set_population(population);
+    }
 }
 
 #[test]
@@ -2622,6 +2629,8 @@ fn scheduler_uses_only_loaded_verification_shapes() {
     for active in [1, 2, 3, 4] {
         let mut s = scheduler(active, 64, 8);
         s.enable_speculation(&[1, 2, 3, 4]).unwrap();
+        // A long-observed geometric population: the widest batch at width one serves every request.
+        s.settle_population();
         let shapes: Vec<_> = [(1, 1), (1, 2), (1, 3), (1, 4), (2, 1), (4, 1)]
             .into_iter()
             .filter(|(batch, _)| *batch <= active.next_power_of_two())
@@ -3946,7 +3955,7 @@ fn core_capacity_bounds_catalog_and_request_profiles() {
         assert_eq!(scheduler.forecasts.population.len(), capacity - 1);
         let handle = scheduler.admit(spec(1, 32)).unwrap();
         let request = scheduler.request(handle).unwrap();
-        assert_eq!(request.acceptance.curve(speculation::ProposalSource::Mtp, 0, false).len(), capacity - 1);
+        assert_eq!(scheduler.acceptance_curve(request, false).len(), capacity - 1);
         let powered = scheduler.powered_curve(request, false);
         assert_eq!(powered.len(), capacity - 1);
         assert_eq!(scheduler.expected_speculative_tokens(request, capacity),

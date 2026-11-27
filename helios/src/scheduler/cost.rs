@@ -63,8 +63,14 @@ pub(super) struct PackedRoundShape {
     pub nanos: u64,
 }
 
+/// Share of the context-slope statistics retained at each new observation.
+const CONTEXT_SLOPE_RETENTION: f64 = 15.0 / 16.0;
+
 struct Estimate {
     nanos: u64,
+    /// Request context position at which `nanos` was observed; zero for graphs
+    /// whose cost is not projected over context.
+    position: u64,
     replays: ReplayTimes,
     observed_at_ns: u64,
     last_attempt_ns: u64,
@@ -72,24 +78,28 @@ struct Estimate {
 
 #[derive(Default)]
 struct ReplayTimes {
-    samples: [u64; 9],
+    samples: [(u64, u64); 9],
     len: usize,
     next: usize,
 }
 
 impl ReplayTimes {
-    fn observe(&mut self, sample: u64, fresh: bool) -> u64 {
+    /// Records a duration with the context position it was observed at and returns
+    /// the median duration with the position of the sample that supplied it.
+    fn observe(&mut self, sample: u64, position: u64, fresh: bool) -> (u64, u64) {
         if !fresh {
             *self = Self::default();
         }
-        self.samples[self.next] = sample;
+        self.samples[self.next] = (sample, position);
         self.next = (self.next + 1) % self.samples.len();
         self.len = (self.len + 1).min(self.samples.len());
         let mut ordered = self.samples;
         ordered[..self.len].sort_unstable();
         let middle = self.len / 2;
         if self.len % 2 == 0 {
-            ((u128::from(ordered[middle - 1]) + u128::from(ordered[middle]) + 1) / 2) as u64
+            let (low, high) = (ordered[middle - 1], ordered[middle]);
+            (((u128::from(low.0) + u128::from(high.0) + 1) / 2) as u64,
+                ((u128::from(low.1) + u128::from(high.1)) / 2) as u64)
         } else {
             ordered[middle]
         }
@@ -107,6 +117,10 @@ pub(super) struct ActionCosts {
     entries: Vec<(Key, Estimate)>,
     index: std::collections::HashMap<Key, usize>,
     packed_round_durations: [Vec<Option<u64>>; 7],
+    /// Least-squares statistics, through the origin, of how far batch-one prefill
+    /// samples depart from their graph's retained estimate against capacity times
+    /// the context distance between them: the summed products and the summed squares.
+    context_slope: (f64, f64),
     now_ns: u64,
     ttl_ns: u64,
 }
@@ -128,7 +142,8 @@ impl ActionCosts {
         };
         let estimate = &mut self.entries[self.index[&key]].1;
         estimate.nanos = nanos;
-        estimate.replays.observe(nanos, false);
+        estimate.position = 0;
+        estimate.replays.observe(nanos, 0, false);
         estimate.observed_at_ns = self.now_ns;
         self.refresh_packed_durations();
     }
@@ -152,6 +167,7 @@ impl ActionCosts {
                 key,
                 Estimate {
                     nanos: 0,
+                    position: 0,
                     replays: ReplayTimes::default(),
                     observed_at_ns: 0,
                     last_attempt_ns: 0,
@@ -222,6 +238,29 @@ impl ActionCosts {
         .map(|estimate| estimate.nanos)
     }
 
+    /// Nanoseconds that a batch-one prefill graph gains per capacity token and per
+    /// token of request context, measured across every prefill graph; zero until one
+    /// graph has executed at two context positions.
+    fn context_slope(&self) -> f64 {
+        let (products, squares) = self.context_slope;
+        if squares > 0.0 { (products / squares).max(0.0) } else { 0.0 }
+    }
+
+    /// Retained duration of a batch-one prefill graph, projected from the context
+    /// position of its estimate to `position`. An estimate taken at a shallow context
+    /// otherwise understates a graph's cost deep in a long prompt, and the median of
+    /// a graph in continuous use lags its growth. A projection never falls below half
+    /// the retained estimate.
+    pub fn prefill_duration(&self, kind: GraphKind, capacity: usize, position: u64) -> Option<u64> {
+        let estimate = self.entry(Key { drafts: 0, kind, batch: 1, tokens: capacity, prefill: 0, packed: 0 })?;
+        if estimate.nanos == 0 {
+            return Some(0);
+        }
+        let retained = estimate.nanos as f64;
+        let shift = self.context_slope() * capacity as f64 * (position as f64 - estimate.position as f64);
+        Some((retained + shift).max(retained / 2.0).round() as u64)
+    }
+
     pub fn duration_key(&self, key: Key) -> Option<u64> {
         self.entry(key).map(|estimate| estimate.nanos)
     }
@@ -284,10 +323,25 @@ impl ActionCosts {
             prefill: step.prefill_capacity(),
             packed: step.packed_token_capacity,
         };
+        // A batch-one prefill lane starts at its request's context position.
+        let position = (step.kind.is_prefill() && step.batch_capacity == 1)
+            .then(|| step.lanes.first().map(|lane| lane.start_position))
+            .flatten();
         if let Some(&index) = self.index.get(&key) {
             let estimate = &mut self.entries[index].1;
             let fresh = estimate.fresh(self.now_ns, self.ttl_ns);
-            estimate.nanos = estimate.replays.observe(sample, fresh);
+            if let Some(position) = position.filter(|_| estimate.nanos != 0) {
+                // The retained median is the reference: one slow or fast replay moves
+                // it little, and it carries the context position of its own sample.
+                let reach = key.tokens as f64 * (position as f64 - estimate.position as f64);
+                let growth = sample as f64 - estimate.nanos as f64;
+                self.context_slope = (
+                    CONTEXT_SLOPE_RETENTION * self.context_slope.0 + growth * reach,
+                    CONTEXT_SLOPE_RETENTION * self.context_slope.1 + reach * reach,
+                );
+            }
+            let position = position.unwrap_or(0);
+            (estimate.nanos, estimate.position) = estimate.replays.observe(sample, position, fresh);
             estimate.observed_at_ns = self.now_ns;
             self.refresh_packed_durations();
         }
@@ -297,17 +351,18 @@ impl ActionCosts {
 #[cfg(test)]
 mod tests {
     use super::{ActionCosts, ReplayTimes, ScheduledStep};
-    use crate::execution::{GraphDescriptor, GraphKind, SamplingMode};
+    use crate::execution::{ExecutionTiming, GraphDescriptor, GraphKind, SamplingMode};
+    use crate::scheduler::{RequestHandle, ScheduledLane};
 
     #[test]
     fn isolated_slow_replay_does_not_displace_the_steady_cost() {
         let mut replays = ReplayTimes::default();
         for _ in 0..9 {
-            assert_eq!(replays.observe(8_000_000, true), 8_000_000);
+            assert_eq!(replays.observe(8_000_000, 0, true).0, 8_000_000);
         }
-        assert_eq!(replays.observe(16_000_000, true), 8_000_000);
+        assert_eq!(replays.observe(16_000_000, 0, true).0, 8_000_000);
         for _ in 0..9 {
-            assert_eq!(replays.observe(8_000_000, true), 8_000_000);
+            assert_eq!(replays.observe(8_000_000, 0, true).0, 8_000_000);
         }
     }
 
@@ -315,21 +370,93 @@ mod tests {
     fn sustained_cost_changes_replace_the_window_and_staleness_resets_it() {
         let mut replays = ReplayTimes::default();
         for _ in 0..9 {
-            replays.observe(8, true);
+            replays.observe(8, 0, true);
         }
         for _ in 0..4 {
-            assert_eq!(replays.observe(16, true), 8);
+            assert_eq!(replays.observe(16, 0, true).0, 8);
         }
-        assert_eq!(replays.observe(16, true), 16);
-        assert_eq!(replays.observe(32, false), 32);
-        assert_eq!(replays.observe(16, true), 24);
+        assert_eq!(replays.observe(16, 0, true).0, 16);
+        assert_eq!(replays.observe(32, 0, false).0, 32);
+        assert_eq!(replays.observe(16, 0, true).0, 24);
     }
 
     #[test]
     fn even_sample_median_does_not_overflow() {
         let mut replays = ReplayTimes::default();
-        assert_eq!(replays.observe(u64::MAX, true), u64::MAX);
-        assert_eq!(replays.observe(u64::MAX - 1, true), u64::MAX);
+        assert_eq!(replays.observe(u64::MAX, 0, true).0, u64::MAX);
+        assert_eq!(replays.observe(u64::MAX - 1, 0, true).0, u64::MAX);
+    }
+
+    #[test]
+    fn the_median_duration_keeps_the_context_position_of_its_sample() {
+        let mut replays = ReplayTimes::default();
+        assert_eq!(replays.observe(100, 0, true), (100, 0));
+        assert_eq!(replays.observe(120, 4096, true), (110, 2048));
+        assert_eq!(replays.observe(140, 8192, true), (120, 4096));
+        // An outlier does not move the median or its position.
+        assert_eq!(replays.observe(900, 12_288, true), (130, 6144));
+        assert_eq!(replays.observe(160, 16_384, true), (140, 8192));
+    }
+
+    #[test]
+    fn prefill_durations_are_projected_along_the_measured_context_slope() {
+        let graph = |capacity: usize| GraphDescriptor {
+            name: format!("prefill{capacity}"),
+            kind: GraphKind::Prefill,
+            sampling_mode: SamplingMode::General,
+            confidence_width: 0,
+            draft_tokens: 0,
+            handle: capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: 0,
+            input_bindings: vec![],
+            tuned_bindings: vec![],
+        };
+        let request = RequestHandle { slot: 0, generation: 1 };
+        let step = |capacity: usize, position: u64, request: RequestHandle| ScheduledStep {
+            draft_tokens: 0,
+            kind: GraphKind::Prefill,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            mixed: None,
+            lanes: vec![ScheduledLane { request, start_position: position, tokens: capacity }],
+            requires_feedback: false,
+        };
+        let timing = |nanos: u64| {
+            let mut gpu_ns = [None; 16];
+            gpu_ns[0] = Some(nanos);
+            ExecutionTiming { gpu_ns, ..Default::default() }
+        };
+        let mut costs = ActionCosts::prepared(&[graph(2048), graph(4096)], 8).unwrap();
+        costs.advance_to(1, 30_000_000_000);
+        // The smaller graph is measured once at an empty context.
+        costs.observe(&step(2048, 0, request), timing(400_000_000));
+        assert_eq!(costs.prefill_duration(GraphKind::Prefill, 2048, 1 << 20), Some(400_000_000));
+        // The larger graph gains 0.25 ns per capacity token and context token.
+        let duration = |position: u64| 800_000_000 + 4096 * position / 4;
+        for chunk in 0..6 {
+            costs.observe(&step(4096, chunk * 4096, request), timing(duration(chunk * 4096)));
+        }
+        let position = 6 * 4096;
+        let close = |projected: Option<u64>, expected: u64| projected.unwrap().abs_diff(expected) <= 1000;
+        assert!(close(costs.prefill_duration(GraphKind::Prefill, 4096, position), duration(position)));
+        assert!(close(costs.prefill_duration(GraphKind::Prefill, 2048, position), 400_000_000 + 2048 * position / 4));
+        // The retained estimates themselves are unchanged.
+        assert_eq!(costs.duration(GraphKind::Prefill, 1, 2048), Some(400_000_000));
+        assert_eq!(costs.duration(GraphKind::Prefill, 1, 4096), Some((duration(2 * 4096) + duration(3 * 4096) + 1) / 2));
+        // A request at an empty context is projected back, never below half the estimate.
+        assert!(close(costs.prefill_duration(GraphKind::Prefill, 4096, 0), duration(0)));
+        let another = RequestHandle { slot: 1, generation: 1 };
+        for chunk in 0..9 {
+            costs.observe(&step(4096, (1 << 22) + chunk * 4096, another), timing(duration((1 << 22) + chunk * 4096)));
+        }
+        let retained = costs.duration(GraphKind::Prefill, 1, 4096).unwrap();
+        assert_eq!(costs.prefill_duration(GraphKind::Prefill, 4096, 0), Some(retained.div_ceil(2)));
+        assert_eq!(costs.prefill_duration(GraphKind::Prefill, 1024, 0), None);
     }
 
     #[test]

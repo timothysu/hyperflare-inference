@@ -1734,12 +1734,7 @@ impl RequestScheduler {
             window_snapshot_ready: false,
             window_restore: false,
             epoch: 0,
-            acceptance: if self.gpu_confidence() {
-                speculation::AcceptanceProfile::new(self.capabilities.completion_token_capacity)
-            } else {
-                speculation::AcceptanceProfile::seeded(
-                    self.capabilities.completion_token_capacity, &self.forecasts.population)
-            },
+            acceptance: speculation::AcceptanceProfile::new(self.capabilities.completion_token_capacity),
             accounting: self.accounting(),
             handle,
             state_slot: StateSlotId((1 + slot * execution_rows) as u32),

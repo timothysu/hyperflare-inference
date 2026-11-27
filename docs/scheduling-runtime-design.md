@@ -83,26 +83,56 @@ confidence drives host decisions; peer estimates must be valid probabilities
 but need not agree bitwise. Exact request identities, consumption, emitted
 prefixes, and committed state agree across ranks.
 
-Confidence forecasts and verified acceptance are separate observations.
-A request's stored forecast averages its completed joint-prefix probabilities,
-starting from a population prior. That prior begins at `0.5^d` for the `d`-th
-draft position and moves toward each observed prefix value with weight one
-sixty-fourth. It is one mean per position across all requests, so it follows
-whichever traffic ran most recently. A model whose graphs allocate prefix
-lengths on the GPU takes the stored value from the completed prefix probability
-of each lane in the round's confidence sidecar; a model with any such graph is
-treated this way for all its rounds. Every other model takes it from the
-verification outcome: for each position a completed MTP round determined, the
-value is the reported survival, or one for an accepted position and zero for a
-rejected one. On this path only lanes whose request is live and whose status
-is not an error count, which are the rounds the request's own acceptance
-profile learns from. Each round updates the population once, by one of the two
-sources. On a model without GPU confidence a new request's MTP acceptance
-estimates start at the population with weight two; with GPU confidence, and
-for copy proposals, they start at `0.5^d`. Forecast and acceptance prefix
-estimates start with weight two, cap at 128, and age with a half-life of 128
-generated tokens.
-Unobserved suffixes retain their means.
+Confidence forecasts and verified acceptance are separate observations. A
+request keeps evidence for each at every draft position: an aged weight and a
+weighted sum of the prefix values it observed. Evidence weight is capped at 128
+observations and halves every 128 generated tokens. The request's estimate at a
+position is the mean of that evidence and a prior, each weighted by its
+observations:
+
+```text
+estimate = (evidence_sum + strength * prior) / (evidence_weight + strength)
+```
+
+A position that a request stops observing returns to its prior as the request
+generates. It does not keep the last values it observed, so a request that
+narrows after rejections widens again without a funded probe once those
+rejections have aged.
+
+The prior is a population mean per position across all requests. It begins at
+`0.5^d` for the `d`-th draft position. Each observation moves it by
+`max(1/64, 1/(n + 1))` of the distance to the observed value, where `n` counts
+the observations the position already has: the first observation replaces the
+starting guess, the mean is a plain average of its first 64 observations, and
+it then follows whichever traffic ran most recently. A model whose graphs
+allocate prefix lengths on the GPU takes the observed value from the completed
+prefix probability of each lane in the round's confidence sidecar; a model with
+any such graph is treated this way for all its rounds. Every other model takes
+it from the verification outcome: for each position a completed MTP round
+determined, the value is the reported survival, or one for an accepted position
+and zero for a rejected one. On this path only lanes whose request is live and
+whose status is not an error count, which are the rounds the request's own
+acceptance evidence learns from. Each round updates the population from one of
+the two sources.
+
+Until a position has 16 observations, selection uses its population mean plus
+the confidence radius `sqrt(ln(20) / (2 * (n + 1)))`, capped at one. A scheduler
+that has verified nothing therefore offers every prepared depth and observes
+it. Without the radius, a depth whose starting guess lies below the survival
+that its cost requires would never be offered, and its guess never corrected.
+
+The strength of the population in a request's estimate is `min(16, n + 1)`
+observations for verified acceptance on a model without GPU confidence: one
+rejected round does not outweigh the population, and about sixteen do. Against
+confidence forecasts the strength is at most two, because every round reports
+confidence at every produced depth. With GPU confidence, and for copy
+proposals, acceptance evidence uses the fixed prior `0.5^d` with strength two.
+
+Prefix survival cannot rise with depth. Verified acceptance estimates are
+projected onto nonincreasing sequences by pooling adjacent violators, each
+position weighted by its evidence weight plus prior strength; the pooled
+positions share their weighted mean. Calibrated confidence forecasts instead
+bound each position by every shallower one, as the next paragraphs describe.
 
 When pricing candidate shapes on a GPU-confidence model, the stored per-request
 confidence forecast is adjusted by two online corrections derived solely from
@@ -120,14 +150,14 @@ completed rounds:
    maintains its own aged per-depth `RequestCalibration` (seeded
    scale-invariantly at `anchor = max(predicted, 0.05)` with prior weight `2.0`
    from the live global factor on its first observation at that depth, EWMA cap
-   `32.0`, 128-token half-life aging matching `PrefixEstimate`) so sequential
+   `32.0`, 128-token half-life aging matching `PrefixEvidence`) so sequential
    workloads, context lengths, and heterogeneous concurrent lanes do not bleed
    calibration across requests, and censored unobserved depths decay their prior
    weight so a single funded acceptance probe can escape stale priors. Updates
    use the exact offered, determined prefix outcomes computed once in
    `complete_inner` (Rao-Blackwellized with `completion_speculative_survival`
    when reported, else binary acceptance/rejection). Pricing multiplies each
-   depth's stored mean by the request's calibration factor, adds the Hoeffding
+   depth's forecast estimate by the request's calibration factor, adds the Hoeffding
    optimistic margin using the minimum aged weight of the confidence forecast
    and verification calibration during funded acceptance learning, clamps to
    `[0, 1]`, and enforces nonincreasing prefix survival across depths.
@@ -158,10 +188,12 @@ completed rounds:
    pure between-request heterogeneity (preventing double-counting of
    per-request forecasts).
 
-Ordinary selection uses the calibrated historical means (plus cross-lane
-allocation surplus on crowded GPU-allocated shapes); funded acceptance learning
-uses the bounded optimistic estimate
-`min(1, calibrated_mean + sqrt(ln(20) / (2 * aged_weight)))`.
+Ordinary selection uses these estimates (plus cross-lane allocation surplus on
+crowded GPU-allocated shapes); funded acceptance learning uses the bounded
+optimistic estimate `min(1, estimate + sqrt(ln(20) / (2 * information)))`.
+Information is the evidence weight plus the prior strength; for a calibrated
+forecast it is the smaller of that and the calibration's aged weight. An
+optimistic position cannot exceed a shallower optimistic position.
 
 A prepared program may also write `completion_speculative_survival`, cumulative
 products of `min(1, p(token)/q(token))` for evaluated prefixes. These replace
@@ -277,6 +309,21 @@ and prompt length also restrict logical work. A graph with 64 useful prompt toke
 earns 64 prompt units and at most one output token, regardless of physical capacity.
 Candidate scoring has no smallest-fitting-shape filter, duration ceiling, forced
 oldest-request filter, or per-chunk prefill lateness cost.
+
+A prefill launch earns the value of its own tokens over its duration, with one
+exception. When the largest prefill capacity reaches the request's next stop in
+one launch, every measured capacity is scored by the value of the whole
+remaining interval over the shortest measured time to finish it, beginning with
+that capacity's launch. A stop is a checkpoint cut, the end of an image window,
+or the prompt end. The shortest time for a remainder is the exact minimum over
+sequences of measured capacities, each launch consuming up to its capacity. A
+capacity that leaves a remainder is thereby charged for the launches the
+remainder needs. A fully occupied small graph has the highest tokens per
+millisecond of its own launch, yet a padded larger graph that reaches the stop
+sooner wins; a measured split wins when it is the shorter completion. The cost
+of delaying decoders uses the first launch alone, because other work can run
+between launches. An interval that contains an atomic image span, and a catalog
+with `TERMINAL_PREFILL` graphs, keep the per-launch score.
 
 When a prepared model registers `TERMINAL_PREFILL` graphs for a subset of
 aligned prefill capacities, Helios infers the tail-protection window as the
@@ -397,6 +444,29 @@ unknown. When multiple packed speculative shapes cover a `(batch, width)` lookup
 for service-rate normalization or continuation pricing, Helios takes the minimum
 positive measured duration across matching shapes and returns zero only when
 every matching shape is unmeasured.
+
+A batch-one prefill graph (`PREFILL`, `TERMINAL_PREFILL`, or `SCORED_PREFILL`)
+costs more as its request's context deepens when its attention work grows with
+history. Each of its samples is stored with the context position at which its
+lane started, and the retained median carries the position of the sample that
+supplied it. One context slope, in nanoseconds per capacity token and context
+token, is shared by all such graphs. It is the least-squares slope through the
+origin of each sample's departure from its graph's retained estimate against
+capacity times the context distance between the two, with the statistics
+decayed by 15/16 at each sample. A negative slope counts as zero, and the slope
+is zero until one graph has run at two context positions. Prefill candidates
+compare capacities at the candidate request's position:
+
+```text
+estimate + slope * capacity * (position - estimate_position)
+```
+
+The projection is never below half the estimate. Without it, an estimate taken
+at a shallow context outranks a graph in continuous use deep in a long prompt,
+whose median also lags its own growth by several chunks, and selection
+alternates between the two as each is measured again. Service-rate
+normalization, checkpoint interval pricing, prerequisite lookahead, and timing
+refresh use the retained estimate without projection.
 
 The raw device observation is the maximum positive rank-local CUDA replay interval.
 When the prepared graphs expose frame-owned readiness timestamps, the cost sample
@@ -721,7 +791,11 @@ includes its maximum packed token extent in capture headroom.
 measured synthetic catalogs: one, two, and sixteen long prefills; fitting and
 padded tails; high- and low-acceptance speculation; heterogeneous cohorts;
 padded batch capacities; long decode pairs; prefill/decode contention; graph
-expiry and recovery; and output gaps. Mixed tests compare every legal cohort
+expiry and recovery; and output gaps. Width selection is also replayed against
+round durations and prefix survival measured on Hy4-flash at batch one, with
+recovery after rejected rounds and the bounded cost of a failed drafter. Prefill
+tests cover tails that a padded graph or a measured split finishes soonest and
+capacity stability while cost grows with context. Mixed tests compare every legal cohort
 against exhaustive useful-work/time enumeration, exercise fitting prompt tails,
 ordinary and speculative decode rows, malformed completions, independent shape
 expiry, and concurrent prompt/decode workloads. Native input tests check packed

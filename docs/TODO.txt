@@ -116,6 +116,30 @@
 [ ] Extend the two-frame submission window to nonterminal prefill with
     device-owned continuation positions and fenced cache reservations.
 
+[ ] Qualify speculative width selection and prefill capacity selection in live
+    Helios after the acceptance-estimator and prefill-scoring changes in
+    helios/src/scheduler/{speculation,rounds,cost,policy}.rs. Compare adaptive
+    selection with every fixed width at concurrency 1, 4, and 8 on a
+    host-allocated core and on a GPU-confidence core, and record prefill
+    launches per prompt for cold and warm prompts of 16k to 128k tokens. Unit
+    tests replay measured Hy4-flash batch-one costs only. See
+    scheduling-runtime-design.md#completed-confidence-and-acceptance.
+
+[ ] Run verification/helios-lifecycle/check.py with TLC against the scheduler
+    after RequestScheduler admission stopped seeding acceptance profiles; the
+    Rust conformance test passes and the model check has not been run.
+
+[ ] Extend shortest-completion prefill scoring (prefill_tail in
+    helios/src/scheduler/policy.rs) to catalogs with TERMINAL_PREFILL graphs
+    and to intervals containing atomic image spans; both keep per-launch
+    scoring. Close when policy tests cover a terminal catalog and a span.
+
+[ ] Price checkpoint intervals (interval_prefill_ns in
+    helios/src/scheduler/checkpoints.rs) with the shortest-completion
+    recursion and context projection that prefill selection uses. It prices a
+    tail by the capacity cheapest per token at retained estimates, so a
+    predicted split cost can exceed the cost that selection then incurs.
+
 [ ] Qualify prompt scoring on remaining recipes and cache lifecycles;
     see docs/logprobs-design.md for TP4 costs and numerical limits.
 

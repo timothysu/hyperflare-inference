@@ -56,40 +56,119 @@ pub fn validate_widths(widths: &[usize]) -> Result<()> {
     Ok(())
 }
 
-/// A bounded observation mean whose information ages as the request advances.
+/// Observations a learned population prior is worth in a request's survival estimate.
+/// A request must contradict the population about this many times before its own
+/// evidence outweighs it.
+pub(super) const POPULATION_PRIOR_STRENGTH: f64 = 16.0;
+/// Observations the fixed geometric prior is worth; no population backs it.
+const GEOMETRIC_PRIOR_STRENGTH: f64 = 2.0;
+/// Generated tokens over which request evidence loses half its weight.
+const EVIDENCE_HALF_LIFE: f64 = 128.0;
+const EVIDENCE_CAPACITY: f64 = 128.0;
+
+/// Prior prefix survival at one draft depth, with its weight in observations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct DepthPrior {
+    pub mean: f64,
+    pub strength: f64,
+}
+
+/// The prior of proposals without a learned population: survival halves per draft depth.
+pub(super) fn geometric_prior(depth: usize) -> DepthPrior {
+    DepthPrior { mean: 0.5f64.powi(depth as i32 + 1), strength: GEOMETRIC_PRIOR_STRENGTH }
+}
+
+pub(super) fn geometric_priors(depths: usize) -> Vec<DepthPrior> {
+    (0..depths).map(geometric_prior).collect()
+}
+
+/// The prior at `depth`, geometric beyond the depths that `priors` covers.
+pub(super) fn prior_at(priors: &[DepthPrior], depth: usize) -> DepthPrior {
+    priors.get(depth).copied().unwrap_or_else(|| geometric_prior(depth))
+}
+
+/// Weighted least-squares projection onto nonincreasing sequences, by pooling adjacent
+/// violators. Prefix survival cannot rise with depth; pooling shares a violation between
+/// the depths that produce it instead of letting the shallower estimate cap the deeper ones.
+pub(super) fn project_nonincreasing(values: &mut [f64], weights: &[f64]) {
+    debug_assert_eq!(values.len(), weights.len());
+    let mut blocks: Vec<(f64, f64, usize)> = Vec::with_capacity(values.len());
+    for (&value, &weight) in values.iter().zip(weights) {
+        let mut block = (value, weight.max(f64::MIN_POSITIVE), 1);
+        while let Some(&(mean, pooled, length)) = blocks.last() {
+            if mean >= block.0 {
+                break;
+            }
+            let total = pooled + block.1;
+            block = ((mean * pooled + block.0 * block.1) / total, total, length + block.2);
+            blocks.pop();
+        }
+        blocks.push(block);
+    }
+    let mut index = 0;
+    for (mean, _, length) in blocks {
+        values[index..index + length].fill(mean);
+        index += length;
+    }
+}
+
+/// One request's observations of a prefix depth. Their weight ages as the request
+/// generates, so an estimate returns to its prior when the depth stops being observed.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct PrefixEstimate {
-    mean: f64,
+pub(super) struct PrefixEvidence {
     weight: f64,
+    sum: f64,
     observed_at: u32,
 }
-impl PrefixEstimate {
-    pub fn new(mean: f64, generated: u32) -> Self {
-        Self { mean, weight: 2.0, observed_at: generated }
+
+impl PrefixEvidence {
+    pub fn new(generated: u32) -> Self {
+        Self { weight: 0.0, sum: 0.0, observed_at: generated }
+    }
+
+    fn decay(&self, generated: u32) -> f64 {
+        (-f64::from(generated.saturating_sub(self.observed_at)) / EVIDENCE_HALF_LIFE).exp2()
     }
 
     pub fn weight_at(&self, generated: u32) -> f64 {
-        self.weight * (-f64::from(generated.saturating_sub(self.observed_at)) / 128.0).exp2()
+        self.weight * self.decay(generated)
     }
 
-    pub fn mean(&self) -> f64 { self.mean }
+    /// Evidence and prior together, in observations.
+    pub fn information(&self, generated: u32, prior: DepthPrior) -> f64 {
+        self.weight_at(generated) + prior.strength
+    }
 
-    pub fn upper(&self, generated: u32) -> f64 {
-        (self.mean + (20.0f64.ln() / (2.0 * self.weight_at(generated))).sqrt()).min(1.0)
+    /// Mean of the aged evidence and the prior, each weighted by its observations.
+    pub fn estimate(&self, generated: u32, prior: DepthPrior) -> f64 {
+        let decay = self.decay(generated);
+        let information = self.weight * decay + prior.strength;
+        if information > 0.0 {
+            (self.sum * decay + prior.strength * prior.mean) / information
+        } else {
+            prior.mean
+        }
     }
 
     pub fn observe(&mut self, value: f64, generated: u32) {
         debug_assert!(value.is_finite() && (0.0..=1.0).contains(&value));
-        self.weight = (self.weight_at(generated) + 1.0).min(128.0);
-        self.mean += (value - self.mean) / self.weight;
+        let aged = self.weight_at(generated);
+        let mean = if aged > 0.0 { self.sum * self.decay(generated) / aged } else { value };
+        self.weight = (aged + 1.0).min(EVIDENCE_CAPACITY);
+        self.sum = (mean + (value - mean) / self.weight) * self.weight;
         self.observed_at = generated;
     }
 }
 
-/// Prefix survival of the complete proposal program, including copy overrides.
+/// Radius of the 95% one-sided Hoeffding bound for `information` observations.
+pub(super) fn optimism(information: f64) -> f64 {
+    (20.0f64.ln() / (2.0 * information.max(1e-9))).sqrt()
+}
+
+/// Verified prefix survival of one request's proposals, by proposal source.
 #[derive(Clone)]
 pub struct AcceptanceProfile {
-    prefixes: [Vec<PrefixEstimate>; 2],
+    prefixes: [Vec<PrefixEvidence>; 2],
     rounds: u64,
 }
 
@@ -101,45 +180,50 @@ impl Default for AcceptanceProfile {
 
 impl AcceptanceProfile {
     pub fn new(token_capacity: usize) -> Self {
-        Self { prefixes: std::array::from_fn(|_| (0..token_capacity.saturating_sub(1))
-            .map(|i| PrefixEstimate::new(0.5f64.powi(i as i32 + 1), 0)).collect()), rounds: 0 }
+        Self { prefixes: std::array::from_fn(|_| vec![PrefixEvidence::new(0); token_capacity.saturating_sub(1)]),
+            rounds: 0 }
     }
 
-    /// Starts the MTP estimates at the survival that earlier requests observed per depth.
-    pub(super) fn seeded(token_capacity: usize, mtp_population: &[f32]) -> Self {
-        debug_assert_eq!(mtp_population.len(), token_capacity - 1);
-        let mut profile = Self::new(token_capacity);
-        for (estimate, &mean) in profile.prefixes[ProposalSource::Mtp as usize].iter_mut().zip(mtp_population) {
-            *estimate = PrefixEstimate::new(f64::from(mean), 0);
-        }
-        profile
-    }
-
-    /// Depth zero is the first draft after the pending target token.
+    /// Survival of the prefix through `depth` from this request's evidence and the
+    /// geometric prior. Depth zero is the first draft after the pending target token.
+    /// Selection uses the population prior where one exists.
     pub fn prefix_probability(&self, source: ProposalSource, depth: usize) -> Option<f64> {
-        self.prefixes[source as usize]
-            .get(depth)
-            .map(|_| self.curve(source, 0, false)[depth])
+        let depths = self.prefixes[source as usize].len();
+        (depth < depths).then(|| self.curve(source, 0, &geometric_priors(depths), false)[depth])
     }
 
-    pub(super) fn curve(&self, source: ProposalSource, generated: u32, optimistic: bool) -> Vec<f64> {
-        let mut bound = 1.0f64;
-        self.prefixes[source as usize].iter().map(|p| {
-            bound = bound.min(if optimistic { p.upper(generated) } else { p.mean() });
-            bound
-        }).collect()
+    /// Nonincreasing prefix survival by depth. The optimistic curve adds each depth's
+    /// confidence radius and cannot exceed a shallower depth's bound.
+    pub(super) fn curve(&self, source: ProposalSource, generated: u32, priors: &[DepthPrior], optimistic: bool) -> Vec<f64> {
+        let evidence = &self.prefixes[source as usize];
+        let mut values: Vec<f64> = evidence.iter().enumerate()
+            .map(|(depth, evidence)| evidence.estimate(generated, prior_at(priors, depth))).collect();
+        let information: Vec<f64> = evidence.iter().enumerate()
+            .map(|(depth, evidence)| evidence.information(generated, prior_at(priors, depth))).collect();
+        project_nonincreasing(&mut values, &information);
+        if optimistic {
+            let mut bound = 1.0f64;
+            for (value, information) in values.iter_mut().zip(&information) {
+                bound = bound.min(*value + optimism(*information));
+                *value = bound;
+            }
+        }
+        values
     }
 
+    /// Expected tokens of a round of `width` positions against the geometric prior.
     pub fn expected_tokens(&self, source: ProposalSource, width: usize) -> f64 {
-        f64::from(width != 0) + self.curve(source, 0, false)[..width.saturating_sub(1).min(self.prefixes[source as usize].len())].iter().sum::<f64>()
+        let depths = self.prefixes[source as usize].len();
+        f64::from(width != 0) + self.curve(source, 0, &geometric_priors(depths), false)
+            [..width.saturating_sub(1).min(depths)].iter().sum::<f64>()
     }
 
     pub fn rounds(&self) -> u64 {
         self.rounds
     }
 
-    pub(super) fn information(&self, source: ProposalSource, depth: usize, generated: u32) -> f64 {
-        self.prefixes[source as usize][depth].weight_at(generated)
+    pub(super) fn information(&self, source: ProposalSource, depth: usize, generated: u32, prior: DepthPrior) -> f64 {
+        self.prefixes[source as usize][depth].information(generated, prior)
     }
 
     pub(super) fn observe(
@@ -174,52 +258,85 @@ pub(super) fn observed_prefixes(offered: usize, accepted: usize, rejected: bool,
 mod tests {
     use super::*;
 
+    const POPULATION: DepthPrior = DepthPrior { mean: 0.25, strength: POPULATION_PRIOR_STRENGTH };
+
     #[test]
-    fn context_ages_information_without_changing_the_mean() {
-        let mut estimate = PrefixEstimate::new(0.5, 0);
-        for _ in 0..256 { estimate.observe(0.0, 0); }
-        let mean = estimate.mean();
-        let upper = estimate.upper(0);
-        assert!(upper < 0.2);
-        assert_eq!(estimate.mean(), mean);
-        assert!(estimate.upper(128) > upper);
-        assert_eq!(estimate.upper(u32::MAX), 1.0);
-        estimate.observe(1.0, 4096);
-        assert!(estimate.mean() > 0.99);
+    fn aged_evidence_returns_the_estimate_to_its_prior() {
+        let mut evidence = PrefixEvidence::new(0);
+        assert_eq!(evidence.estimate(0, POPULATION), 0.25);
+        for _ in 0..256 { evidence.observe(0.0, 0); }
+        let observed = evidence.estimate(0, POPULATION);
+        assert!(observed < 0.03);
+        assert!(evidence.estimate(128, POPULATION) > observed);
+        assert!((evidence.estimate(u32::MAX, POPULATION) - 0.25).abs() < 1e-12);
+        evidence.observe(1.0, 4096);
+        assert!((evidence.estimate(4096, POPULATION) - (1.0 + 16.0 * 0.25) / 17.0).abs() < 1e-9);
     }
 
     #[test]
-    fn shallow_rounds_do_not_refresh_unobserved_suffixes() {
+    fn one_observation_does_not_outweigh_the_population() {
+        let mut evidence = PrefixEvidence::new(0);
+        evidence.observe(0.0, 0);
+        assert!((evidence.estimate(0, POPULATION) - 16.0 * 0.25 / 17.0).abs() < 1e-12);
+        for _ in 0..9 { evidence.observe(0.0, 0); }
+        assert!((evidence.estimate(0, POPULATION) - 16.0 * 0.25 / 26.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unobserved_depths_follow_the_prior_instead_of_freezing() {
         let mut profile = AcceptanceProfile::default();
-        for _ in 0..256 { profile.observe(ProposalSource::Mtp, 0, 7, 0, true, None); }
-        let before = profile.curve(ProposalSource::Mtp, 0, true);
+        let low = vec![DepthPrior { mean: 0.0, strength: POPULATION_PRIOR_STRENGTH }; 7];
+        let high = vec![DepthPrior { mean: 0.75, strength: POPULATION_PRIOR_STRENGTH }; 7];
+        for _ in 0..8 { profile.observe(ProposalSource::Mtp, 0, 7, 0, true, None); }
+        // Shallow rounds leave depths one and beyond unobserved while the request advances.
         for generated in 1..=1024 {
             profile.observe(ProposalSource::Mtp, generated, 1, 1, true, None);
         }
-        let means = profile.curve(ProposalSource::Mtp, 1024, false);
-        let upper = profile.curve(ProposalSource::Mtp, 1024, true);
-        assert!(means[0] > 0.99);
-        assert!(means[1] < 0.01);
-        assert!(upper[1] > before[1] + 0.5);
-        assert!(upper.windows(2).all(|p| p[0] >= p[1]));
+        let means = profile.curve(ProposalSource::Mtp, 1024, &high, false);
+        assert!(means[0] > 0.95);
+        assert!(means[1..].iter().all(|mean| (mean - 0.75).abs() < 0.01), "{means:?}");
+        assert!(profile.curve(ProposalSource::Mtp, 1024, &low, false)[1..].iter().all(|mean| *mean < 0.01));
+        let upper = profile.curve(ProposalSource::Mtp, 1024, &high, true);
+        assert!(upper.windows(2).all(|pair| pair[0] >= pair[1]));
+        assert!(upper.iter().zip(&means).all(|(upper, mean)| upper >= mean));
     }
 
     #[test]
-    fn seeded_profile_replaces_only_the_mtp_prior() {
-        let population = [0.9f32, 0.5, 0.25, 0.0625, 0.03125, 0.015625, 0.0078125];
-        let seeded = AcceptanceProfile::seeded(8, &population);
-        let fresh = AcceptanceProfile::new(8);
-        for depth in 0..7 {
-            assert_eq!(seeded.prefix_probability(ProposalSource::Mtp, depth),
-                Some(f64::from(population[depth])));
-            assert_eq!(seeded.prefix_probability(ProposalSource::Copy, depth),
-                fresh.prefix_probability(ProposalSource::Copy, depth));
-        }
-        assert_eq!(seeded.rounds(), 0);
-        let geometric: Vec<f32> = (0..7).map(|i| 0.5f32.powi(i + 1)).collect();
-        let unchanged = AcceptanceProfile::seeded(8, &geometric);
-        assert_eq!(unchanged.curve(ProposalSource::Mtp, 0, true), fresh.curve(ProposalSource::Mtp, 0, true));
-        assert_eq!(unchanged.curve(ProposalSource::Mtp, 0, false), fresh.curve(ProposalSource::Mtp, 0, false));
+    fn projection_pools_violations_and_preserves_ordered_curves() {
+        let mut ordered = [0.9, 0.5, 0.5, 0.1];
+        project_nonincreasing(&mut ordered, &[1.0; 4]);
+        assert_eq!(ordered, [0.9, 0.5, 0.5, 0.1]);
+
+        // The weighted mean of the violating pair replaces both; a running minimum
+        // would instead have cut the second depth to 0.2.
+        let mut violated = [0.2, 0.8, 0.1];
+        project_nonincreasing(&mut violated, &[1.0, 3.0, 1.0]);
+        assert!((violated[0] - 0.65).abs() < 1e-12 && (violated[1] - 0.65).abs() < 1e-12);
+        assert_eq!(violated[2], 0.1);
+
+        let mut cascade = [0.1, 0.2, 0.3, 0.4];
+        project_nonincreasing(&mut cascade, &[1.0; 4]);
+        assert!(cascade.iter().all(|value| (value - 0.25).abs() < 1e-12));
+
+        let mut values = [0.31, 0.77, 0.12, 0.64, 0.64, 0.05, 0.4];
+        let weights = [2.0, 1.0, 5.0, 0.5, 3.0, 1.0, 4.0];
+        let total: f64 = values.iter().zip(&weights).map(|(value, weight)| value * weight).sum();
+        project_nonincreasing(&mut values, &weights);
+        assert!(values.windows(2).all(|pair| pair[0] >= pair[1]));
+        let projected: f64 = values.iter().zip(&weights).map(|(value, weight)| value * weight).sum();
+        assert!((projected - total).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_noisy_shallow_depth_does_not_cap_well_observed_deeper_depths() {
+        let mut profile = AcceptanceProfile::default();
+        let priors = vec![DepthPrior { mean: 0.5, strength: 1.0 }; 7];
+        // Depth one holds many high observations; depth zero holds one low observation.
+        for _ in 0..32 { profile.prefixes[ProposalSource::Mtp as usize][1].observe(0.8, 0); }
+        profile.prefixes[ProposalSource::Mtp as usize][0].observe(0.0, 0);
+        let curve = profile.curve(ProposalSource::Mtp, 0, &priors, false);
+        assert!(curve[1] > 0.7, "{curve:?}");
+        assert!(curve.windows(2).all(|pair| pair[0] >= pair[1]));
     }
 
     #[test]
@@ -241,9 +358,10 @@ mod tests {
             let expected = (2.0 * 0.5f64.powi(depth as i32 + 1) + f64::from(survival[depth])) / 3.0;
             assert!((profile.prefix_probability(ProposalSource::Mtp, depth).unwrap() - expected).abs() < 1e-12);
         }
-        let before = profile.curve(ProposalSource::Mtp, 0, false);
+        let priors = geometric_priors(7);
+        let before = profile.curve(ProposalSource::Mtp, 0, &priors, false);
         profile.observe(ProposalSource::Mtp, 0, 7, 1, false, Some(&survival));
-        assert_eq!(profile.curve(ProposalSource::Mtp, 0, false)[1..], before[1..]);
+        assert_eq!(profile.curve(ProposalSource::Mtp, 0, &priors, false)[1..], before[1..]);
     }
 }
 
@@ -262,7 +380,7 @@ fn arbitrary_width_catalog_preserves_declared_values() {
 fn acceptance_profiles_follow_core_capacity() {
     for capacity in [1, 8, 13, 16, 32, 257] {
         let mut profile = AcceptanceProfile::new(capacity);
-        assert_eq!(profile.curve(ProposalSource::Mtp, 0, false).len(), capacity - 1);
+        assert_eq!(profile.curve(ProposalSource::Mtp, 0, &geometric_priors(capacity - 1), false).len(), capacity - 1);
         profile.observe(ProposalSource::Mtp, 0, capacity - 1, capacity - 1, false, None);
         assert_eq!(profile.rounds(), u64::from(capacity > 1));
         assert!(profile.prefix_probability(ProposalSource::Mtp, capacity - 1).is_none());

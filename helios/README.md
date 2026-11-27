@@ -403,9 +403,9 @@ resources associated with the attempted submission.
 Each request owns conditional draft-acceptance statistics by depth and proposal
 source. Validated speculative completions update that request. On a model
 without GPU confidence they also move a population mean per depth, which
-starts each later request's MTP estimates. With GPU confidence the population
-comes from the confidence forecasts, seeds the forecasts, and acceptance
-estimates start at the geometric prior. The emitted accepted prefix supplies positive observations. When a correction token was
+is the prior of every request's MTP estimates. With GPU confidence the population
+comes from the confidence forecasts and is the prior of the forecasts, and
+acceptance estimates use the geometric prior. The emitted accepted prefix supplies positive observations. When a correction token was
 emitted and an offered draft remained, the next draft supplies a rejection.
 Termination within an accepted prefix censors the remaining depths. Expected
 yield is clipped by the remaining output limit, context capacity, and available
@@ -438,8 +438,8 @@ This bounds aggregate refresh expense, not individual stalls; see
 [funded timing refresh](../docs/scheduling-runtime-design.md#funded-timing-refresh).
 
 Speculative width selection combines this cost with expected prefix survival,
-estimated per request and, on a model without GPU confidence, started from the
-population mean of earlier requests. Complete programs learn from terminal
+estimated per request and, on a model without GPU confidence, blended with the
+population mean across requests. Complete programs learn from terminal
 verification and keep stored confidence forecasts separate from acceptance
 outcomes. When pricing GPU-confidence shapes, stored per-depth forecasts are
 scaled by a request-local aged per-depth verification calibration ratio (seeded

@@ -7,7 +7,14 @@
 
 use super::{policy::{Candidate, bits}, utility::{LaneValue, ValueRate, best_cohort}, *};
 
-const POPULATION_WEIGHT: f32 = 1.0 / 64.0;
+/// Smallest step of the population mean toward one observation.
+const POPULATION_STEP: f32 = 1.0 / 64.0;
+/// Observations the population is worth against a request's confidence forecasts.
+/// Every round reports confidence at every produced depth, so the forecasts need
+/// less support from the population than verified acceptance does.
+const FORECAST_PRIOR_STRENGTH: f64 = 2.0;
+/// Observations of a depth before its population mean is used without optimism.
+const POPULATION_WARMUP: u32 = 16;
 const CALIBRATION_PRIOR_WEIGHT: f64 = 4.0;
 const POPULATION_CALIBRATION_MAX_WEIGHT: f64 = 64.0;
 const CALIBRATION_FACTOR_MAX: f64 = 2.0;
@@ -262,17 +269,40 @@ fn interp_prefix(prefix: &[f64], pos: f64) -> f64 {
 #[derive(Clone)]
 struct Forecast {
     request: RequestHandle,
-    prefixes: Vec<speculation::PrefixEstimate>,
+    prefixes: Vec<speculation::PrefixEvidence>,
     calibration: Vec<RequestCalibration>,
 }
 
 impl Forecast {
-    fn new(request: RequestHandle, prior: &[f32], generated: u32) -> Self {
+    fn new(request: RequestHandle, depths: usize, generated: u32) -> Self {
         Self {
             request,
-            prefixes: prior.iter().map(|&p| speculation::PrefixEstimate::new(f64::from(p), generated)).collect(),
-            calibration: vec![RequestCalibration::new(generated); prior.len()],
+            prefixes: vec![speculation::PrefixEvidence::new(generated); depths],
+            calibration: vec![RequestCalibration::new(generated); depths],
         }
+    }
+
+    /// Calibrated prefix survival by depth, nonincreasing. The request's confidence
+    /// evidence is blended with the population prior before calibration. A depth is
+    /// bounded by every shallower depth: verification reaches a depth only through the
+    /// shallower ones, so a calibrated shallow depth outweighs forecasts that no
+    /// verification has corrected.
+    fn curve(&self, generated: u32, priors: &[speculation::DepthPrior], global: &[DepthCalibration],
+        optimistic: bool) -> Vec<f64> {
+        let mut bound = 1.0f64;
+        (0..self.prefixes.len()).map(|depth| {
+            let prior = speculation::prior_at(priors, depth);
+            let calibrated = self.prefixes[depth].estimate(generated, prior) * self.calibration_factor(depth, global);
+            let value = if optimistic {
+                let information = self.prefixes[depth].information(generated, prior)
+                    .min(self.calibration_information(depth, generated));
+                calibrated + speculation::optimism(information)
+            } else {
+                calibrated
+            };
+            bound = bound.min(value.clamp(0.0, 1.0));
+            bound
+        }).collect()
     }
 
     fn calibration_factor(&self, depth: usize, global: &[DepthCalibration]) -> f64 {
@@ -295,6 +325,8 @@ impl Forecast {
 pub(super) struct Forecasts {
     requests: [Option<Forecast>; REQUEST_LANES],
     pub(super) population: Vec<f32>,
+    /// Observations folded into each depth's population mean.
+    observations: Vec<u32>,
     calibration: Vec<DepthCalibration>,
     surplus: SurplusHistory,
 }
@@ -306,16 +338,65 @@ impl Forecasts {
         let calibration = population.iter().map(|&p| DepthCalibration::new(f64::from(p))).collect();
         Self {
             requests: std::array::from_fn(|_| None),
+            observations: vec![0; population.len()],
             population,
             calibration,
             surplus: SurplusHistory::new(),
         }
     }
 
-    /// Moves the mean survival of the prefix at `depth` toward one observed value.
+    /// Folds one observed value into the mean survival of the prefix at `depth`. The
+    /// mean is the plain average of its first observations, which replaces the initial
+    /// geometric guess at once, and moves by `POPULATION_STEP` afterwards.
     pub(super) fn observe_population(&mut self, depth: usize, prefix: f32) {
         debug_assert!(prefix.is_finite() && (0.0..=1.0).contains(&prefix));
-        self.population[depth] += POPULATION_WEIGHT * (prefix - self.population[depth]);
+        let step = POPULATION_STEP.max(1.0 / (self.observations[depth] as f32 + 1.0));
+        self.population[depth] += step * (prefix - self.population[depth]);
+        self.observations[depth] = self.observations[depth].saturating_add(1);
+    }
+
+    /// The population prior at `depth`. Until a depth has `POPULATION_WARMUP`
+    /// observations its mean carries a confidence radius, so selection offers the depth
+    /// and observes it instead of trusting the initial guess.
+    pub(super) fn prior(&self, depth: usize) -> speculation::DepthPrior {
+        if depth >= self.population.len() {
+            return speculation::geometric_prior(depth);
+        }
+        let observations = self.observations[depth];
+        let pseudo = f64::from(observations) + 1.0;
+        let mean = f64::from(self.population[depth]);
+        speculation::DepthPrior {
+            mean: if observations < POPULATION_WARMUP { (mean + speculation::optimism(pseudo)).min(1.0) } else { mean },
+            strength: pseudo.min(speculation::POPULATION_PRIOR_STRENGTH),
+        }
+    }
+
+    pub(super) fn priors(&self) -> Vec<speculation::DepthPrior> {
+        (0..self.population.len()).map(|depth| self.prior(depth)).collect()
+    }
+
+    /// The population prior at `depth` at the strength it has against confidence forecasts.
+    fn forecast_prior(&self, depth: usize) -> speculation::DepthPrior {
+        let prior = self.prior(depth);
+        speculation::DepthPrior { strength: prior.strength.min(FORECAST_PRIOR_STRENGTH), ..prior }
+    }
+
+    fn forecast_priors(&self) -> Vec<speculation::DepthPrior> {
+        (0..self.population.len()).map(|depth| self.forecast_prior(depth)).collect()
+    }
+
+    /// Replaces the population means and marks every depth as long observed: past its
+    /// warm-up and moving by `POPULATION_STEP`.
+    #[cfg(test)]
+    pub(super) fn set_population(&mut self, population: Vec<f32>) {
+        self.observations = vec![(1.0 / POPULATION_STEP) as u32; population.len()];
+        self.population = population;
+    }
+
+    /// Observations folded into the population mean at `depth`.
+    #[cfg(test)]
+    pub(super) fn population_observations(&self, depth: usize) -> u32 {
+        self.observations[depth]
     }
 
     /// Calibrates raw GPU prefix confidence against realized verification outcomes at `depth`.
@@ -401,25 +482,39 @@ impl RequestScheduler {
 
     pub(super) fn speculative_curve(&self, request: &LiveRequest, optimistic: bool) -> Vec<f64> {
         if self.proposal_source == speculation::ProposalSource::Mtp && self.gpu_confidence() {
-            let forecast = self.forecasts.requests[request.handle.slot as usize].as_ref()
-                .filter(|forecast| forecast.request == request.handle)
-                .cloned().unwrap_or_else(|| Forecast::new(request.handle, &self.forecasts.population, request.generated_tokens));
-            let mut bound = 1.0f64;
-            forecast.prefixes.iter().enumerate().map(|(depth, estimate)| {
-                let calibrated = estimate.mean() * forecast.calibration_factor(depth, &self.forecasts.calibration);
-                let value = if optimistic {
-                    let info = estimate.weight_at(request.generated_tokens)
-                        .min(forecast.calibration_information(depth, request.generated_tokens));
-                    calibrated + (20.0f64.ln() / (2.0 * info.max(1e-9))).sqrt()
-                } else {
-                    calibrated
-                };
-                bound = bound.min(value.clamp(0.0, 1.0));
-                bound
-            }).collect()
+            let priors = self.forecasts.forecast_priors();
+            let generated = request.generated_tokens;
+            match self.forecasts.requests[request.handle.slot as usize].as_ref()
+                .filter(|forecast| forecast.request == request.handle) {
+                Some(forecast) => forecast.curve(generated, &priors, &self.forecasts.calibration, optimistic),
+                None => Forecast::new(request.handle, priors.len(), generated)
+                    .curve(generated, &priors, &self.forecasts.calibration, optimistic),
+            }
         } else {
-            request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic)
+            self.acceptance_curve(request, optimistic)
         }
+    }
+
+    /// Priors of the verified acceptance evidence that requests keep. Learned proposals
+    /// of a model without GPU confidence use the population of verification outcomes;
+    /// every other case uses the geometric prior, because its population holds
+    /// confidence forecasts or does not describe the proposal source.
+    pub(super) fn acceptance_priors(&self) -> Vec<speculation::DepthPrior> {
+        if self.proposal_source == speculation::ProposalSource::Mtp && !self.gpu_confidence() {
+            self.forecasts.priors()
+        } else {
+            speculation::geometric_priors(self.forecasts.population.len())
+        }
+    }
+
+    /// Verified prefix survival of `request` by depth, from its evidence and its prior.
+    pub(super) fn acceptance_curve(&self, request: &LiveRequest, optimistic: bool) -> Vec<f64> {
+        request.acceptance.curve(self.proposal_source, request.generated_tokens, &self.acceptance_priors(), optimistic)
+    }
+
+    /// Expected tokens of a round of `width` positions from verified acceptance.
+    pub(super) fn acceptance_tokens(&self, request: &LiveRequest, width: usize) -> f64 {
+        forecast_tokens(&self.acceptance_curve(request, false), width)
     }
 
     /// Whether the model reports per-depth confidence on the GPU rather than leaving it to host estimates.
@@ -473,7 +568,7 @@ impl RequestScheduler {
             if mask & (1 << slot) == 0 { return Vec::new(); }
             let request = self.slots[slot].request.as_ref().unwrap();
             if gpu { self.speculative_curve(request, optimistic) }
-            else { request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic)
+            else { self.acceptance_curve(request, optimistic)
                 .into_iter().map(|probability| probability.powf(self.policy.adaptive_verification_alpha) * values[slot].output_token).collect() }
         });
         let mut positions = Vec::new();
@@ -496,7 +591,7 @@ impl RequestScheduler {
         for &slot in available {
             let request = self.slots[slot].request.as_ref().unwrap();
             let limit = self.speculative_tokens(request, width.min(drafts + 1));
-            probabilities[slot] = request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic)
+            probabilities[slot] = self.acceptance_curve(request, optimistic)
                 .into_iter().map(|probability| probability.powf(self.policy.adaptive_verification_alpha)).collect();
             for position in 0..limit.saturating_sub(1) {
                 scores.push((probabilities[slot][position] * values[slot].output_token, position, slot));
@@ -514,9 +609,10 @@ impl RequestScheduler {
 
     pub(super) fn speculative_information(&self, request: &LiveRequest, depth: usize) -> f64 {
         self.forecasts.requests[request.handle.slot as usize].as_ref().filter(|forecast| forecast.request == request.handle)
-            .map_or_else(|| request.acceptance.information(self.proposal_source, depth, request.generated_tokens),
+            .map_or_else(|| request.acceptance.information(self.proposal_source, depth, request.generated_tokens,
+                    speculation::prior_at(&self.acceptance_priors(), depth)),
                 |forecast| {
-                    let info = forecast.prefixes[depth].weight_at(request.generated_tokens);
+                    let info = forecast.prefixes[depth].information(request.generated_tokens, self.forecasts.forecast_prior(depth));
                     if self.proposal_source == speculation::ProposalSource::Mtp && self.gpu_confidence() {
                         info.min(forecast.calibration_information(depth, request.generated_tokens))
                     } else {
@@ -559,6 +655,8 @@ impl RequestScheduler {
         } else {
             Vec::new()
         };
+        // The priors that selection used: this round's observations move them below.
+        let priors = self.forecasts.forecast_priors();
         let mut cursor = 0usize;
         for (row, lane) in step.lanes.iter().enumerate() {
             while cursor < observed_realized.len() && observed_realized[cursor].0 < row {
@@ -576,7 +674,7 @@ impl RequestScheduler {
             let generated = (record.generated_tokens - vector.emitted_count) as u32;
             let mut forecast = self.forecasts.requests[lane.request.slot as usize].take()
                 .filter(|forecast| forecast.request == lane.request)
-                .unwrap_or_else(|| Forecast::new(lane.request, &self.forecasts.population, generated));
+                .unwrap_or_else(|| Forecast::new(lane.request, priors.len(), generated));
             let depth_limit = lane.tokens.saturating_sub(1).min(step.draft_tokens);
             let cal_factors = if gpu_confidence && depth_limit >= 1 {
                 (0..depth_limit)
@@ -586,12 +684,8 @@ impl RequestScheduler {
                 Vec::new()
             };
             let mut host_pred = if !cal_factors.is_empty() {
-                let mut bound = 1.0f64;
-                (0..depth_limit).map(|depth| {
-                    let calibrated = forecast.prefixes[depth].mean() * cal_factors[depth];
-                    bound = bound.min(calibrated.clamp(0.0, 1.0));
-                    bound as f32
-                }).collect::<Vec<_>>()
+                forecast.curve(generated, &priors, &self.forecasts.calibration, false)[..depth_limit]
+                    .iter().map(|&value| value as f32).collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
@@ -736,8 +830,7 @@ impl RequestScheduler {
                     available.iter().map(|&slot| {
                         let request = self.slots[slot].request.as_ref().unwrap();
                         let length = self.speculative_tokens(request, shape.width.min(shape.drafts + 1));
-                        let expected = f64::from(length != 0) + request.acceptance.curve(
-                            self.proposal_source, request.generated_tokens, false)[..length.saturating_sub(1)]
+                        let expected = f64::from(length != 0) + self.acceptance_curve(request, false)[..length.saturating_sub(1)]
                             .iter().map(|&probability| {
                                 if self.policy.adaptive_verification_alpha == 1.0 { probability }
                                 else { probability.powf(self.policy.adaptive_verification_alpha) }

@@ -2640,31 +2640,27 @@ fn acceptance_learning_escapes_width_one_and_pays_for_complete_rounds() {
 }
 
 #[test]
-fn host_rounds_move_the_population_and_seed_later_requests() {
+fn host_rounds_move_the_population_and_later_requests_start_from_it() {
     let mut s = engine(2, true);
     s.fixed_speculative_width(Some(4)).unwrap();
     let geometric = s.forecasts.population.clone();
     let first = add(&mut s, 1, 64, 4096);
-    let mtp = |s: &RequestScheduler, h: RequestHandle| (0..7).map(|depth|
-        s.request(h).unwrap().acceptance.prefix_probability(speculation::ProposalSource::Mtp, depth).unwrap())
-        .collect::<Vec<_>>();
-    let prior: Vec<f64> = geometric[..7].iter().map(|&p| f64::from(p)).collect();
-    assert_eq!(mtp(&s, first), prior);
     ready(&mut s, &[first]);
     assert_eq!(s.forecasts.population, geometric);
     for _ in 0..64 { step(&mut s, 3); }
-    // Width four offers three drafts, all accepted: depths 0 to 2 move toward one, deeper depths are not offered.
+    // Width four offers three drafts, all accepted: the first observation replaces the geometric
+    // guess at depths 0 to 2, and deeper depths are not offered.
     let population = s.forecasts.population.clone();
-    let remaining = (1.0f32 - 1.0 / 64.0).powi(64);
-    for depth in 0..3 {
-        assert!((population[depth] - (1.0 - (1.0 - geometric[depth]) * remaining)).abs() < 1e-4, "depth {depth}");
-    }
+    assert_eq!(population[..3], [1.0; 3]);
     assert_eq!(population[3..], geometric[3..]);
+    for depth in 0..3 { assert_eq!(s.forecasts.population_observations(depth), 64); }
+    assert_eq!(s.forecasts.population_observations(3), 0);
+    // A request without evidence takes the population at the observed depths.
     let second = add(&mut s, 2, 64, 4096);
-    let seeded = mtp(&s, second);
-    for depth in 0..7 { assert_eq!(seeded[depth], f64::from(population[depth])); }
-    assert_eq!(s.request(second).unwrap().acceptance.prefix_probability(speculation::ProposalSource::Copy, 0), Some(0.5));
-    assert_eq!(s.request(second).unwrap().acceptance.rounds(), 0);
+    let request = s.request(second).unwrap();
+    assert_eq!(request.acceptance.rounds(), 0);
+    assert_eq!(s.acceptance_curve(request, false)[..3], [1.0; 3]);
+    assert_eq!(request.acceptance.prefix_probability(speculation::ProposalSource::Copy, 0), Some(0.5));
 }
 
 /// Plans, commits and completes one speculative round on a live request of a host-estimated scheduler.
@@ -2683,7 +2679,11 @@ fn host_round(s: &mut RequestScheduler, accepted: usize, survival: Option<(Reque
     for token in output { s.published_output(token.request, fence).unwrap(); }
 }
 
-fn moved(population: f32, observed: f32) -> f32 { population + (observed - population) / 64.0 }
+/// The population mean after one more observation, `seen` observations having preceded it.
+fn moved(population: f32, observed: f32, seen: u32) -> f32 {
+    population + (1.0f32 / 64.0).max(1.0 / (seen as f32 + 1.0)) * (observed - population)
+}
+
 
 #[test]
 fn rejected_and_survival_rounds_move_the_population_by_the_observed_values() {
@@ -2695,14 +2695,16 @@ fn rejected_and_survival_rounds_move_the_population_by_the_observed_values() {
     // Three drafts offered, one accepted, then rejected: depth 0 observed true, depths 1 and 2 observed false.
     host_round(&mut s, 1, None);
     let rejected = s.forecasts.population.clone();
-    assert_eq!(rejected[..3], [moved(start[0], 1.0), moved(start[1], 0.0), moved(start[2], 0.0)]);
+    assert_eq!(rejected[..3], [moved(start[0], 1.0, 0), moved(start[1], 0.0, 0), moved(start[2], 0.0, 0)]);
+    // The first observation of a depth replaces the geometric guess.
+    assert_eq!(rejected[..3], [1.0, 0.0, 0.0]);
     assert_eq!(rejected[3..], start[3..]);
     // The same rejected round with survival feedback: the reported values replace the 0 and 1 samples.
     let mut row = [-1.0f32; 15];
     row[..3].copy_from_slice(&[0.9, 0.6, 0.2]);
     host_round(&mut s, 1, Some((handle, &row)));
     let soft = s.forecasts.population.clone();
-    assert_eq!(soft[..3], [moved(rejected[0], 0.9), moved(rejected[1], 0.6), moved(rejected[2], 0.2)]);
+    assert_eq!(soft[..3], [moved(rejected[0], 0.9, 1), moved(rejected[1], 0.6, 1), moved(rejected[2], 0.2, 1)]);
     assert_eq!(soft[3..], start[3..]);
     // The request's own profile saw the same two rounds.
     assert_eq!(s.request(handle).unwrap().acceptance.rounds(), 2);
@@ -2779,23 +2781,62 @@ fn population_after_full_acceptance(rounds: usize) -> Vec<f32> {
     s.forecasts.population.clone()
 }
 
-/// Width of the first round of a new request when the scheduler starts from `population` and picks widths itself.
+/// Width of the first round of a new request when the scheduler starts from a long-observed
+/// `population`, or from an unobserved one, and picks widths itself.
 fn adaptive_width(population: Option<Vec<f32>>) -> usize {
     let mut s = engine(1, true);
-    if let Some(population) = population { s.forecasts.population = population; }
+    if let Some(population) = population { s.forecasts.set_population(population); }
     let handle = add(&mut s, 1, 64, 4096);
     ready(&mut s, &[handle]);
     s.plan().unwrap().token_capacity
 }
 
 #[test]
-fn a_request_admitted_after_high_survival_plans_a_wider_round_than_on_a_fresh_scheduler() {
-    // No fixed width in either case: only the request's starting estimate differs.
+fn a_request_admitted_after_high_survival_plans_a_wider_round_than_after_low_survival() {
+    // No fixed width in either case: only the population that the request starts from differs.
     let learned = population_after_full_acceptance(300);
     assert!(learned.iter().take(7).all(|&p| p > 0.97), "{learned:?}");
-    let fresh = adaptive_width(None);
-    let seeded = adaptive_width(Some(learned));
-    assert!(seeded > fresh, "seeded width {seeded}, fresh width {fresh}");
+    let geometric = engine(1, true).forecasts.population.clone();
+    let high = adaptive_width(Some(learned));
+    let low = adaptive_width(Some(geometric));
+    assert!(high > low, "width {high} after high survival, {low} after low survival");
+}
+
+#[test]
+fn an_unobserved_population_offers_every_depth_and_a_failed_drafter_costs_bounded_rounds() {
+    // A scheduler that has verified nothing does not trust the geometric guess: it plans
+    // the widest round, which observes every depth.
+    assert_eq!(adaptive_width(None), 8);
+    let mut s = engine(1, true);
+    let cold = s.forecasts.priors();
+    assert!(cold.iter().take(7).all(|prior| prior.mean == 1.0 && prior.strength == 1.0), "{cold:?}");
+    // Every draft of every request is rejected. The first observation replaces the guess,
+    // the optimism of an observed depth shrinks with its count, and each request leaves
+    // wide rounds once its own evidence agrees.
+    let mut first_widths = Vec::new();
+    let mut wide_rounds = 0;
+    let mut optimism = Vec::new();
+    for id in 1..=24 {
+        let handle = add(&mut s, id, 64, 4096);
+        ready(&mut s, &[handle]);
+        let mut width = s.plan().unwrap().token_capacity;
+        first_widths.push(width);
+        for _ in 0..8 {
+            if width == 1 { break; }
+            step(&mut s, 0);
+            wide_rounds += 1;
+            assert_eq!(s.forecasts.population[0], 0.0);
+            width = s.plan().unwrap().token_capacity;
+        }
+        assert_eq!(width, 1, "request {id} still plans width {width}");
+        optimism.push(s.forecasts.prior(0).mean);
+        s.cancel(handle).unwrap();
+        if first_widths.last() == Some(&1) { break; }
+    }
+    assert_eq!(first_widths[0], 8);
+    assert_eq!(first_widths.last(), Some(&1), "{first_widths:?}");
+    assert!(optimism.windows(2).all(|pair| pair[1] <= pair[0]), "{optimism:?}");
+    assert!(wide_rounds <= 32, "{wide_rounds} wide rounds, first widths {first_widths:?}");
 }
 
 /// A scheduler whose catalog has host-allocated shapes at every width and one GPU-allocated shape (width 8).
@@ -2839,7 +2880,7 @@ fn a_catalog_with_host_and_gpu_shapes_is_gpu_confidence_and_moves_the_population
     let mut expected = s.forecasts.population.clone();
     let observed = gpu_confidence_round(&mut s, 0.9);
     assert!(!observed.is_empty());
-    for (depth, prefix) in observed.into_iter().enumerate() { expected[depth] = moved(expected[depth], prefix); }
+    for (depth, prefix) in observed.into_iter().enumerate() { expected[depth] = moved(expected[depth], prefix, 0); }
     assert_eq!(s.forecasts.population, expected);
     s.cancel(handle).unwrap();
     assert_new_request_keeps_the_geometric_prior(&mut s);
@@ -2866,10 +2907,10 @@ fn gpu_confidence_models_keep_the_geometric_prior_and_one_population_update_per_
     ready(&mut s, &[first]);
     let geometric = s.forecasts.population.clone();
     let mut expected = geometric.clone();
-    for _ in 0..3 {
+    for round in 0..3 {
         let observed = gpu_confidence_round(&mut s, 0.9);
         assert!(!observed.is_empty());
-        for (depth, prefix) in observed.into_iter().enumerate() { expected[depth] = moved(expected[depth], prefix); }
+        for (depth, prefix) in observed.into_iter().enumerate() { expected[depth] = moved(expected[depth], prefix, round); }
         // One update per depth and round from the confidence sidecar; the rejected host outcomes add nothing.
         assert_eq!(s.forecasts.population, expected);
     }
@@ -3699,6 +3740,7 @@ fn funded_acceptance_probe_compares_offered_prefixes_across_equal_width_budgets(
             prefill_capacity: 0, estimated_duration_ns: duration, input_bindings: vec![] });
     }
     scheduler.measured_graph_durations(&graphs).unwrap();
+    scheduler.settle_population();
     let handles = [add(&mut scheduler, 1, 64, 32), add(&mut scheduler, 2, 64, 32)];
     ready(&mut scheduler, &handles);
     scheduler.refresh.acceptance_credit_ns = 0.0;
@@ -5104,7 +5146,7 @@ fn gpu_allocation_surplus_rescues_packed_speculative_at_alpha_one_and_falls_back
     let easy = vec![0.95f32, 0.90, 0.85, 0.78, 0.70, 0.60, 0.50];
     let hard = vec![0.25f32, 0.04, 0.0, 0.0, 0.0, 0.0, 0.0];
     let mean: Vec<f32> = easy.iter().zip(&hard).map(|(a, b)| 0.5 * (a + b)).collect();
-    scheduler.forecasts.population = mean.clone();
+    scheduler.forecasts.set_population(mean.clone());
     let without_surplus = scheduler.plan().unwrap();
     assert_eq!((without_surplus.batch_capacity, without_surplus.token_capacity), (16, 1),
         "without variance surplus, mean-only pricing should underprice P=48 below B16xW1");
@@ -5286,7 +5328,7 @@ fn gpu_allocation_surplus_supports_width_two_depth_one_and_falls_back_conservati
         vec![(16, 1, 2, 24, crate::execution::PrefixAllocation::Gpu)];
     let handles: Vec<_> = (0..16).map(|i| add(&mut scheduler, i + 1, 64, 512)).collect();
     ready(&mut scheduler, &handles);
-    scheduler.forecasts.population = vec![0.60, 0.30, 0.15, 0.08, 0.04, 0.02, 0.01];
+    scheduler.forecasts.set_population(vec![0.60, 0.30, 0.15, 0.08, 0.04, 0.02, 0.01]);
     // Without surplus: 16 + 8*0.60 = 20.8 / 13.5ms = 1.54 tok/ms < B16xW1 (16 / 10ms = 1.60 tok/ms).
     let before = scheduler.plan().unwrap();
     assert_eq!((before.batch_capacity, before.token_capacity), (16, 1));
@@ -5368,6 +5410,7 @@ fn large_batch_single_low_acceptance_round_does_not_collapse_calibration() {
     scheduler.measured_graph_durations(&graphs).unwrap();
     scheduler.capabilities.speculative_allocations =
         vec![(32, 1, 2, 64, crate::execution::PrefixAllocation::Gpu)];
+    scheduler.settle_population();
     let handles: Vec<_> = (0..32).map(|i| add(&mut scheduler, i + 1, 64, 512)).collect();
     ready(&mut scheduler, &handles);
     let slots = scheduler.limits.request_capacity();
@@ -5798,4 +5841,222 @@ fn cold_scored_prefill_checkpoint_cuts_and_atomic_spans_use_natural_fit_discover
         (10_240, 10_000, PlanOrigin::Ordinary)
     );
     assert_eq!(span_sched.request(h).unwrap().consumed_tokens, 20_000);
+}
+
+#[test]
+fn a_rejected_round_does_not_lock_a_request_narrow_and_aged_evidence_recovers() {
+    let mut s = engine(1, true);
+    s.forecasts.set_population(vec![0.9; 15]);
+    let handle = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[handle]);
+    // Neither funded probes nor timing refresh may supply the recovery below.
+    s.refresh.acceptance_credit_ns = -1e18;
+    s.refresh.credit_ns = -1e18;
+    assert_eq!(s.plan().unwrap().token_capacity, 8);
+    // One fully rejected round is one observation against a population worth sixteen.
+    step(&mut s, 0);
+    assert_eq!(s.plan().unwrap().token_capacity, 8, "one rejected round must not narrow the request");
+    // Sustained rejection does narrow it, within a bounded number of rounds.
+    let mut rejected = 1;
+    while s.plan().unwrap().token_capacity > 1 {
+        step(&mut s, 0);
+        rejected += 1;
+        assert!(rejected <= 200, "sustained rejection must reach width one");
+    }
+    // Other requests keep the population high. Width-one rounds observe no draft depth,
+    // so the request's rejections age and its estimate returns to the population.
+    s.forecasts.set_population(vec![0.9; 15]);
+    let narrowed_at = s.request(handle).unwrap().generated_tokens;
+    let mut recovered = None;
+    for _ in 0..1024 {
+        let plan = s.plan().unwrap();
+        assert_eq!(plan.origin, PlanOrigin::Ordinary);
+        if plan.token_capacity > 1 {
+            recovered = Some(s.request(handle).unwrap().generated_tokens - narrowed_at);
+            break;
+        }
+        step(&mut s, 0);
+    }
+    let recovered = recovered.expect("aged rejections must stop holding the request at width one");
+    assert!(recovered <= 768, "recovered after {recovered} generated tokens");
+}
+
+#[test]
+fn shortest_prefill_time_is_exact_over_measured_capacities() {
+    // An affine table of 40 ms per launch plus 0.19 ms per token of capacity.
+    let affine: Vec<(usize, u64)> = [128usize, 256, 512, 1024]
+        .into_iter().map(|capacity| (capacity, 40 * MS + capacity as u64 * 190_000)).collect();
+    let cost = |capacity: usize| affine.iter().find(|entry| entry.0 == capacity).unwrap().1;
+    assert_eq!(policy::shortest_prefill_ns(&affine, 0), Some(0));
+    assert_eq!(policy::shortest_prefill_ns(&[], 1), None);
+    // One padded 512 launch finishes 374 tokens sooner than 256 followed by 128.
+    assert_eq!(policy::shortest_prefill_ns(&affine, 374), Some(cost(512)));
+    assert!(cost(512) < cost(256) + cost(128));
+    assert_eq!(policy::shortest_prefill_ns(&affine, 128), Some(cost(128)));
+    assert_eq!(policy::shortest_prefill_ns(&affine, 129), Some(cost(256)));
+    // Beyond the largest capacity the recursion repeats launches.
+    assert_eq!(policy::shortest_prefill_ns(&affine, 2048), Some(2 * cost(1024)));
+    assert_eq!(policy::shortest_prefill_ns(&affine, 1100), Some(cost(1024) + cost(128)));
+    // A table whose large graph is slow per token prefers the measured split.
+    let convex = [(256usize, 18 * MS), (512, 22 * MS), (1024, 100 * MS)];
+    assert_eq!(policy::shortest_prefill_ns(&convex, 600), Some(40 * MS));
+    // Exhaustive check against every launch sequence of up to four launches.
+    for tokens in (1..=1024).step_by(37) {
+        let mut best = u64::MAX;
+        let capacities: Vec<usize> = affine.iter().map(|entry| entry.0).collect();
+        let mut stack = vec![(tokens as i64, 0u64, 0usize)];
+        while let Some((left, spent, depth)) = stack.pop() {
+            if left <= 0 { best = best.min(spent); continue; }
+            if depth == 8 { continue; }
+            for &capacity in &capacities { stack.push((left - capacity as i64, spent + cost(capacity), depth + 1)); }
+        }
+        assert_eq!(policy::shortest_prefill_ns(&affine, tokens), Some(best), "{tokens} tokens");
+    }
+}
+
+/// A warm scheduler whose prefill graphs cost `duration(capacity)` at an empty context.
+fn measured_prefill_engine(duration: impl Fn(usize) -> u64) -> RequestScheduler {
+    let mut s = cold_deepseek_16k_engine(false);
+    set_cost(&mut s, GraphKind::Init, 1, 1, 150_000);
+    set_cost(&mut s, GraphKind::Snapshot, 1, 1, 500_000);
+    for capacity in DEEPSEEK_16K_PREFILL_CATALOG {
+        set_cost(&mut s, GraphKind::Prefill, 1, capacity, duration(capacity));
+    }
+    s
+}
+
+/// Runs request `id` through prefill and returns each prefill launch as (capacity, tokens, start).
+fn prefill_launches(s: &mut RequestScheduler, id: u32, prompt: usize,
+    duration: impl Fn(usize, u64) -> u64) -> Vec<(usize, usize, u64)> {
+    let handle = add(s, id, prompt, 1);
+    let mut launches = Vec::new();
+    while s.request(handle).is_ok() {
+        let plan = s.plan().expect("request must make progress");
+        let nanos = if plan.kind.is_prefill() {
+            assert_eq!(plan.origin, PlanOrigin::Ordinary);
+            launches.push((plan.token_capacity, plan.lanes[0].tokens, plan.lanes[0].start_position));
+            duration(plan.token_capacity, plan.lanes[0].start_position)
+        } else {
+            realistic_sm120_duration_ns(plan.kind, plan.token_capacity)
+        };
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        s.advance_to(s.now_ns + nanos).unwrap();
+        complete_timed(s, &plan, fence, 0, true, gpu_time(nanos));
+    }
+    launches
+}
+
+#[test]
+fn a_prefill_tail_takes_the_shortest_measured_completion() {
+    // 15 ms per launch plus 14 us per token of capacity: a full 512 graph has the highest
+    // tokens per millisecond, yet one padded 1024 launch finishes a 600-token prompt
+    // in 29.4 ms where 512 followed by 256 takes 40.8 ms.
+    let affine = |capacity: usize| realistic_sm120_duration_ns(GraphKind::Prefill, capacity);
+    assert!(512.0 / affine(512) as f64 > 600.0 / affine(1024) as f64);
+    assert!(affine(1024) < affine(512) + affine(256));
+    let mut s = measured_prefill_engine(affine);
+    let launches = prefill_launches(&mut s, 1, 600, |capacity, _| affine(capacity));
+    assert_eq!(launches, [(1024, 600, 0)]);
+    // The tail of a long prompt is decomposed the same way after its full chunks.
+    let launches = prefill_launches(&mut s, 2, 16_384 + 600, |capacity, _| affine(capacity));
+    assert_eq!(launches, [(16_384, 16_384, 0), (1024, 600, 16_384)]);
+
+    // When the measured split is shorter than the padded launch, the split runs.
+    let convex = |capacity: usize| match capacity {
+        256 => 18 * MS,
+        512 => 22 * MS,
+        1024 => 100 * MS,
+        capacity => affine(capacity) + 200 * MS,
+    };
+    let mut s = measured_prefill_engine(convex);
+    let launches = prefill_launches(&mut s, 1, 600, |capacity, _| convex(capacity));
+    // Either order of the 512 and 256 graphs takes the same 40 ms.
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    assert_eq!(launches.iter().map(|launch| convex(launch.0)).sum::<u64>(), 40 * MS, "{launches:?}");
+    assert_eq!(launches.iter().map(|launch| launch.1).sum::<usize>(), 600);
+}
+
+#[test]
+fn prefill_capacity_is_stable_while_cost_grows_with_context() {
+    // Every graph costs more per token as the request's context deepens.
+    let duration = |capacity: usize, position: u64| {
+        15 * MS + (capacity as u64 * 230 * MS / 16_384) * (100_000 + position) / 100_000
+    };
+    assert!(16_384.0 / duration(16_384, 0) as f64 > 14_336.0 / duration(14_336, 0) as f64);
+    // The retained estimates of the smaller graphs were all taken at an empty context.
+    let mut s = measured_prefill_engine(|capacity| duration(capacity, 0));
+    let launches = prefill_launches(&mut s, 1, 6 * 16_384, duration);
+    assert_eq!(launches.iter().map(|launch| launch.0).collect::<Vec<_>>(), [16_384; 6],
+        "a graph in continuous use must not yield to estimates taken at a shallower context");
+    // Compared at their own context positions, the third chunk would have gone to the
+    // smaller graph: its empty-context estimate beats the median of the larger graph.
+    let lagging_median = (duration(16_384, 0) + duration(16_384, 16_384)) / 2;
+    assert!(14_336.0 / duration(14_336, 0) as f64 > 16_384.0 / lagging_median as f64);
+    // The projection of the unused graph follows the measured growth.
+    let deep = 5 * 16_384;
+    let projected = s.costs.prefill_duration(GraphKind::Prefill, 14_336, deep).unwrap();
+    let actual = duration(14_336, deep);
+    assert!(projected.abs_diff(actual) * 50 < actual, "projected {projected} ns, actual {actual} ns");
+    assert_eq!(s.costs.duration(GraphKind::Prefill, 1, 14_336), Some(duration(14_336, 0)));
+
+    // Constant costs measure no growth and leave every retained estimate as it is.
+    let flat = |capacity: usize| realistic_sm120_duration_ns(GraphKind::Prefill, capacity);
+    let mut s = measured_prefill_engine(flat);
+    let launches = prefill_launches(&mut s, 1, 6 * 16_384, |capacity, _| flat(capacity));
+    assert_eq!(launches.len(), 6);
+    assert_eq!(s.costs.prefill_duration(GraphKind::Prefill, 14_336, deep), Some(flat(14_336)));
+}
+
+#[test]
+fn adaptive_width_follows_measured_survival_when_wide_rounds_are_cheap() {
+    // Round durations by width and prefix survival by depth, measured on Hy4-flash at
+    // batch one on SM120. Tokens per millisecond rise with width up to width six, and
+    // each added depth clears its cost under the balanced policy.
+    const DURATIONS_US: [u64; 6] = [12_660, 15_130, 16_820, 17_700, 18_690, 18_890];
+    const SURVIVAL: [f64; 5] = [0.659, 0.382, 0.257, 0.180, 0.151];
+    let mut s = engine(1, false);
+    s.enable_speculation(&[1, 2, 3, 4, 5, 6]).unwrap();
+    for (index, micros) in DURATIONS_US.into_iter().enumerate() {
+        set_cost(&mut s, GraphKind::Speculative, 1, index + 1, micros * 1000);
+    }
+    // A fixed linear congruential sequence draws how many drafts each round accepts.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut uniform = move || {
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let (mut rounds, mut widest, mut tokens, mut nanos) = (0usize, 0usize, 0u64, 0u64);
+    let mut first_request_widest = 0usize;
+    for id in 1..=8u32 {
+        let handle = add(&mut s, id, 64, 4096);
+        ready(&mut s, &[handle]);
+        for _ in 0..150 {
+            let plan = s.plan().unwrap();
+            assert_eq!(plan.kind, GraphKind::Speculative);
+            let draw = uniform();
+            let accepted = SURVIVAL.iter().take_while(|survival| draw < **survival).count();
+            let duration = DURATIONS_US[plan.token_capacity - 1] * 1000;
+            let before = s.request(handle).unwrap().generated_tokens;
+            let fence = Fence(s.submitted.0 + 1);
+            s.commit(&plan, fence).unwrap();
+            s.advance_to(s.now_ns + duration).unwrap();
+            complete_timed(&mut s, &plan, fence, accepted, true, gpu_time(duration));
+            rounds += 1;
+            widest += usize::from(plan.token_capacity == 6);
+            tokens += u64::from(s.request(handle).unwrap().generated_tokens - before);
+            nanos += duration;
+        }
+        if id == 1 { first_request_widest = widest; }
+        s.cancel(handle).unwrap();
+    }
+    let rate = tokens as f64 / (nanos as f64 / 1e6);
+    println!("widest {widest}/{rounds}, first request {first_request_widest}/150, {rate:.4} tokens/ms");
+    // A request whose first rounds reject every draft keeps the population's estimate,
+    // so the widest round stays selected from a cold scheduler onwards.
+    assert!(first_request_widest >= 120, "first request ran {first_request_widest} of 150 rounds at width six");
+    assert!(widest * 10 >= rounds * 9, "{widest} of {rounds} rounds at width six");
+    // Width six yields 2.63 tokens in 18.89 ms, 0.139 tokens per millisecond; width
+    // four yields 0.130.
+    assert!(rate > 0.133, "{rate:.4} tokens per millisecond");
 }

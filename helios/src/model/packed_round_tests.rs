@@ -114,6 +114,8 @@ fn packed_combined_packing_preserves_sparse_slot_keys_and_ceiling_padding() {
     let mut scheduler = RequestScheduler::new(config.identity, config.limits, scheduler_capabilities_with_manifest(&config, &manifest).unwrap()).unwrap();
     scheduler.enable_speculation(&config.speculative_widths).unwrap();
     scheduler.measured_graph_durations(&manifest.graphs).unwrap();
+    // A long-observed population: the first drafting round waits for all three requests.
+    scheduler.settle_population();
     let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
     let mut handles = Vec::new();
     for _ in 0..4 {

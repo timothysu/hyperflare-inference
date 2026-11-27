@@ -61,7 +61,7 @@ fn greedy_lengths(scheduler: &RequestScheduler, mask: u64, batch: usize, drafts:
     let probabilities: [Vec<f64>; REQUEST_LANES] = std::array::from_fn(|slot| {
         let Some(request) = scheduler.slots.get(slot).and_then(|slot| slot.request.as_ref()) else { return Vec::new(); };
         if gpu { scheduler.speculative_curve(request, optimistic) }
-        else { request.acceptance.curve(scheduler.proposal_source, request.generated_tokens, optimistic)
+        else { scheduler.acceptance_curve(request, optimistic)
             .into_iter().map(|p| p.powf(scheduler.policy.adaptive_verification_alpha) * values[slot].output_token).collect() }
     });
     let mut lengths = [0; REQUEST_LANES];
@@ -119,7 +119,7 @@ fn ranked_prefix_allocation_matches_greedy_frontiers() {
                         values[slot].output_token = [0.0, 1.0, 1.0, 4.0][(slot + seed) % 4];
                     }
                     scheduler.limits.max_sequence_tokens = if seed == 3 { 83 } else { 8192 };
-                    scheduler.forecasts.population = vec![0.9, 0.9, 0.5, 0.5, 0.25, 0.0, 0.0];
+                    scheduler.forecasts.set_population(vec![0.9, 0.9, 0.5, 0.5, 0.25, 0.0, 0.0]);
                     let lanes = mask.count_ones() as usize;
                     for width in [1, 2, 4, 8] {
                         for drafts in [width - 1, 7] {

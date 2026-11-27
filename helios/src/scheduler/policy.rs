@@ -588,7 +588,7 @@ impl RequestScheduler {
                 consider(
                     ns,
                     value.decode(
-                        r.acceptance.expected_tokens(self.proposal_source, tokens),
+                        self.acceptance_tokens(r, tokens),
                         ns as f64 / 1e6,
                     ),
                 );
@@ -942,6 +942,9 @@ impl RequestScheduler {
         values: &[LaneValue; REQUEST_LANES],
         age_price: f64,
     ) {
+        if kind.is_prefill() {
+            return self.add_prefill_candidate(output, kind, capacity, mask, values, age_price);
+        }
         let Some(duration_ns) = self.costs.duration(kind, batch, capacity) else {
             return;
         };
@@ -949,28 +952,6 @@ impl RequestScheduler {
         let mut count = 0;
         for slot in bits(mask) {
             let r = self.slots[slot].request.as_ref().unwrap();
-            if kind.is_prefill() {
-                let catalog = if kind == GraphKind::ScoredPrefill {
-                    &self.scored_prefill_catalog
-                } else {
-                    &self.prefill_catalog
-                };
-                let cut = self.estimated_checkpoint_cut(r);
-                let work = self.prefill_work_through(r, capacity, cut);
-                let resolved = self.resolve_prefill_kind(r, capacity, work, cut);
-                // Restrict unmeasured pure prefill discovery to the natural-fit capacity
-                // so smaller unmeasured shapes do not preempt larger fitting graphs and
-                // larger padded shapes that consume no additional tokens are skipped.
-                if work == 0
-                    || resolved != kind
-                    || (kind == GraphKind::Prefill
-                        && self.prefill_requires_terminal_completion(r, cut))
-                    || (duration_ns == 0
-                        && self.natural_fit_prefill_capacity(r, catalog, cut) != Some(capacity))
-                {
-                    continue;
-                }
-            }
             if kind == GraphKind::Vision && capacity < r.vision_patches[0] {
                 continue;
             }
@@ -997,14 +978,7 @@ impl RequestScheduler {
             || !matches!(kind, GraphKind::Decode | GraphKind::Speculative)
             || bits(selected).any(|slot| {
                 let r = self.slots[slot].request.as_ref().unwrap();
-                r.grammar_constrained
-                    || r.host_stops
-                    || (kind.is_prefill()
-                        && (r.consumed_tokens + self.prefill_work(r, capacity) as u64
-                            == r.prompt_tokens as u64
-                            || r.message_boundaries.binary_search(
-                                &(r.consumed_tokens as usize + self.prefill_work(r, capacity)),
-                            ).is_ok()))
+                r.grammar_constrained || r.host_stops
             });
         let (selected, rate) = self
             .continuation_candidate(
@@ -1023,21 +997,155 @@ impl RequestScheduler {
             capacity,
             prefill_capacity: 0,
             prefill_slot: None,
-            work: if kind.is_prefill() {
-                self.prefill_work(
-                    self.slots[selected.trailing_zeros() as usize]
-                        .request
-                        .as_ref()
-                        .unwrap(),
-                    capacity,
-                )
-            } else {
-                0
-            },
+            work: 0,
             duration_ns,
             rate,
             feedback,
         });
+    }
+
+    /// One batch-one prefill candidate for `capacity`: the request whose launch has the
+    /// highest value rate, with the graph's duration projected to that request's context.
+    fn add_prefill_candidate(
+        &self,
+        output: &mut Vec<Candidate>,
+        kind: GraphKind,
+        capacity: usize,
+        mask: u64,
+        values: &[LaneValue; REQUEST_LANES],
+        age_price: f64,
+    ) {
+        let Some(retained_ns) = self.costs.duration(kind, 1, capacity) else {
+            return;
+        };
+        let catalog = if kind == GraphKind::ScoredPrefill {
+            &self.scored_prefill_catalog
+        } else {
+            &self.prefill_catalog
+        };
+        let mut best: Option<(usize, usize, u64, ValueRate)> = None;
+        for slot in bits(mask) {
+            let r = self.slots[slot].request.as_ref().unwrap();
+            let cut = self.estimated_checkpoint_cut(r);
+            let work = self.prefill_work_through(r, capacity, cut);
+            let resolved = self.resolve_prefill_kind(r, capacity, work, cut);
+            // Restrict unmeasured pure prefill discovery to the natural-fit capacity
+            // so smaller unmeasured shapes do not preempt larger fitting graphs and
+            // larger padded shapes that consume no additional tokens are skipped.
+            if work == 0
+                || resolved != kind
+                || (kind == GraphKind::Prefill
+                    && self.prefill_requires_terminal_completion(r, cut))
+                || (retained_ns == 0
+                    && self.natural_fit_prefill_capacity(r, catalog, cut) != Some(capacity))
+            {
+                continue;
+            }
+            let duration_ns = self.costs.prefill_duration(kind, capacity, r.consumed_tokens).unwrap_or(0);
+            let rate = self.prefill_rate(r, kind, capacity, work, cut, duration_ns, values[slot], age_price);
+            if best.is_none_or(|(_, _, _, old)| rate.compare(old).is_gt()) {
+                best = Some((slot, work, duration_ns, rate));
+            }
+        }
+        let Some((slot, work, duration_ns, rate)) = best else {
+            return;
+        };
+        output.push(Candidate { host_lengths: None, draft_tokens: 0, packed_token_capacity: 0,
+            kind,
+            mask: 1 << slot,
+            batch: 1,
+            capacity,
+            prefill_capacity: 0,
+            prefill_slot: None,
+            work,
+            duration_ns,
+            rate,
+            feedback: true,
+        });
+    }
+
+    /// Value rate of launching `capacity` for `work` prompt tokens of `r`.
+    ///
+    /// When the largest capacity reaches the request's next stop in one launch, every
+    /// measured capacity is scored by the value of the whole interval over the
+    /// shortest measured time to finish it, starting with this launch. A capacity that
+    /// leaves a remainder is thereby charged for the launches that remainder needs, so
+    /// a fully occupied small graph does not outrank a padded graph that finishes
+    /// sooner. The cost of delaying decoders covers this launch alone, because other
+    /// work can run between launches. A launch that finishes the interval, and every
+    /// launch of a longer interval, keeps the value of its own tokens over its duration.
+    fn prefill_rate(
+        &self,
+        r: &LiveRequest,
+        kind: GraphKind,
+        capacity: usize,
+        work: usize,
+        cut: Option<usize>,
+        duration_ns: u64,
+        value: LaneValue,
+        age_price: f64,
+    ) -> ValueRate {
+        let launch = ValueRate::new(
+            duration_ns,
+            self.lane_value_for_tokens(r, kind, work, duration_ns, value),
+            age_price,
+        );
+        if duration_ns == 0 {
+            return launch;
+        }
+        let Some((interval, remainder_ns)) = self.prefill_tail(r, kind, capacity, cut) else {
+            return launch;
+        };
+        if remainder_ns == 0 {
+            return launch;
+        }
+        let completion_ms = duration_ns.saturating_add(remainder_ns) as f64 / 1e6;
+        let duration_ms = duration_ns as f64 / 1e6;
+        ValueRate {
+            duration_ns,
+            score: self.lane_value_for_tokens(r, kind, interval, duration_ns, value) / completion_ms
+                - age_price * duration_ms / 2.0,
+        }
+    }
+
+    /// The prompt tokens from `r`'s position to its next stop and the shortest measured
+    /// time to consume what a launch of `capacity` leaves of them.
+    ///
+    /// Present only when the largest capacity reaches the stop in one launch, no atomic
+    /// span lies in the interval, and the catalog has no terminal-prefill graphs, whose
+    /// launch kinds depend on the position of each launch.
+    fn prefill_tail(
+        &self,
+        r: &LiveRequest,
+        kind: GraphKind,
+        capacity: usize,
+        cut: Option<usize>,
+    ) -> Option<(usize, u64)> {
+        if kind == GraphKind::TerminalPrefill
+            || (kind == GraphKind::Prefill && !self.terminal_prefill_catalog.is_empty())
+        {
+            return None;
+        }
+        let catalog = self.prefill_catalog(kind);
+        let largest = *catalog.last()?;
+        let interval = self.prefill_work_through(r, largest, cut);
+        let start = r.consumed_tokens as usize;
+        if interval == 0
+            || interval >= largest
+            || r.prefill_spans.iter().any(|span| span.start < start + interval && start < span.end)
+        {
+            return None;
+        }
+        let costs: Vec<(usize, u64)> = catalog
+            .iter()
+            .filter_map(|&capacity| {
+                self.costs
+                    .prefill_duration(kind, capacity, r.consumed_tokens)
+                    .filter(|&nanos| nanos != 0)
+                    .map(|nanos| (capacity, nanos))
+            })
+            .collect();
+        Some((interval, shortest_prefill_ns(&costs, interval.saturating_sub(capacity))?))
     }
 
     pub(super) fn candidates(
@@ -1351,7 +1459,11 @@ impl RequestScheduler {
             let kind = self.resolve_prefill_kind(request, capacity, work, cut);
             (kind, capacity, 0, work)
         };
-        let duration_ns = self.costs.shape_duration(kind, candidate.batch, capacity, prefill)?;
+        let duration_ns = if mixed {
+            self.costs.shape_duration(kind, candidate.batch, capacity, prefill)?
+        } else {
+            self.costs.prefill_duration(kind, capacity, request.consumed_tokens)?
+        };
         candidate.kind = kind;
         candidate.capacity = capacity;
         candidate.prefill_capacity = prefill;
@@ -1500,6 +1612,29 @@ impl RequestScheduler {
         let origin = if candidate.rate.duration_ns == 0 { PlanOrigin::Discovery } else { PlanOrigin::Ordinary };
         self.materialize(candidate, scale, origin)
     }
+}
+
+/// Shortest total duration of launches that consume `tokens` prompt tokens, given each
+/// measured capacity and its duration. A launch consumes up to its capacity, and any
+/// capacity may repeat. `None` when tokens remain and no capacity is measured.
+pub(super) fn shortest_prefill_ns(costs: &[(usize, u64)], tokens: usize) -> Option<u64> {
+    if tokens == 0 {
+        return Some(0);
+    }
+    // Capacities are multiples of 64, so every remainder differs from `tokens` by a
+    // multiple of 64: state `j` holds `tokens - 64 * (steps - j)` tokens.
+    let steps = tokens.div_ceil(64);
+    let mut shortest: Vec<Option<u64>> = vec![None; steps + 1];
+    shortest[0] = Some(0);
+    for state in 1..=steps {
+        shortest[state] = costs
+            .iter()
+            .filter_map(|&(capacity, nanos)| {
+                shortest[state.saturating_sub(capacity / 64)].map(|rest| rest.saturating_add(nanos))
+            })
+            .min();
+    }
+    shortest[steps]
 }
 
 pub(super) fn terminal_cleanup(request: &LiveRequest) -> bool {
